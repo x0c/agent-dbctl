@@ -207,7 +207,7 @@ func TestMultiModalPatternMatchersAndPreflight(t *testing.T) {
 		}
 	}
 
-	var dmGuardRules, pgSideRules []types.RiskPatternRule
+	var dmGuardRules, pgSideRules, tdGuardRules, esGuardRules []types.RiskPatternRule
 	for _, pack := range policy.BuiltinRulePacks() {
 		for _, r := range pack.Rules {
 			r.ScopeType = "global"
@@ -217,11 +217,15 @@ func TestMultiModalPatternMatchersAndPreflight(t *testing.T) {
 				dmGuardRules = append(dmGuardRules, r)
 			case "pg-side-effect":
 				pgSideRules = append(pgSideRules, r)
+			case "tdengine-tsdb-guard":
+				tdGuardRules = append(tdGuardRules, r)
+			case "es-unbounded-scan":
+				esGuardRules = append(esGuardRules, r)
 			}
 		}
 	}
-	if len(dmGuardRules) == 0 {
-		t.Fatal("expected dameng-sys-guard builtin pack")
+	if len(dmGuardRules) == 0 || len(tdGuardRules) == 0 {
+		t.Fatal("expected dameng-sys-guard and tdengine-tsdb-guard builtin packs")
 	}
 
 	dmSys := &types.System{ID: "sys_dm", Slug: "erp"}
@@ -231,19 +235,43 @@ func TestMultiModalPatternMatchersAndPreflight(t *testing.T) {
 	if len(resolvedDM) == 0 {
 		t.Fatal("expected dameng-sys-guard rule resolved for dameng engine")
 	}
-	dmSQL := "CALL SP_SET_PARA_VALUE(1, 'ENABLE_MONITOR', 0)"
-	if matches, _ := policy.MatchPatternRules(resolvedDM, classify.Classify("dameng", dmSQL), nil, dmSQL); len(matches) == 0 {
-		t.Fatalf("expected dameng-sys-guard to match %q", dmSQL)
+	for _, dmSQL := range []string{
+		"CALL SP_SET_PARA_VALUE(1, 'ENABLE_MONITOR', 0)",
+		"CALL SP_CREATE_JOB('nightly', 1, 0, '', 0, 0, '', 0, '')",
+		"SELECT LEVEL FROM DUAL CONNECT BY LEVEL <= 1000000",
+	} {
+		if matches, _ := policy.MatchPatternRules(resolvedDM, classify.Classify("dameng", dmSQL), nil, dmSQL); len(matches) == 0 {
+			t.Fatalf("expected dameng-sys-guard to match %q", dmSQL)
+		}
 	}
 
-	for _, eng := range []string{"opengauss", "kingbase"} {
-		resolvedPG := policy.ResolveEffectivePatternRules(prodEnv, dmSys, dmTgt, eng, types.FamilySQL, pgSideRules)
-		if len(resolvedPG) == 0 {
-			t.Fatalf("expected pg-side-effect rules resolved for %s", eng)
+	for _, tc := range []struct {
+		eng string
+		sql string
+	}{
+		{"opengauss", "SELECT pg_sleep(5)"},
+		{"opengauss", "SELECT gs_roach_stop_backup()"},
+		{"kingbase", "SELECT sys_read_file('/etc/passwd')"},
+		{"kingbase", "SELECT sys_sleep(5)"},
+	} {
+		resolvedPG := policy.ResolveEffectivePatternRules(prodEnv, dmSys, dmTgt, tc.eng, types.FamilySQL, pgSideRules)
+		if matches, _ := policy.MatchPatternRules(resolvedPG, classify.Classify(tc.eng, tc.sql), nil, tc.sql); len(matches) == 0 {
+			t.Fatalf("expected pg-side-effect to match %s query %q", tc.eng, tc.sql)
 		}
-		pgSQL := "SELECT pg_sleep(5)"
-		if matches, _ := policy.MatchPatternRules(resolvedPG, classify.Classify(eng, pgSQL), nil, pgSQL); len(matches) == 0 {
-			t.Fatalf("expected pg-side-effect to match %s query %q", eng, pgSQL)
+	}
+
+	tdTgt := types.Target{ID: "tgt_td", Ref: "erp/prod/td", OwnerSystemID: "sys_dm", EnvironmentCode: "prod", Status: types.TargetActive}
+	resolvedTD := policy.ResolveEffectivePatternRules(prodEnv, dmSys, tdTgt, "tdengine", types.FamilySQL, tdGuardRules)
+	for _, tdSQL := range []string{"COMPACT", "SELECT * FROM meters"} {
+		if matches, _ := policy.MatchPatternRules(resolvedTD, classify.Classify("tdengine", tdSQL), nil, tdSQL); len(matches) == 0 {
+			t.Fatalf("expected tdengine-tsdb-guard to match %q", tdSQL)
 		}
+	}
+
+	esTgt := types.Target{ID: "tgt_es", Ref: "erp/prod/es", OwnerSystemID: "sys_dm", EnvironmentCode: "prod", Status: types.TargetActive}
+	resolvedES := policy.ResolveEffectivePatternRules(prodEnv, dmSys, esTgt, "easysearch", types.FamilyDocument, esGuardRules)
+	esQuery := "POST /orders/_search\n{\"knn\":{\"field\":\"vec\",\"k\":500,\"num_candidates\":2000}}"
+	if matches, _ := policy.MatchPatternRules(resolvedES, classify.Classify("easysearch", esQuery), nil, esQuery); len(matches) == 0 {
+		t.Fatalf("expected es-unbounded-scan to match heavy knn query on easysearch")
 	}
 }

@@ -1042,6 +1042,16 @@ func TestLiveMultiDatabaseEngines(t *testing.T) {
 			t.Fatalf("expected Dameng preflight FullScan=true, got pf=%+v resp=%+v err=%v", pf.Preflight, pf, err)
 		}
 
+		// Hierarchical CONNECT BY must be blocked from silent execution on prod even though EXPLAIN estimates 1 row.
+		cbRes, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT LEVEL FROM DUAL CONNECT BY LEVEL <= 1000000",
+			DryRun:           true,
+		})
+		if err != nil || cbRes.Classification.RiskLevel != types.RiskHighCostRead || cbRes.Evaluation.Decision != types.DecisionRequireApproval {
+			t.Fatalf("expected Dameng CONNECT BY to require approval on prod, got %+v err=%v", cbRes, err)
+		}
+
 		upd, err := svc.Execute(ctx, types.ExecRequest{
 			TargetRefOrAlias: prodTgt.Alias,
 			Query:            "UPDATE ADB_RW.ORDERS SET AMOUNT_CENTS = AMOUNT_CENTS + 1 WHERE ID = 42",

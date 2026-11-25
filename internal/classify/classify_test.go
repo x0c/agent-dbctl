@@ -65,7 +65,16 @@ func TestClassifySQL(t *testing.T) {
 		{"dameng_explain_for_delete", "EXPLAIN FOR DELETE FROM orders WHERE id = 1", types.RiskHighCostRead, true, "explain_dml"},
 		{"dameng_dual_safe", "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL", types.RiskSafeRead, true, ""},
 		{"dameng_para_admin", "SELECT sf_set_session_para_value('MONITOR_SQL_EXEC', 1) FROM DUAL", types.RiskAdmin, false, "dangerous_admin_function"},
+		{"dameng_connect_by_dos", "SELECT LEVEL FROM DUAL CONNECT BY LEVEL <= 10000000", types.RiskHighCostRead, true, "connect_by"},
+		{"dameng_dbms_xmlgen", "SELECT DBMS_XMLGEN.GETXML('SELECT 1 FROM DUAL') FROM DUAL", types.RiskAdmin, false, "dangerous_admin_function"},
 		{"opengauss_password_notify_admin", "SELECT gs_password_notify('u', 'p')", types.RiskAdmin, false, "dangerous_admin_function"},
+		{"opengauss_roach_backup", "SELECT gs_roach_stop_backup()", types.RiskAdmin, false, "dangerous_admin_function"},
+		{"opengauss_wlm_get_safe", "SELECT * FROM gs_wlm_get_session_info() LIMIT 10", types.RiskSafeRead, true, ""},
+		{"kingbase_sys_read_file", "SELECT sys_read_file('/etc/passwd')", types.RiskAdmin, false, "dangerous_admin_function"},
+		{"kingbase_sys_advisory_lock", "SELECT sys_advisory_lock(42)", types.RiskWrite, false, "side_effect_function"},
+		{"kingbase_sys_sleep", "SELECT sys_sleep(5)", types.RiskHighCostRead, true, "high_cost_function"},
+		{"tdengine_compact_admin", "COMPACT", types.RiskAdmin, false, ""},
+		{"tdengine_reset_cache_admin", "RESET QUERY CACHE", types.RiskAdmin, false, ""},
 	}
 
 	for _, tc := range cases {
@@ -252,6 +261,8 @@ func TestClassifyNewDatabaseDialectsAndElasticsearch(t *testing.T) {
 		{"es_painless_script", `{"index":"orders","script_fields":{"x":{"script":"doc['a'].value * 2"}},"size":10}`, types.RiskHighCostRead, true, "script_eval"},
 		{"es_large_size", `{"index":"orders","query":{"match_all":{}},"size":5000}`, types.RiskHighCostRead, true, "large_size"},
 		{"es_sql_safe", `{"sql":"SELECT id FROM orders WHERE id = 1 LIMIT 5"}`, types.RiskSafeRead, true, ""},
+		{"es_sql_translate_delete", "POST /_sql/_translate\n{\"query\":\"DELETE FROM orders WHERE id = 1\"}", types.RiskWrite, false, ""},
+		{"es_knn_heavy_scan", "POST /orders/_search\n{\"knn\":{\"field\":\"vec\",\"query_vector\":[0.1,0.2],\"k\":500,\"num_candidates\":5000}}", types.RiskHighCostRead, true, "knn_heavy_scan"},
 		{"es_sql_delete", `{"sql":"DELETE FROM orders WHERE id = 1"}`, types.RiskWrite, false, ""},
 		{"es_bulk_write", "POST /_bulk\n{\"index\":{\"_index\":\"orders\",\"_id\":\"1\"}}", types.RiskWrite, false, "es_write"},
 		{"es_delete_by_query", "POST /orders/_delete_by_query\n{\"query\":{\"match_all\":{}}}", types.RiskWrite, false, "es_write"},

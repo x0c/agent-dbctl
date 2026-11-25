@@ -187,8 +187,9 @@ func classifyElasticsearch(engine, raw string) types.Classification {
 		return esResult(engine, "ES_ADMIN", types.RiskAdmin, false, []string{"es_admin_endpoint"}, snippet)
 	}
 
-	// ES SQL endpoint delegates inner SQL classification.
-	if lowerPath == "/_sql" || strings.HasSuffix(lowerPath, "/_sql") {
+	// ES/Easysearch SQL endpoints delegate inner SQL classification.
+	if lowerPath == "/_sql" || strings.HasSuffix(lowerPath, "/_sql") ||
+		lowerPath == "/_sql/_translate" || strings.HasSuffix(lowerPath, "/_sql/_translate") {
 		if cmd.Doc != nil {
 			if q, ok := cmd.Doc["query"].(string); ok {
 				sqlCls := classifySQL(engine, q)
@@ -292,6 +293,9 @@ func inspectESReadHazards(cmd ParsedESCommand, lowerPath string, parsedURL *url.
 		if fromVal, ok := asESInt(cmd.Doc["from"]); ok && fromVal >= 10000 {
 			flags = append(flags, "deep_offset")
 		}
+		if hasHeavyKNNQuery(cmd.Doc) {
+			flags = append(flags, "knn_heavy_scan")
+		}
 	} else if parsedURL != nil {
 		if qs := parsedURL.Query().Get("size"); qs != "" {
 			if n, ok := asESInt(qs); ok && n > 1000 {
@@ -338,4 +342,55 @@ func asESInt(v any) (int64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func hasHeavyKNNQuery(v any) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, val := range x {
+			if strings.EqualFold(k, "knn") {
+				if isHeavyKNNBlock(val) {
+					return true
+				}
+			}
+			if hasHeavyKNNQuery(val) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range x {
+			if hasHeavyKNNQuery(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isHeavyKNNBlock(v any) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, val := range x {
+			if strings.EqualFold(k, "k") {
+				if n, ok := asESInt(val); ok && n > 100 {
+					return true
+				}
+			}
+			if strings.EqualFold(k, "num_candidates") {
+				if n, ok := asESInt(val); ok && n > 1000 {
+					return true
+				}
+			}
+			if subMap, ok := val.(map[string]any); ok && isHeavyKNNBlock(subMap) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range x {
+			if isHeavyKNNBlock(item) {
+				return true
+			}
+		}
+	}
+	return false
 }

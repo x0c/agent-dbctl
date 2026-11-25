@@ -52,37 +52,95 @@ var sqlAdminFunctions = map[string]bool{
 	"dbms_sql":                  true,
 	"dbms_sql.execute":          true,
 	"dbms_pipe":                 true,
-	"sf_set_session_para_value": true,
-	"sf_set_system_para_value":  true,
-	"sp_set_para_value":         true,
-	"sp_set_para_double_value":  true,
-	"sp_create_system_packages": true,
-	"sp_set_session_readonly":   true,
-	"pg_switch_xlog":            true,
-	"gs_password_notify":        true,
-	"gs_wlm_readjust_user_space": true,
+	"sf_set_session_para_value":  true,
+	"sf_set_system_para_value":   true,
+	"sf_set_para_value":          true,
+	"sp_set_para_value":          true,
+	"sp_set_para_double_value":   true,
+	"sp_set_para_string_value":   true,
+	"sp_create_system_packages":  true,
+	"sp_set_session_readonly":    true,
+	"sp_close_session":           true,
+	"sp_cancel_session_operation": true,
+	"sp_create_job":              true,
+	"dbms_job":                   true,
+	"dbms_scheduler":             true,
+	"dbms_xmlgen":                true,
+	"dbms_lob.loadfromfile":      true,
+	"dbms_lob.fileopen":          true,
+	"pg_switch_xlog":             true,
+	"pg_start_backup":            true,
+	"pg_stop_backup":             true,
+	"pgxc_pool_reload":           true,
+	"pgxc_lock_for_backup":       true,
+	"gs_password_notify":         true,
+	"gs_wlm_session_respool":     true,
+	"sys_read_file":              true,
+	"sys_read_binary_file":       true,
+	"sys_ls_dir":                 true,
+	"sys_ls_logdir":              true,
+	"sys_ls_waldir":              true,
+	"sys_ls_tmpdir":              true,
+	"sys_stat_file":              true,
+	"sys_terminate_backend":      true,
+	"sys_cancel_backend":         true,
+	"sys_reload_conf":            true,
+	"sys_rotate_logfile":         true,
+	"sys_switch_wal":             true,
+	"sys_create_restore_point":   true,
+	"sys_backup_start":           true,
+	"sys_backup_stop":            true,
+	"sys_start_backup":           true,
+	"sys_stop_backup":            true,
+}
+
+func isSQLAdminFunction(fn string) bool {
+	if sqlAdminFunctions[fn] {
+		return true
+	}
+	for _, prefix := range []string{
+		"gs_roach_", "gs_wlm_readjust_", "gs_wlm_rebuild_", "gs_wlm_switch_", "gs_wlm_node_",
+		"dbms_sql.", "dbms_job.", "dbms_scheduler.", "dbms_xmlgen.",
+		"utl_file.", "utl_http.", "utl_tcp.",
+	} {
+		if strings.HasPrefix(fn, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 var sqlWriteFunctions = map[string]bool{
-	"nextval":                     true,
-	"setval":                      true,
-	"pg_advisory_lock":            true,
-	"pg_advisory_lock_shared":     true,
-	"pg_try_advisory_lock":        true,
-	"pg_try_advisory_lock_shared": true,
-	"pg_advisory_xact_lock":       true,
+	"nextval":                      true,
+	"setval":                       true,
+	"pg_advisory_lock":             true,
+	"pg_advisory_lock_shared":      true,
+	"pg_try_advisory_lock":         true,
+	"pg_try_advisory_lock_shared":  true,
+	"pg_advisory_xact_lock":        true,
 	"pg_advisory_xact_lock_shared": true,
-	"pg_advisory_unlock":          true,
-	"pg_advisory_unlock_all":      true,
-	"get_lock":                    true,
-	"release_lock":                true,
-	"release_all_locks":           true,
+	"pg_advisory_unlock":           true,
+	"pg_advisory_unlock_all":       true,
+	"sys_advisory_lock":            true,
+	"sys_advisory_lock_shared":     true,
+	"sys_try_advisory_lock":        true,
+	"sys_try_advisory_lock_shared": true,
+	"sys_advisory_xact_lock":       true,
+	"sys_advisory_xact_lock_shared": true,
+	"sys_advisory_unlock":          true,
+	"sys_advisory_unlock_all":      true,
+	"get_lock":                     true,
+	"release_lock":                 true,
+	"release_all_locks":            true,
 }
 
 var sqlHighCostFunctions = map[string]bool{
 	"pg_sleep":        true,
 	"pg_sleep_for":    true,
 	"pg_sleep_until":  true,
+	"sys_sleep":       true,
+	"sys_sleep_for":   true,
+	"sys_sleep_until": true,
 	"sleep":           true,
 	"benchmark":       true,
 	"randomblob":      true,
@@ -453,7 +511,7 @@ func classifySQLTokens(rawTokens []string, snippet string) types.StatementSummar
 			Snippet:       snippet,
 		}
 
-	case "GRANT", "REVOKE", "COPY", "LOAD", "CALL", "EXEC", "EXECUTE", "VACUUM", "ANALYZE", "REINDEX", "CLUSTER", "KILL", "FLUSH", "LOCK", "UNLOCK", "SET", "USE", "ATTACH", "DETACH",
+	case "GRANT", "REVOKE", "COPY", "LOAD", "CALL", "EXEC", "EXECUTE", "VACUUM", "ANALYZE", "REINDEX", "CLUSTER", "KILL", "FLUSH", "COMPACT", "RESET", "LOCK", "UNLOCK", "SET", "USE", "ATTACH", "DETACH",
 		"OPTIMIZE", "SYSTEM", "EXCHANGE", "BACKUP", "RESTORE", "DBCC", "SHUTDOWN", "RECONFIGURE", "BULK", "WAITFOR":
 		if first == "COPY" && containsToken(kwUpper, "PROGRAM") {
 			flags = append(flags, "copy_program_rce")
@@ -540,7 +598,7 @@ func analyzeSelectQuery(stmtType string, rawTokens, upper, kwUpper, flags []stri
 	fns := extractSQLFunctions(rawTokens)
 	fnRisk := types.RiskSafeRead
 	for _, fn := range fns {
-		if sqlAdminFunctions[fn] {
+		if isSQLAdminFunction(fn) {
 			flags = append(flags, "dangerous_admin_function")
 			if riskRank(types.RiskAdmin) > riskRank(fnRisk) {
 				fnRisk = types.RiskAdmin
@@ -581,6 +639,10 @@ func analyzeSelectQuery(stmtType string, rawTokens, upper, kwUpper, flags []stri
 	hasCrossJoin := containsSequence(kwUpper, "CROSS", "JOIN")
 	hasCommaJoin := hasImplicitCommaJoin(upper)
 	isRecursive := containsToken(flags, "recursive_cte")
+	hasConnectBy := containsSequence(kwUpper, "CONNECT", "BY")
+	if hasConnectBy {
+		flags = append(flags, "connect_by")
+	}
 
 	if hasCrossJoin {
 		flags = append(flags, "cross_join")
@@ -601,8 +663,8 @@ func analyzeSelectQuery(stmtType string, rawTokens, upper, kwUpper, flags []stri
 	if stmtType == "TABLE" && !hasLimit {
 		flags = append(flags, "missing_where", "missing_limit", "table_full_scan")
 	} else {
-		// Recursive CTEs can amplify into millions of rows even under scalar aggregates.
-		scalarAgg := !isRecursive && (isScalarAggregateOnly(kwUpper) || isOracleDualQuery(kwUpper))
+		// Recursive CTEs and Oracle/Dameng CONNECT BY queries can amplify into millions of rows from DUAL.
+		scalarAgg := !isRecursive && !hasConnectBy && (isScalarAggregateOnly(kwUpper) || isOracleDualQuery(kwUpper))
 		hasBoundedLimit := hasBoundedTopLevelLimit(upper, 1000)
 		if hasFrom && !hasWhere && !hasLimit && !scalarAgg {
 			flags = append(flags, "missing_where", "missing_limit")
@@ -616,6 +678,7 @@ func analyzeSelectQuery(stmtType string, rawTokens, upper, kwUpper, flags []stri
 
 	risk := types.RiskSafeRead
 	if isRecursive ||
+		hasConnectBy ||
 		containsToken(flags, "order_by_random") ||
 		containsToken(flags, "sql_calc_found_rows") ||
 		containsToken(flags, "deep_offset") ||
