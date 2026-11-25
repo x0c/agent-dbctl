@@ -72,6 +72,26 @@ Enterprise environments involve multiple business systems, shared jump hosts, pr
 - **Tier 1 (Built-in Pure Go, `CGO_ENABLED=0`)**: PostgreSQL (`pgx/v5`), MySQL / MariaDB / TiDB (`go-sql-driver/mysql` via per-connection `mysql.NewConnector`), SQLite (`modernc.org/sqlite`), MongoDB (`mongo-go-driver/v2`), Redis / Valkey (`go-redis/v9`). Drivers adapt across server versions and restricted privilege tiers (e.g., `EXPLAIN` JSON/tree/tabular fallbacks, `transaction_read_only`/`tx_read_only`, `hello`/`isMaster`/`buildInfo` probes, RESP2/RESP3 normalization, and PgBouncer `exec_mode=simple_protocol`).
 - **Tier 3 (External gRPC Subprocess Plugins)**: Loaded via `hashicorp/go-plugin` over gRPC from `<config_home>/plugins/<id>/manifest.json`. Verified against `host_api_version` and binary SHA-256 before execution. Crashes are isolated to the subprocess; daemon-managed network tunnels (`ssh_tunnel`, `socks5`, `http_proxy`) are bridged over an ephemeral authenticated loopback forwarder when `DialContext` is active.
 
+### Connection Lifecycle & Multi-Version Contracts
+
+- **Per-Operation Lifecycle & Cancel Discard**: `Service.openDriverConn` currently resolves credentials and builds a `netdial` dialer per operation (`Ping`, `DiscoverInstance`, `Preflight`, `Execute`), wrapping cleanup hooks with `driver.CloseOnce`. On timeout or cancellation, `ExecuteWithCancelGuard` invokes `Conn.CancelAndDiscard()` (including when `ctx.Err() != nil` on the result branch); PostgreSQL issues `CancelRequest` and MySQL issues `KILL QUERY <connection_id>` over a short-lived side connection before closing.
+- **Engine-Specific Multi-Version & Read-Only Enforcement**:
+  - **PostgreSQL**: Builds `pgx.ConnConfig` directly (safe for IPv6 and special database names), supports `exec_mode=simple_protocol` for PgBouncer/proxies, protects `default_transaction_read_only=on` after `Params` when `ReadOnly` is true, detects `Parallel Seq Scan` / `Foreign Scan` in JSON plans, and falls back to text `EXPLAIN` / `SELECT version()`.
+  - **MySQL / MariaDB / TiDB**: Uses `mysql.NewConnector` (avoiding global `RegisterTLSConfig`/`RegisterDialContext` leaks), wraps `driver.Connector.Connect` to enforce `SET SESSION TRANSACTION READ ONLY` -> `tx_read_only = 1` -> `transaction_read_only = 1` on every physical connection (failing closed if all fail), blocks `MultiStatements`/`AllowAllFiles`/`AllowCleartextPasswords` overrides in read-only mode, and parses MySQL v1 JSON, MySQL 8.4 `explain_json_format_version=2`, MariaDB `rows`, and tabular `EXPLAIN` (MySQL 5.5 / TiDB).
+  - **SQLite**: Encodes `file:` URIs cleanly, applies `mode=ro` + `query_only(1)` on non-`:memory:` read-only targets (preventing empty file creation on probes), honors allowlisted pragmas, and Base64-encodes non-UTF-8 `BLOB` columns.
+  - **MongoDB**: Iterates full cursors via `getMore` + `killCursors` cleanup, auto-enables `directConnection=true` when dialing a single host over a tunnel/proxy unless overridden, defaults `ReadOnly` to `SecondaryPreferred`, falls back `Ping` from `buildInfo` to `hello`/`isMaster` and `ListDatabases` to `authorizedDatabases: true`, and normalizes `Decimal128`/`Timestamp`/`Regex`/non-finite floats.
+  - **Redis / Valkey**: Uses `redis.NewUniversalClient` (standalone or `cluster=true` / comma-separated seeds, configurable `protocol=2|3`), falls back `Ping` past ACL-restricted `INFO server`, normalizes RESP3 `map[any]any` for JSON marshaling, and caps single-command array/map replies via `RowBuffer`.
+
+### Pending Connection & Driver Roadmap (Unimplemented Design Decisions)
+
+1. **Daemon SSH Tunnel & Read-Only Connection Pooling (`TunnelPool` / `ConnPool`)**:
+   - *Gap*: Under `guarded`/`strict` environments, a single safe read currently opens and tears down two separate SSH tunnels and database connections (`Preflight` followed by `Execute`).
+   - *Target design*: Cache keepalive-enabled `ssh.Client` instances keyed by `(network_profile_id, bastion_cred_hash)` with idle TTL eviction and catalog-change invalidation; optionally pool read-only `driver.Conn` handles keyed by `(target_id, cred_mode, read_only)` while keeping write operations and `CancelAndDiscard()` connections unpooled/discarded.
+   - *Open decision*: Secret-rotation invalidation policy (for `exec_provider` short-lived tokens) and session-state reset rules before connection reuse.
+2. **Explicit Dialect & Negotiated Server Capability Registry (`Dialect` / `ServerCapabilities`)**:
+   - *Gap*: `Instance.Engine` routes at coarse engine granularity (`postgres`, `mysql`, `sqlite`, `mongodb`, `redis`) without persisting the negotiated server dialect/version (`mariadb`, `tidb`, `cockroachdb`, `redshift`, `valkey`, `redis-cluster`).
+   - *Target design*: Capture and expose negotiated `dialect`, `server_version`, and capability flags during `Ping`/`DiscoverInstance` so preflight, policy, and the Web Console adapt deterministically without per-call probing.
+
 ### Risk Classification & Preflight
 
 - **Multi-statement safety**: Multi-statement SQL scripts are split respecting quotes, dollar-quotes, and comments; overall classification takes the maximum severity across all statements.
@@ -80,7 +100,7 @@ Enterprise environments involve multiple business systems, shared jump hosts, pr
   - SQL: missing `LIMIT` / `WHERE`, `SELECT *` without `WHERE`, `FOR UPDATE` / `LOCK IN SHARE MODE`, `EXPLAIN ANALYZE`, `CROSS JOIN`, `SELECT INTO`, multi-statement queries.
   - MongoDB: empty filter `{}` without limit, `aggregate` without `$limit`, `$where`, write stages `$out`/`$merge`.
   - Redis: `KEYS`, `HGETALL`, `HKEYS`, `HVALS`, `SMEMBERS`, unbounded `LRANGE`/`ZRANGE`, `MONITOR`, `DUMP`, `SINTER`/`SUNION`/`SDIFF` (`high_cost_read`), plus writes/admin (`SET`, `DEL`, `FLUSHDB`, `FLUSHALL`, `EVAL`, etc.).
-- **Preflight (`EXPLAIN` without `ANALYZE`)**: In `guarded`/`strict` environments, safe reads undergo `EXPLAIN` preflight before execution; full scans (`Seq Scan`, `ALL`, `COLLSCAN`, SQLite `SCAN`) or estimated rows exceeding `explain_max_rows` escalate to `require_approval`, attaching the plan summary to the approval card.
+- **Preflight (`EXPLAIN` without `ANALYZE`)**: In `guarded`/`strict` environments, safe reads undergo `EXPLAIN` preflight before execution; full scans (`Seq Scan`, `ALL`, `COLLSCAN`, SQLite `SCAN`) or estimated rows exceeding `explain_max_rows` escalate to `require_approval`, attaching the plan summary to the approval card. See [READ_RISK_AUDIT.md](READ_RISK_AUDIT.md) for empirically verified high-risk read patterns and current classifier/preflight gaps.
 
 ### Four-Level Monotonic Policy Inheritance
 

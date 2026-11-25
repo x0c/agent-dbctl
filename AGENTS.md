@@ -8,9 +8,10 @@ Read the relevant document(s) before making design, protocol, CLI contract, or U
 
 - [README.md](README.md): Public overview, supported platforms, installation, and quick start.
 - [README.zh-CN.md](README.zh-CN.md): Complete Simplified Chinese overview and quick start.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): System boundaries, four-layer catalog (`System` -> `Environment` -> `Instance` -> `Target`), network/credential decoupling, classifier + `EXPLAIN` preflight, 4-level monotonic policy inheritance, `ApprovalProvider` abstraction, append-only hash-chain audit log, and silent companion skill sync.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): System boundaries, four-layer catalog (`System` -> `Environment` -> `Instance` -> `Target`), network/credential decoupling, driver connection/multi-version contracts and pending pooling/dialect roadmap, classifier + `EXPLAIN` preflight, 4-level monotonic policy inheritance, `ApprovalProvider` abstraction, append-only hash-chain audit log, and silent companion skill sync.
+- [docs/READ_RISK_AUDIT.md](docs/READ_RISK_AUDIT.md): Empirically verified dangerous and high-load read statement matrix across PostgreSQL, MySQL, SQLite, MongoDB, and Redis, plus current classifier, preflight, and policy-gate coverage gaps.
 - [docs/CLI_CONTRACT.md](docs/CLI_CONTRACT.md): `agent-friendly-cli` contract, command hierarchy, flags and aliases, JSON envelope `{ok, data, error, meta}`, OS exit codes (`0..7`), semantic `error.code` catalog, `--dry-run` vs `--preflight`, `--wait=false` + `op status`, truncation & `--out`, companion skill management, and environment variable overrides.
-- [docs/PLUGIN_PROTOCOL.md](docs/PLUGIN_PROTOCOL.md): Tier-3 external gRPC driver plugin protocol (`proto/driver/v1/driver.proto`), `manifest.json` schema, SHA-256 integrity verification, and `ApprovalProvider` extension contract.
+- [docs/PLUGIN_PROTOCOL.md](docs/PLUGIN_PROTOCOL.md): Tier-3 external gRPC driver plugin protocol (`proto/driver/v1/driver.proto`), `manifest.json` schema, SHA-256 integrity verification, loopback tunnel bridge, `v1` caveats and pending `v2` typed-protobuf/cancel roadmap, and `ApprovalProvider` extension contract.
 - [skills/agent-dbctl/SKILL.md](skills/agent-dbctl/SKILL.md): Canonical companion coding-agent skill synced to local agent skill directories.
 - [SECURITY.md](SECURITY.md): Threat model, local execution guarantees, and private vulnerability reporting.
 - [CONTRIBUTING.md](CONTRIBUTING.md): Development checks and CI-independent local release packaging.

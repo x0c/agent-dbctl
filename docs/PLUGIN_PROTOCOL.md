@@ -49,6 +49,15 @@ Defined in [proto/driver/v1/driver.proto](proto/driver/v1/driver.proto):
 - `Execute(ExecuteRequest) -> stream ExecuteChunk`: Streams columns, row/document batches, `affected_rows`, server messages, and final summary (`fetched_rows`, `truncated`, `cutoff_reason`, `latency_ms`) so large result sets can be capped cleanly at `max_rows` / `max_bytes` without OOM or lost truncation status.
 - **Network Tunnel & TLS Forwarding**: `TargetSpec` carries `tls_mode`, and when the host configures a bastion/proxy `DialContext`, the host opens an ephemeral per-connection `127.0.0.1` TCP forwarder and rewrites `TargetSpec.Host`/`Port` to the local listener so plugins work transparently across SSH tunnels and proxies without embedding proxy/SSH logic.
 
+### Known `v1` Limitations & Pending `v2` Protocol Roadmap
+
+- **Current `v1` Limitations**:
+  - `proto/driver/v1/driver.proto` transports payloads through `google.protobuf.Struct` + JSON marshaling, which converts JSON numbers through `float64` and loses precision on 64-bit integer keys above $2^{53}$.
+  - Host-side `CancelAndDiscard()` closes the local stream and dial bridge, but `v1` has no explicit out-of-band `Cancel` RPC to abort an already-running backend query inside a plugin subprocess.
+  - `Preflight` and `ListDatabases` are dispatched even if a plugin omits those flags from `manifest.json` `capabilities`.
+- **Pending `driver.v2.DriverPlugin` Roadmap (Unimplemented Design Decision)**:
+  - Introduce typed Protobuf messages (native `int64`, `bytes`, typed value `oneof`) alongside `host_api_version: 2`, an explicit `Cancel(OperationRef)` RPC / stateful session handle, and capability-gated host dispatch (`capabilities` enforcement before RPC calls).
+
 ---
 
 ## 2. Pluggable Approval Providers (`internal/approval.Provider`)
