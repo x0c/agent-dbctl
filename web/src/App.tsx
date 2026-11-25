@@ -1,5 +1,18 @@
-import { AdminShell, type AdminNavItem, Badge, Button, Toaster, toast } from '@x0c/ui'
-import { Cpu, Database, Languages, ScrollText, ShieldAlert, ShieldCheck } from 'lucide-react'
+import {
+  type AdminNavItem,
+  AppFrame,
+  AppTopbar,
+  Button,
+  type CommandAction,
+  CommandPalette,
+  MobileTabBar,
+  SideNav,
+  SideNavItem,
+  SideNavSection,
+  Toaster,
+  toast,
+} from '@x0c/ui'
+import { Cpu, Database, Languages, ScrollText, Search, ShieldAlert, ShieldCheck } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api, type BootstrapPayload, type DisplayCatalog } from './api'
 import { ApprovalsTab } from './components/ApprovalsTab'
@@ -95,6 +108,7 @@ export function App() {
   const [catalog, setCatalog] = useState<DisplayCatalog>(() => loadCachedCatalog())
   const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null)
   const [pendingCount, setPendingCount] = useState<number>(0)
+  const [cmdOpen, setCmdOpen] = useState(false)
 
   const refreshBootstrap = async () => {
     try {
@@ -140,34 +154,115 @@ export function App() {
     }
   }
 
+  const sections: Array<{ title?: string; items: Array<AdminNavItem & { id: Tab }> }> = []
+  for (const item of navItems) {
+    const last = sections[sections.length - 1]
+    if (!last || last.title !== item.section) {
+      sections.push({ title: item.section, items: [item] })
+    } else {
+      last.items.push(item)
+    }
+  }
+
+  const commandItems: CommandAction[] = [
+    ...navItems.map((item) => ({
+      id: `nav:${item.id}`,
+      label: item.label,
+      group: item.section,
+      icon: item.icon,
+      onSelect: () => setTab(item.id),
+    })),
+    {
+      id: 'pref:lang',
+      label: t('common.langToggleTitle'),
+      group: t('command.group.preferences'),
+      icon: Languages,
+      onSelect: () => setLocale(locale === 'zh' ? 'en' : 'zh'),
+    },
+  ]
+
+  const metaLine = bootstrap
+    ? bootstrap.identity.session && bootstrap.identity.session !== 'default'
+      ? `${bootstrap.identity.session} · ${bootstrap.identity.version}`
+      : bootstrap.identity.version
+    : null
+
   return (
-    <>
-      <AdminShell
-        product="agent-dbctl"
-        nav={navItems}
+    <div className="min-h-svh bg-background text-foreground">
+      <AppTopbar product="agent-dbctl" onBrandClick={() => setTab('approvals')}>
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setCmdOpen(true)}
+            className="hidden h-8 gap-2 px-2.5 text-xs text-muted-foreground sm:inline-flex"
+            aria-label={t('command.ariaLabel')}
+          >
+            <Search className="size-3.5" />
+            <span>{t('command.trigger')}</span>
+            <kbd className="rounded border border-border bg-muted px-1 py-0.5 font-mono text-[10px] leading-none">
+              ⌘K
+            </kbd>
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-8 gap-1.5 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground"
+            title={t('common.langToggleTitle')}
+            aria-label={t('common.langToggleTitle')}
+            onClick={() => setLocale(locale === 'zh' ? 'en' : 'zh')}
+          >
+            <Languages className="size-3.5" />
+            <span>{t('common.langToggle')}</span>
+          </Button>
+        </div>
+      </AppTopbar>
+
+      <CommandPalette
+        open={cmdOpen}
+        onOpenChange={setCmdOpen}
+        items={commandItems}
+        title={t('command.title')}
+        placeholder={t('command.placeholder')}
+        emptyLabel={t('command.empty')}
+      />
+
+      <MobileTabBar
+        items={navItems}
         activeId={tab}
-        onSelectNav={(id) => setTab(id as Tab)}
-        onBrandClick={() => setTab('approvals')}
-        navAriaLabel={t('nav.ariaLabel')}
-        enableCommandPalette
-        topbarExtra={
-          <div className="flex items-center gap-2">
-            {bootstrap && (
-              <Badge variant="outline" className="font-mono text-[11px]">
-                {bootstrap.identity.session} · {bootstrap.identity.version}
-              </Badge>
+        onSelect={(id) => setTab(id as Tab)}
+        label={t('nav.ariaLabel')}
+      />
+
+      <AppFrame
+        sidebar={
+          <div className="flex flex-col">
+            <SideNav label={t('nav.ariaLabel')}>
+              {sections.map((sec, idx) => (
+                <div key={sec.title ?? idx}>
+                  {sec.title && <SideNavSection>{sec.title}</SideNavSection>}
+                  <div className="flex flex-col gap-0.5">
+                    {sec.items.map((item) => (
+                      <SideNavItem
+                        key={item.id}
+                        active={item.id === tab}
+                        icon={item.icon}
+                        onClick={() => setTab(item.id)}
+                      >
+                        {item.label}
+                      </SideNavItem>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </SideNav>
+            {metaLine && (
+              <div className="px-2.5 pt-6 font-mono text-[11px] text-muted-foreground/60">
+                {metaLine}
+              </div>
             )}
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 px-2 text-xs"
-              title={t('common.langToggleTitle')}
-              aria-label={t('common.langToggleTitle')}
-              onClick={() => setLocale(locale === 'zh' ? 'en' : 'zh')}
-            >
-              <Languages className="size-3.5" />
-              {t('common.langToggle')}
-            </Button>
           </div>
         }
       >
@@ -201,9 +296,9 @@ export function App() {
         )}
         {tab === 'audit' && <AuditTab catalog={catalog} />}
         {tab === 'drivers' && <DriversTab />}
-      </AdminShell>
+      </AppFrame>
       <Toaster />
-    </>
+    </div>
   )
 }
 
