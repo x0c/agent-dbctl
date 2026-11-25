@@ -31,6 +31,7 @@ Pin and reuse the verified absolute binary path (`"$BIN"`) for the rest of the s
 When a database is not yet registered (`db list` returns empty or `db_not_found`), configure it directly through `agent-dbctl` CLI commands (every change is atomic, idempotent, and hash-chain audited):
 
 1. **One-shot registration (`db add`)**:
+   - Unless `--no-workspace` is set, `db list` and `db add` automatically detect local `workspace_paths` and canonicalized `git_remotes` (supporting Git worktrees and subdirectories) to reuse matching systems instead of creating duplicates from worktree directory names. Pass `--git-remote <url>` (or `system set --git-remote <url>`) to bind additional remotes explicitly.
    - **Zero-secret Web handoff (recommended when human will enter password)**: leave password blank and pass `--open-secret` so the browser opens straight to that credential's password dialog:
      ```sh
      "$BIN" db add --engine postgres --host 127.0.0.1 --port 5432 --database orders \
