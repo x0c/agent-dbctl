@@ -264,7 +264,7 @@ func registerRPCRoutes(mux *http.ServeMux, svc *Service, shutdownFn func()) {
 				offset = n
 			}
 		}
-		items, total, err := svc.Store().ListAuditEntriesFiltered(r.Context(), store.AuditFilter{
+		items, total, truncated, err := svc.listAuthorizedAuditEntries(r.Context(), store.AuditFilter{
 			Action:      q.Get("action"),
 			TargetID:    q.Get("target"),
 			OperationID: q.Get("operation_id"),
@@ -277,15 +277,6 @@ func registerRPCRoutes(mux *http.ServeMux, svc *Service, shutdownFn func()) {
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
-		}
-		truncated := offset+len(items) < total
-		if svc.IsServerMode() {
-			p := rbac.PrincipalFromContext(r.Context())
-			if !rbac.IsPlatformAdmin(p) {
-				items = filterAuditForPrincipal(r.Context(), svc, p, items)
-				total = len(items)
-				truncated = false
-			}
 		}
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"items":         items,

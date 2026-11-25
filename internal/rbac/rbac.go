@@ -274,7 +274,7 @@ func Authorize(p types.Principal, action Action, res ResourceScope) error {
 }
 
 // AuthorizeApprovalDecision enforces human-only approval, approver RBAC, and optional four-eyes separation.
-func AuthorizeApprovalDecision(p types.Principal, app types.ApprovalRequest, systemID string, forbidSelf bool) error {
+func AuthorizeApprovalDecision(p types.Principal, app types.ApprovalRequest, systemID, opOwnerUserID string, forbidSelf bool) error {
 	if p.Kind == types.PrincipalLocalOwner {
 		return nil
 	}
@@ -288,9 +288,11 @@ func AuthorizeApprovalDecision(p types.Principal, app types.ApprovalRequest, sys
 	}); err != nil {
 		return err
 	}
-	if forbidSelf && app.PrincipalID != "" {
-		// Compare canonical user ID or requester subject.
-		if app.PrincipalID == p.ID || (app.Actor != "" && strings.EqualFold(app.Actor, p.Subject)) {
+	if forbidSelf {
+		// Compare requester user ID, linked operation owner, and requester subject.
+		if (app.PrincipalID != "" && app.PrincipalID == p.ID) ||
+			(opOwnerUserID != "" && opOwnerUserID == p.ID) ||
+			(app.Actor != "" && strings.EqualFold(app.Actor, p.Subject)) {
 			return fmt.Errorf("forbidden: four-eyes policy forbids self-approval")
 		}
 	}

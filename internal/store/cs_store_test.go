@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -85,6 +87,45 @@ func TestRebindPostgresAndCSStoreLifecycle(t *testing.T) {
 	}
 	if err := st.CheckAndStoreWebhookNonce(ctx, "feishu", "evt_1", exp); err == nil {
 		t.Fatalf("expected replayed webhook nonce to fail")
+	}
+
+	// Verify PrincipalKind persistence for human CLI tokens vs agent tokens.
+	humanTok, err := st.CreateAPIToken(ctx, "user:"+u.Email, types.APIToken{
+		UserID:        u.ID,
+		Name:          "cli-sso-session",
+		TokenPrefix:   "humn1234",
+		TokenHash:     "hash_human",
+		PrincipalKind: types.PrincipalHuman,
+	})
+	if err != nil {
+		t.Fatalf("CreateAPIToken human: %v", err)
+	}
+	gotHuman, _, err := st.LookupAPITokenByHash(ctx, "hash_human")
+	if err != nil || gotHuman.ID != humanTok.ID || gotHuman.PrincipalKind != types.PrincipalHuman {
+		t.Fatalf("LookupAPITokenByHash human mismatch: tok=%+v err=%v", gotHuman, err)
+	}
+	toks, err := st.ListAPITokens(ctx, u.ID)
+	if err != nil || len(toks) < 2 {
+		t.Fatalf("ListAPITokens mismatch: toks=%+v err=%v", toks, err)
+	}
+
+	// Verify concurrent audit writes remain strictly serialized and hash-chain valid.
+	var auditWG sync.WaitGroup
+	errs := make(chan error, 12)
+	for i := 0; i < 12; i++ {
+		i := i
+		auditWG.Add(1)
+		go func() {
+			defer auditWG.Done()
+			if err := st.RecordAuditEvent(ctx, "user:alice@corp.com", "audit.concurrent", fmt.Sprintf("tgt_%d", i), "", map[string]any{"i": i}); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	auditWG.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent RecordAuditEvent failed: %v", err)
 	}
 
 	// Verify audit chain after all C/S mutations.

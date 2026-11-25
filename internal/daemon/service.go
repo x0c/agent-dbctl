@@ -1347,13 +1347,14 @@ func (s *Service) ResolveApproval(ctx context.Context, approvalID string, approv
 		if s.serverCfg != nil && s.serverCfg.Auth.ForbidSelfApproval != nil {
 			forbidSelf = forbidSelf && *s.serverCfg.Auth.ForbidSelfApproval
 		}
-		if authErr := rbac.AuthorizeApprovalDecision(p, appCur, sysID, forbidSelf); authErr != nil {
-			return types.ApprovalRequest{}, authErr
-		}
-		if forbidSelf {
-			if op, opErr := s.store.GetOperation(ctx, appCur.OperationID); opErr == nil && op.OwnerUserID != "" && op.OwnerUserID == p.ID {
-				return types.ApprovalRequest{}, fmt.Errorf("forbidden: four-eyes policy forbids self-approval")
+		opOwnerUserID := ""
+		if forbidSelf && appCur.OperationID != "" {
+			if op, opErr := s.store.GetOperation(ctx, appCur.OperationID); opErr == nil {
+				opOwnerUserID = op.OwnerUserID
 			}
+		}
+		if authErr := rbac.AuthorizeApprovalDecision(p, appCur, sysID, opOwnerUserID, forbidSelf); authErr != nil {
+			return types.ApprovalRequest{}, authErr
 		}
 		reviewer = p.Subject
 		reviewerUserID = p.ID
@@ -1562,6 +1563,16 @@ func (s *Service) TestRiskPattern(ctx context.Context, req types.PatternTestRequ
 		detail, err := s.ResolveTarget(ctx, req.TargetID, "")
 		if err != nil {
 			return types.PatternTestResult{}, err
+		}
+		if s.IsServerMode() {
+			sysID, sysSlug := targetDetailSystemScope(detail)
+			if authErr := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionCatalogRead, rbac.ResourceScope{
+				SystemID:        sysID,
+				SystemSlug:      sysSlug,
+				EnvironmentCode: detail.Target.EnvironmentCode,
+			}); authErr != nil {
+				return types.PatternTestResult{}, authErr
+			}
 		}
 		tgt = detail.Target
 		eff = detail.EffectivePolicy

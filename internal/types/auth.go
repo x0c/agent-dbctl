@@ -63,13 +63,14 @@ type RoleBinding struct {
 
 // APIToken represents a revocable, scope-limited credential issued to CLI/coding agents.
 type APIToken struct {
-	ID             string   `json:"id"`
-	UserID         string   `json:"user_id"`
-	OwnerEmail     string   `json:"owner_email,omitempty"`
-	Name           string   `json:"name"`
-	TokenPrefix    string   `json:"token_prefix"`
-	TokenHash      string   `json:"-"`
-	RoleCeiling    Role     `json:"role_ceiling"`
+	ID             string        `json:"id"`
+	UserID         string        `json:"user_id"`
+	OwnerEmail     string        `json:"owner_email,omitempty"`
+	Name           string        `json:"name"`
+	TokenPrefix    string        `json:"token_prefix"`
+	TokenHash      string        `json:"-"`
+	PrincipalKind  PrincipalKind `json:"principal_kind,omitempty"`
+	RoleCeiling    Role          `json:"role_ceiling"`
 	AllowedSystems []string `json:"allowed_systems,omitempty"`
 	AllowedEnvs    []string `json:"allowed_envs,omitempty"`
 	ReadOnlyForced bool     `json:"read_only_forced"`

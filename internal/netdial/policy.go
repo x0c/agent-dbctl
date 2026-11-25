@@ -88,7 +88,7 @@ func (p DialPolicy) CheckIP(ip net.IP) error {
 	if len(p.AllowedCIDRs) > 0 && !ipInAny(ip, p.AllowedCIDRs) {
 		return fmt.Errorf("egress address %s is outside allowed_egress_cidrs", ip.String())
 	}
-	if len(p.BlockedCIDRs) == 0 && ipInAny(ip, defaultBlockedNets) && !ipInAny(ip, p.AllowedCIDRs) {
+	if ipInAny(ip, defaultBlockedNets) && !ipInAny(ip, p.AllowedCIDRs) {
 		return fmt.Errorf("egress blocked to restricted address %s", ip.String())
 	}
 	return nil
@@ -191,7 +191,7 @@ func BuildContextWithPolicy(ctx context.Context, np *types.NetworkProfile, basti
 		}
 		return DialResult{
 			DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
-				return dialHTTPConnect(dctx, u, addr)
+				return dialHTTPConnectWithDialer(dctx, u, addr, d)
 			},
 			TLSMode:   tlsMode,
 			TLSConfig: tlsCfg,
@@ -205,7 +205,7 @@ func BuildContextWithPolicy(ctx context.Context, np *types.NetworkProfile, basti
 		if err := checkDialHostPolicy(ctx, np.BastionHost, pol); err != nil {
 			return DialResult{}, err
 		}
-		return buildSSHTunnel(ctx, np, bastionCred, tlsMode, tlsCfg)
+		return buildSSHTunnelWithDialer(ctx, np, bastionCred, tlsMode, tlsCfg, d)
 
 	default:
 		return DialResult{}, fmt.Errorf("unsupported network mode %q", np.Mode)
@@ -221,7 +221,7 @@ func checkDialHostPolicy(ctx context.Context, host string, pol DialPolicy) error
 	}
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		return nil
+		return fmt.Errorf("resolve egress host %q: %w", host, err)
 	}
 	for _, ip := range ips {
 		if err := pol.CheckIP(ip.IP); err != nil {
@@ -242,5 +242,5 @@ func (p *TunnelPool) BuildContextWithPolicy(ctx context.Context, np *types.Netwo
 	if err := checkDialHostPolicy(ctx, np.BastionHost, pol); err != nil {
 		return DialResult{}, err
 	}
-	return p.BuildContext(ctx, np, bastionCred, instanceTLSMode, targetHost)
+	return p.buildContextWithDialer(ctx, np, bastionCred, instanceTLSMode, targetHost, pol.NewDialer())
 }

@@ -405,6 +405,16 @@ func registerWebAPIRoutes(mux *http.ServeMux, svc *Service) {
 		id := r.PathValue("id")
 		for _, d := range details {
 			if d.Target.ID == id || d.Target.Ref == id {
+				if svc.IsServerMode() {
+					sysID, sysSlug := targetDetailSystemScope(d)
+					if !requireHTTPAction(w, r, rbac.ActionDBTest, rbac.ResourceScope{
+						SystemID:        sysID,
+						SystemSlug:      sysSlug,
+						EnvironmentCode: d.Target.EnvironmentCode,
+					}) {
+						return
+					}
+				}
 				writeJSONResp(w, http.StatusOK, svc.PingTarget(r.Context(), d))
 				return
 			}
@@ -416,6 +426,21 @@ func registerWebAPIRoutes(mux *http.ServeMux, svc *Service) {
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if svc.IsServerMode() {
+			p := rbac.PrincipalFromContext(r.Context())
+			filtered := make([]types.TargetDetail, 0, len(details))
+			for _, d := range details {
+				sysID, sysSlug := targetDetailSystemScope(d)
+				if rbac.Authorize(p, rbac.ActionDBTest, rbac.ResourceScope{
+					SystemID:        sysID,
+					SystemSlug:      sysSlug,
+					EnvironmentCode: d.Target.EnvironmentCode,
+				}) == nil {
+					filtered = append(filtered, d)
+				}
+			}
+			details = filtered
 		}
 		results := svc.PingTargets(r.Context(), details)
 		writeJSONResp(w, http.StatusOK, map[string]any{"results": results})
@@ -642,15 +667,27 @@ func registerWebAPIRoutes(mux *http.ServeMux, svc *Service) {
 	mux.HandleFunc("GET /api/v1/audit", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		limit, _ := strconv.Atoi(q.Get("limit"))
-		items, err := svc.Store().ListAuditEntries(r.Context(), q.Get("action"), q.Get("target"), q.Get("operation_id"), limit)
+		offset, _ := strconv.Atoi(q.Get("offset"))
+		items, total, truncated, err := svc.listAuthorizedAuditEntries(r.Context(), store.AuditFilter{
+			Action:      q.Get("action"),
+			TargetID:    q.Get("target"),
+			OperationID: q.Get("operation_id"),
+			Actor:       q.Get("actor"),
+			SinceUTC:    q.Get("since"),
+			UntilUTC:    q.Get("until"),
+			Limit:       limit,
+			Offset:      offset,
+		})
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		if svc.IsServerMode() {
-			items = filterAuditForPrincipal(r.Context(), svc, rbac.PrincipalFromContext(r.Context()), items)
-		}
-		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"items":         items,
+			"total_matched": total,
+			"returned":      len(items),
+			"truncated":     truncated,
+		})
 	})
 	mux.HandleFunc("POST /api/v1/audit/verify", func(w http.ResponseWriter, r *http.Request) {
 		if svc.IsServerMode() && !requireHTTPAction(w, r, rbac.ActionAuditVerify, rbac.ResourceScope{}) {

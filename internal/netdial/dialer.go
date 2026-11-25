@@ -146,8 +146,18 @@ func buildTLSConfig(mode, host string) (*tls.Config, error) {
 	}
 }
 
+func defaultDialer() *net.Dialer {
+	return &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+}
+
 func dialHTTPConnect(ctx context.Context, proxyURL *url.URL, targetAddr string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	return dialHTTPConnectWithDialer(ctx, proxyURL, targetAddr, defaultDialer())
+}
+
+func dialHTTPConnectWithDialer(ctx context.Context, proxyURL *url.URL, targetAddr string, d *net.Dialer) (net.Conn, error) {
+	if d == nil {
+		d = defaultDialer()
+	}
 	conn, err := d.DialContext(ctx, "tcp", proxyURL.Host)
 	if err != nil {
 		return nil, err
@@ -212,6 +222,13 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 }
 
 func dialSSHClient(ctx context.Context, np *types.NetworkProfile, cred secrets.ResolvedSecret) (*ssh.Client, error) {
+	return dialSSHClientWithDialer(ctx, np, cred, defaultDialer())
+}
+
+func dialSSHClientWithDialer(ctx context.Context, np *types.NetworkProfile, cred secrets.ResolvedSecret, dialer *net.Dialer) (*ssh.Client, error) {
+	if dialer == nil {
+		dialer = defaultDialer()
+	}
 	if np == nil {
 		return nil, fmt.Errorf("ssh_tunnel requires network profile")
 	}
@@ -281,7 +298,6 @@ func dialSSHClient(ctx context.Context, np *types.NetworkProfile, cred secrets.R
 		Timeout:         10 * time.Second,
 	}
 	bastionAddr := net.JoinHostPort(np.BastionHost, fmt.Sprintf("%d", port))
-	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	rawConn, err := dialer.DialContext(ctx, "tcp", bastionAddr)
 	if err != nil {
 		if agentConn != nil {
@@ -304,7 +320,11 @@ func dialSSHClient(ctx context.Context, np *types.NetworkProfile, cred secrets.R
 }
 
 func buildSSHTunnel(ctx context.Context, np *types.NetworkProfile, cred secrets.ResolvedSecret, tlsMode string, tlsCfg *tls.Config) (DialResult, error) {
-	client, err := dialSSHClient(ctx, np, cred)
+	return buildSSHTunnelWithDialer(ctx, np, cred, tlsMode, tlsCfg, defaultDialer())
+}
+
+func buildSSHTunnelWithDialer(ctx context.Context, np *types.NetworkProfile, cred secrets.ResolvedSecret, tlsMode string, tlsCfg *tls.Config, dialer *net.Dialer) (DialResult, error) {
+	client, err := dialSSHClientWithDialer(ctx, np, cred, dialer)
 	if err != nil {
 		return DialResult{}, err
 	}

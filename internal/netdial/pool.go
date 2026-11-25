@@ -115,7 +115,10 @@ func (p *TunnelPool) BuildContext(ctx context.Context, np *types.NetworkProfile,
 	if p == nil || np == nil || np.Mode != types.NetworkSSHTunnel {
 		return BuildContext(ctx, np, bastionCred, instanceTLSMode, targetHost)
 	}
+	return p.buildContextWithDialer(ctx, np, bastionCred, instanceTLSMode, targetHost, defaultDialer())
+}
 
+func (p *TunnelPool) buildContextWithDialer(ctx context.Context, np *types.NetworkProfile, bastionCred secrets.ResolvedSecret, instanceTLSMode, targetHost string, dialer *net.Dialer) (DialResult, error) {
 	tlsMode := strings.ToLower(strings.TrimSpace(instanceTLSMode))
 	if strings.TrimSpace(np.TLSMode) != "" && tlsMode == "" {
 		tlsMode = strings.ToLower(strings.TrimSpace(np.TLSMode))
@@ -126,14 +129,14 @@ func (p *TunnelPool) BuildContext(ctx context.Context, np *types.NetworkProfile,
 	}
 
 	key := buildTunnelKey(np, bastionCred)
-	entry, err := p.getOrDial(ctx, key, np, bastionCred)
+	entry, err := p.getOrDial(ctx, key, np, bastionCred, dialer)
 	if err != nil {
 		return DialResult{}, err
 	}
 
 	return DialResult{
 		DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
-			return p.dialThroughPool(dctx, key, np, bastionCred, entry, network, addr)
+			return p.dialThroughPool(dctx, key, np, bastionCred, entry, network, addr, dialer)
 		},
 		TLSMode:   tlsMode,
 		TLSConfig: tlsCfg,
@@ -142,11 +145,11 @@ func (p *TunnelPool) BuildContext(ctx context.Context, np *types.NetworkProfile,
 	}, nil
 }
 
-func (p *TunnelPool) dialThroughPool(dctx context.Context, key string, np *types.NetworkProfile, cred secrets.ResolvedSecret, initial *pooledTunnel, network, addr string) (net.Conn, error) {
+func (p *TunnelPool) dialThroughPool(dctx context.Context, key string, np *types.NetworkProfile, cred secrets.ResolvedSecret, initial *pooledTunnel, network, addr string, dialer *net.Dialer) (net.Conn, error) {
 	entry := initial
 	if entry == nil {
 		var err error
-		entry, err = p.getOrDial(dctx, key, np, cred)
+		entry, err = p.getOrDial(dctx, key, np, cred, dialer)
 		if err != nil {
 			return nil, err
 		}
@@ -165,7 +168,7 @@ func (p *TunnelPool) dialThroughPool(dctx context.Context, key string, np *types
 	p.evictIfSame(key, entry)
 	p.reconnects.Add(1)
 
-	fresh, dialErr := p.getOrDial(dctx, key, np, cred)
+	fresh, dialErr := p.getOrDial(dctx, key, np, cred, dialer)
 	if dialErr != nil {
 		return nil, err
 	}
@@ -189,7 +192,7 @@ func (p *TunnelPool) dialLockForKey(key string) *sync.Mutex {
 	return lk
 }
 
-func (p *TunnelPool) getOrDial(ctx context.Context, key string, np *types.NetworkProfile, cred secrets.ResolvedSecret) (*pooledTunnel, error) {
+func (p *TunnelPool) getOrDial(ctx context.Context, key string, np *types.NetworkProfile, cred secrets.ResolvedSecret, dialer *net.Dialer) (*pooledTunnel, error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -220,7 +223,7 @@ func (p *TunnelPool) getOrDial(ctx context.Context, key string, np *types.Networ
 	}
 	p.mu.Unlock()
 
-	client, err := dialSSHClient(ctx, np, cred)
+	client, err := dialSSHClientWithDialer(ctx, np, cred, dialer)
 	if err != nil {
 		return nil, err
 	}

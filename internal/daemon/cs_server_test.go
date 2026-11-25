@@ -562,4 +562,116 @@ func TestRemoteServerEnterpriseCS(t *testing.T) {
 	if carolWho.Email != "carol@corp.example" {
 		t.Fatalf("expected carol@corp.example principal, got %+v", carolWho)
 	}
+
+	// 5. Platform admin Device Flow session mints PrincipalHuman (can mutate envs/security via CLI),
+	// whereas scoped AgentToken stays blocked by ActionEnvWrite.
+	if err := aliceClient.DoJSON(ctx, http.MethodPost, "/rpc/v1/environments", map[string]any{
+		"environment": types.Environment{
+			Code:       "qa-blocked",
+			SafetyTier: types.SafetyTierGuarded,
+		},
+	}, nil); err == nil {
+		t.Fatalf("agent token must not mutate environments via CLI")
+	}
+
+	var adminDevStart types.DeviceCodeStartResponse
+	if err := unauthRPC.DoJSON(ctx, http.MethodPost, "/rpc/v1/auth/device/start", map[string]any{}, &adminDevStart); err != nil {
+		t.Fatalf("admin device start: %v", err)
+	}
+	resp, raw = webDo(adminWeb, http.MethodPost, "/api/v1/auth/device/decide", loginOut.CSRFToken, map[string]string{
+		"user_code": adminDevStart.UserCode,
+		"decision":  "approve",
+	}, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin device decide status=%d body=%s", resp.StatusCode, string(raw))
+	}
+	var adminPoll types.DeviceCodePollResponse
+	if err := unauthRPC.DoJSON(ctx, http.MethodPost, "/rpc/v1/auth/device/poll", map[string]string{"device_code": adminDevStart.DeviceCode}, &adminPoll); err != nil {
+		t.Fatalf("admin device poll: %v", err)
+	}
+	if adminPoll.Status != "approved" || adminPoll.AccessToken == "" {
+		t.Fatalf("unexpected admin device poll: %+v", adminPoll)
+	}
+	adminCLI, err := NewRemoteClient(config.ClientContext{
+		Name:       "srv",
+		Endpoint:   tlsSrv.URL,
+		CACertFile: caPath,
+	}, adminPoll.AccessToken)
+	if err != nil {
+		t.Fatalf("adminCLI NewRemoteClient: %v", err)
+	}
+	var adminWho types.Principal
+	if err := adminCLI.DoJSON(ctx, http.MethodGet, "/rpc/v1/whoami", nil, &adminWho); err != nil {
+		t.Fatalf("adminCLI whoami: %v", err)
+	}
+	if adminWho.Kind != types.PrincipalHuman {
+		t.Fatalf("interactive CLI login should mint PrincipalHuman, got %+v", adminWho)
+	}
+	var envCreated types.Environment
+	if err := adminCLI.DoJSON(ctx, http.MethodPost, "/rpc/v1/environments", map[string]any{
+		"environment": types.Environment{
+			Code:       "qa-human",
+			SafetyTier: types.SafetyTierGuarded,
+		},
+	}, &envCreated); err != nil {
+		t.Fatalf("platform_admin human CLI token should be allowed ActionEnvWrite: %v", err)
+	}
+
+	// 6. Non-admin audit pagination must filter BEFORE LIMIT/OFFSET and report accurate totals/truncated.
+	// Note that several platform_admin events were just recorded after Alice's executions.
+	var rpcAudit struct {
+		Items        []types.AuditEntry `json:"items"`
+		TotalMatched int                `json:"total_matched"`
+		Returned     int                `json:"returned"`
+		Truncated    bool               `json:"truncated"`
+	}
+	if err := aliceClient.DoJSON(ctx, http.MethodGet, "/rpc/v1/audit?limit=1&offset=0", nil, &rpcAudit); err != nil {
+		t.Fatalf("alice rpc audit page 1: %v", err)
+	}
+	if len(rpcAudit.Items) != 1 || rpcAudit.TotalMatched < 2 || !rpcAudit.Truncated {
+		t.Fatalf("expected non-empty paginated audit slice after unauthorized newer rows, got items=%d total=%d truncated=%v",
+			len(rpcAudit.Items), rpcAudit.TotalMatched, rpcAudit.Truncated)
+	}
+	resp, raw = webDo(aliceWeb, http.MethodGet, "/api/v1/audit?limit=1&offset=0", "", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("alice web audit status=%d body=%s", resp.StatusCode, string(raw))
+	}
+	var webAudit struct {
+		Items        []types.AuditEntry `json:"items"`
+		TotalMatched int                `json:"total_matched"`
+		Truncated    bool               `json:"truncated"`
+	}
+	_ = json.Unmarshal(raw, &webAudit)
+	if len(webAudit.Items) != 1 || webAudit.TotalMatched < 2 || !webAudit.Truncated {
+		t.Fatalf("expected non-empty web audit page, got items=%d total=%d truncated=%v",
+			len(webAudit.Items), webAudit.TotalMatched, webAudit.Truncated)
+	}
+
+	// 7. Explicit target test RBAC enforcement: Alice can test orders target, cannot test billing target.
+	resp, raw = webDo(aliceWeb, http.MethodPost, "/api/v1/targets/"+dbListRes.Items[0].Target.ID+"/test", aliceLogin.CSRFToken, map[string]any{}, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("alice target test orders status=%d body=%s", resp.StatusCode, string(raw))
+	}
+	resp, raw = webDo(adminWeb, http.MethodGet, "/api/v1/targets", "", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin targets status=%d body=%s", resp.StatusCode, string(raw))
+	}
+	var adminTargets struct {
+		Items []types.TargetDetail `json:"items"`
+	}
+	_ = json.Unmarshal(raw, &adminTargets)
+	billingID := ""
+	for _, td := range adminTargets.Items {
+		if td.OwnerSystem != nil && td.OwnerSystem.Slug == "billing" {
+			billingID = td.Target.ID
+			break
+		}
+	}
+	if billingID == "" {
+		t.Fatalf("billing target not found")
+	}
+	resp, _ = webDo(aliceWeb, http.MethodPost, "/api/v1/targets/"+billingID+"/test", aliceLogin.CSRFToken, map[string]any{}, nil)
+	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("alice must not test unauthorized billing target, got %d", resp.StatusCode)
+	}
 }

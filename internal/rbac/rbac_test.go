@@ -52,7 +52,7 @@ func TestRBACRolesAndHumanOnlyApprovalBoundary(t *testing.T) {
 		EnvironmentCode: "staging",
 		PrincipalID:     "tok_other",
 	}
-	if err := AuthorizeApprovalDecision(agentTok, app, "sys_orders", true); err == nil {
+	if err := AuthorizeApprovalDecision(agentTok, app, "sys_orders", "", true); err == nil {
 		t.Fatalf("agent token must never approve requests")
 	}
 	// AgentToken ceiling caps platform_admin down to system_admin and scopes to order-core/staging.
@@ -72,12 +72,15 @@ func TestRBACRolesAndHumanOnlyApprovalBoundary(t *testing.T) {
 			{Role: types.RoleApprover, ScopeType: types.ScopeSystem, ScopeID: "order-core"},
 		},
 	}
-	if err := AuthorizeApprovalDecision(approver, app, "sys_orders", true); err != nil {
+	if err := AuthorizeApprovalDecision(approver, app, "sys_orders", "usr_other", true); err != nil {
 		t.Fatalf("human approver should approve other requester's ticket: %v", err)
+	}
+	if err := AuthorizeApprovalDecision(approver, app, "sys_orders", "usr_approver", true); err == nil {
+		t.Fatalf("four-eyes policy must block self-approval via operation owner_user_id")
 	}
 	selfApp := app
 	selfApp.PrincipalID = "usr_approver"
-	if err := AuthorizeApprovalDecision(approver, selfApp, "sys_orders", true); err == nil {
+	if err := AuthorizeApprovalDecision(approver, selfApp, "sys_orders", "", true); err == nil {
 		t.Fatalf("four-eyes policy must block self-approval")
 	}
 }

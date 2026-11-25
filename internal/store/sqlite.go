@@ -476,6 +476,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 	name TEXT NOT NULL,
 	token_prefix TEXT NOT NULL,
 	token_hash TEXT NOT NULL UNIQUE,
+	principal_kind TEXT NOT NULL DEFAULT 'agent_token',
 	role_ceiling TEXT NOT NULL DEFAULT '',
 	allowed_systems_json TEXT NOT NULL DEFAULT '[]',
 	allowed_envs_json TEXT NOT NULL DEFAULT '[]',
@@ -542,6 +543,9 @@ CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
 `
 	if _, err := s.db.ExecContext(ctx, csSchema); err != nil {
 		return fmt.Errorf("apply sqlite c/s schema: %w", err)
+	}
+	if err := s.ensureColumnLocked(ctx, "api_tokens", "principal_kind", "TEXT NOT NULL DEFAULT 'agent_token'"); err != nil {
+		return err
 	}
 
 	now := nowUTC()
@@ -723,10 +727,12 @@ func (s *Store) flushAuditBatchTx(ctx context.Context, tx *sql.Tx, batch *auditB
 	if s.isPG() {
 		err := s.txQueryRow(ctx, tx, `SELECT last_seq, last_hash FROM audit_chain_head WHERE id = 1 FOR UPDATE`).Scan(&prevSeq, &prevHash)
 		if errors.Is(err, sql.ErrNoRows) {
-			prevSeq = 0
-			prevHash = audit.GenesisPrevHash
-			if _, insErr := s.txExec(ctx, tx, `INSERT INTO audit_chain_head(id, last_seq, last_hash) VALUES (1, 0, ?) ON CONFLICT(id) DO NOTHING`, prevHash); insErr != nil {
+			if _, insErr := s.txExec(ctx, tx, `INSERT INTO audit_chain_head(id, last_seq, last_hash) VALUES (1, 0, ?) ON CONFLICT(id) DO NOTHING`, audit.GenesisPrevHash); insErr != nil {
 				return insErr
+			}
+			// Re-select FOR UPDATE so concurrent cold-start transactions serialize on row id=1.
+			if selErr := s.txQueryRow(ctx, tx, `SELECT last_seq, last_hash FROM audit_chain_head WHERE id = 1 FOR UPDATE`).Scan(&prevSeq, &prevHash); selErr != nil {
+				return selErr
 			}
 		} else if err != nil {
 			return err

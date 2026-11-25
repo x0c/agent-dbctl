@@ -464,6 +464,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 	name TEXT NOT NULL,
 	token_prefix TEXT NOT NULL,
 	token_hash TEXT NOT NULL UNIQUE,
+	principal_kind TEXT NOT NULL DEFAULT 'agent_token',
 	role_ceiling TEXT NOT NULL DEFAULT '',
 	allowed_systems_json TEXT NOT NULL DEFAULT '[]',
 	allowed_envs_json TEXT NOT NULL DEFAULT '[]',
@@ -539,6 +540,9 @@ CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
 `
 	if _, err := conn.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("apply postgres schema: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS principal_kind TEXT NOT NULL DEFAULT 'agent_token'`); err != nil {
+		return fmt.Errorf("migrate api_tokens.principal_kind: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, `
 		INSERT INTO audit_chain_head(id, last_seq, last_hash)

@@ -271,6 +271,9 @@ func (s *Store) CreateAPIToken(ctx context.Context, actor string, tok types.APIT
 	if tok.ID == "" {
 		tok.ID = newID("tok")
 	}
+	if tok.PrincipalKind == "" {
+		tok.PrincipalKind = types.PrincipalAgentToken
+	}
 	now := nowUTC()
 	if tok.CreatedAtUTC == "" {
 		tok.CreatedAtUTC = now
@@ -280,11 +283,11 @@ func (s *Store) CreateAPIToken(ctx context.Context, actor string, tok types.APIT
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
 		_, err := s.txExec(ctx, tx, `
 			INSERT INTO api_tokens(
-				id, user_id, name, token_prefix, token_hash, role_ceiling,
+				id, user_id, name, token_prefix, token_hash, principal_kind, role_ceiling,
 				allowed_systems_json, allowed_envs_json, read_only_forced,
 				expires_at_utc, last_used_at_utc, revoked_at_utc, created_at_utc
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)`,
-			tok.ID, tok.UserID, tok.Name, tok.TokenPrefix, tok.TokenHash, string(tok.RoleCeiling),
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)`,
+			tok.ID, tok.UserID, tok.Name, tok.TokenPrefix, tok.TokenHash, string(tok.PrincipalKind), string(tok.RoleCeiling),
 			string(sysJSON), string(envJSON), boolToInt(tok.ReadOnlyForced), tok.ExpiresAtUTC, tok.CreatedAtUTC)
 		if err != nil {
 			if isUniqueErr(err) {
@@ -295,6 +298,7 @@ func (s *Store) CreateAPIToken(ctx context.Context, actor string, tok types.APIT
 		return s.appendAuditTx(ctx, tx, actor, "api_token.create", tok.ID, "", map[string]any{
 			"name":             tok.Name,
 			"user_id":          tok.UserID,
+			"principal_kind":   tok.PrincipalKind,
 			"role_ceiling":     tok.RoleCeiling,
 			"allowed_systems":  tok.AllowedSystems,
 			"allowed_envs":     tok.AllowedEnvs,
@@ -308,7 +312,7 @@ func (s *Store) CreateAPIToken(ctx context.Context, actor string, tok types.APIT
 // LookupAPITokenByHash loads an active, non-revoked API token and its owner User.
 func (s *Store) LookupAPITokenByHash(ctx context.Context, tokenHash string) (types.APIToken, types.User, error) {
 	row := s.dbQueryRow(ctx, `
-		SELECT t.id, t.user_id, t.name, t.token_prefix, t.token_hash, t.role_ceiling,
+		SELECT t.id, t.user_id, t.name, t.token_prefix, t.token_hash, t.principal_kind, t.role_ceiling,
 			t.allowed_systems_json, t.allowed_envs_json, t.read_only_forced,
 			t.expires_at_utc, t.last_used_at_utc, t.revoked_at_utc, t.created_at_utc,
 			u.id, u.email, u.display_name, u.oidc_issuer, u.oidc_subject, u.password_hash, u.status, u.created_at_utc, u.updated_at_utc
@@ -317,10 +321,10 @@ func (s *Store) LookupAPITokenByHash(ctx context.Context, tokenHash string) (typ
 		WHERE t.token_hash = ?`, tokenHash)
 	var tok types.APIToken
 	var u types.User
-	var sysJSON, envJSON string
+	var kindRaw, sysJSON, envJSON string
 	var roInt int
 	err := row.Scan(
-		&tok.ID, &tok.UserID, &tok.Name, &tok.TokenPrefix, &tok.TokenHash, &tok.RoleCeiling,
+		&tok.ID, &tok.UserID, &tok.Name, &tok.TokenPrefix, &tok.TokenHash, &kindRaw, &tok.RoleCeiling,
 		&sysJSON, &envJSON, &roInt,
 		&tok.ExpiresAtUTC, &tok.LastUsedAtUTC, &tok.RevokedAtUTC, &tok.CreatedAtUTC,
 		&u.ID, &u.Email, &u.DisplayName, &u.OIDCIssuer, &u.OIDCSubject, &u.PasswordHash, &u.Status, &u.CreatedAtUTC, &u.UpdatedAtUTC,
@@ -330,6 +334,10 @@ func (s *Store) LookupAPITokenByHash(ctx context.Context, tokenHash string) (typ
 	}
 	if err != nil {
 		return tok, u, err
+	}
+	tok.PrincipalKind = types.PrincipalKind(kindRaw)
+	if tok.PrincipalKind == "" {
+		tok.PrincipalKind = types.PrincipalAgentToken
 	}
 	tok.OwnerEmail = u.Email
 	tok.ReadOnlyForced = roInt == 1
@@ -345,7 +353,7 @@ func (s *Store) TouchAPITokenLastUsed(ctx context.Context, tokenID string) {
 
 // ListAPITokens lists tokens, optionally filtered by user_id.
 func (s *Store) ListAPITokens(ctx context.Context, userID string) ([]types.APIToken, error) {
-	q := `SELECT t.id, t.user_id, u.email, t.name, t.token_prefix, t.role_ceiling,
+	q := `SELECT t.id, t.user_id, u.email, t.name, t.token_prefix, t.principal_kind, t.role_ceiling,
 		t.allowed_systems_json, t.allowed_envs_json, t.read_only_forced,
 		t.expires_at_utc, t.last_used_at_utc, t.revoked_at_utc, t.created_at_utc
 	FROM api_tokens t JOIN users u ON u.id = t.user_id`
@@ -363,11 +371,15 @@ func (s *Store) ListAPITokens(ctx context.Context, userID string) ([]types.APITo
 	var out []types.APIToken
 	for rows.Next() {
 		var tok types.APIToken
-		var sysJSON, envJSON string
+		var kindRaw, sysJSON, envJSON string
 		var roInt int
-		if err := rows.Scan(&tok.ID, &tok.UserID, &tok.OwnerEmail, &tok.Name, &tok.TokenPrefix, &tok.RoleCeiling,
+		if err := rows.Scan(&tok.ID, &tok.UserID, &tok.OwnerEmail, &tok.Name, &tok.TokenPrefix, &kindRaw, &tok.RoleCeiling,
 			&sysJSON, &envJSON, &roInt, &tok.ExpiresAtUTC, &tok.LastUsedAtUTC, &tok.RevokedAtUTC, &tok.CreatedAtUTC); err != nil {
 			return nil, err
+		}
+		tok.PrincipalKind = types.PrincipalKind(kindRaw)
+		if tok.PrincipalKind == "" {
+			tok.PrincipalKind = types.PrincipalAgentToken
 		}
 		tok.ReadOnlyForced = roInt == 1
 		_ = json.Unmarshal([]byte(sysJSON), &tok.AllowedSystems)

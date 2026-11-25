@@ -404,38 +404,47 @@ export function App() {
           </div>
         }
       >
-        {tab === 'approvals' && (
-          <ApprovalsTab
-            catalog={catalog}
-            globalSecurity={bootstrap?.global_security ?? null}
-            deepLinkId={initialLink.approvalId}
-            deepLinkToken={initialLink.approvalToken}
-            onToggleFreeze={handleToggleFreeze}
-            onCountChange={setPendingCount}
-          />
-        )}
-        {tab === 'catalog' && (
-          <CatalogTab
-            catalog={catalog}
-            onRefreshBootstrap={refreshBootstrap}
-            initialSubTab={initialLink.catalogSubTab}
-            deepLinkCredential={initialLink.credentialId}
-          />
-        )}
-        {tab === 'policies' && (
-          <PoliciesTab
-            catalog={catalog}
-            initialSubTab={initialLink.policiesSubTab}
-            onRefreshBootstrap={refreshBootstrap}
-            onSavedGlobal={(cfg) =>
-              setBootstrap((prev) => (prev ? { ...prev, global_security: cfg } : prev))
-            }
-          />
-        )}
-        {tab === 'audit' && <AuditTab catalog={catalog} />}
-        {tab === 'drivers' && <DriversTab />}
-        {tab === 'access' && isServerMode && bootstrap?.current_user && (
-          <AccessTab currentUser={bootstrap.current_user} />
+        {!bootstrap ? (
+          <div className="space-y-3" aria-busy="true">
+            <div className="h-7 w-44 rounded-md bg-muted/60" />
+            <div className="h-28 rounded-xl border border-border/60 bg-card/50" />
+          </div>
+        ) : (
+          <>
+            {tab === 'approvals' && (
+              <ApprovalsTab
+                catalog={catalog}
+                globalSecurity={bootstrap.global_security ?? null}
+                deepLinkId={initialLink.approvalId}
+                deepLinkToken={initialLink.approvalToken}
+                onToggleFreeze={handleToggleFreeze}
+                onCountChange={setPendingCount}
+              />
+            )}
+            {tab === 'catalog' && (
+              <CatalogTab
+                catalog={catalog}
+                onRefreshBootstrap={refreshBootstrap}
+                initialSubTab={initialLink.catalogSubTab}
+                deepLinkCredential={initialLink.credentialId}
+              />
+            )}
+            {tab === 'policies' && (
+              <PoliciesTab
+                catalog={catalog}
+                initialSubTab={initialLink.policiesSubTab}
+                onRefreshBootstrap={refreshBootstrap}
+                onSavedGlobal={(cfg) =>
+                  setBootstrap((prev) => (prev ? { ...prev, global_security: cfg } : prev))
+                }
+              />
+            )}
+            {tab === 'audit' && <AuditTab catalog={catalog} />}
+            {tab === 'drivers' && <DriversTab />}
+            {tab === 'access' && isServerMode && bootstrap.current_user && (
+              <AccessTab currentUser={bootstrap.current_user} />
+            )}
+          </>
         )}
       </AppFrame>
       <Toaster />

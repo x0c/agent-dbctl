@@ -100,8 +100,7 @@ func NewServerService(ctx context.Context, paths config.Paths, srvCfg config.Ser
 		bus = NewMemoryEventBus()
 	}
 
-	enforceEgress := len(srvCfg.BlockedEgressCIDRs) > 0 || len(srvCfg.AllowedEgressCIDRs) > 0
-	dialPol, err := netdial.ParseDialPolicy(enforceEgress, srvCfg.DisableSSHAuthSock, true, srvCfg.BlockedEgressCIDRs, srvCfg.AllowedEgressCIDRs)
+	dialPol, err := netdial.ParseDialPolicy(true, srvCfg.DisableSSHAuthSock, true, srvCfg.BlockedEgressCIDRs, srvCfg.AllowedEgressCIDRs)
 	if err != nil {
 		_ = bus.Close()
 		_ = slots.Close()
@@ -794,6 +793,7 @@ func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
 			Name:           strings.TrimSpace(body.Name),
 			TokenPrefix:    prefix,
 			TokenHash:      hash,
+			PrincipalKind:  types.PrincipalAgentToken,
 			RoleCeiling:    roleCeil,
 			AllowedSystems: body.AllowedSystems,
 			AllowedEnvs:    body.AllowedEnvs,
@@ -1051,41 +1051,21 @@ func verifyAndProvisionOIDCUser(ctx context.Context, svc *Service, rawIDToken, e
 	return claims, u, nil
 }
 
-func highestUserRole(bindings []types.RoleBinding) types.Role {
-	rank := map[types.Role]int{
-		types.RoleViewer:        1,
-		types.RoleDeveloper:     2,
-		types.RoleApprover:      3,
-		types.RoleSystemAdmin:   4,
-		types.RolePlatformAdmin: 5,
-	}
-	best := types.RoleViewer
-	bestScore := 0
-	for _, b := range bindings {
-		if sc := rank[b.Role]; sc > bestScore {
-			bestScore = sc
-			best = b.Role
-		}
-	}
-	return best
-}
-
 func mintCLISessionToken(ctx context.Context, svc *Service, u types.User, prefixLabel string) (string, error) {
 	plain, prefix, hash, err := auth.GenerateAPIToken()
 	if err != nil {
 		return "", err
 	}
-	bindings, _ := svc.Store().ListRoleBindings(ctx, u.ID)
 	suffix, _ := auth.RandomHex(3)
 	exp := time.Now().UTC().Add(30 * 24 * time.Hour).Format(time.RFC3339Nano)
 	_, err = svc.Store().CreateAPIToken(ctx, "user:"+u.Email, types.APIToken{
-		UserID:       u.ID,
-		OwnerEmail:   u.Email,
-		Name:         fmt.Sprintf("%s-%s-%s", prefixLabel, time.Now().UTC().Format("20060102"), suffix),
-		TokenPrefix:  prefix,
-		TokenHash:    hash,
-		RoleCeiling:  highestUserRole(bindings),
-		ExpiresAtUTC: exp,
+		UserID:        u.ID,
+		OwnerEmail:    u.Email,
+		Name:          fmt.Sprintf("%s-%s-%s", prefixLabel, time.Now().UTC().Format("20060102"), suffix),
+		TokenPrefix:   prefix,
+		TokenHash:     hash,
+		PrincipalKind: types.PrincipalHuman,
+		ExpiresAtUTC:  exp,
 	})
 	if err != nil {
 		return "", err
@@ -1188,6 +1168,19 @@ func resolveRequestPrincipal(r *http.Request, svc *Service) (types.Principal, bo
 	return p, ok
 }
 
+func (s *Service) touchAPITokenLastUsedAsync(tokenID string) {
+	if s == nil || s.rootCtx == nil || s.rootCtx.Err() != nil {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		ctx, cancel := context.WithTimeout(s.rootCtx, 5*time.Second)
+		defer cancel()
+		s.store.TouchAPITokenLastUsed(ctx, tokenID)
+	}()
+}
+
 func resolveBearerPrincipal(r *http.Request, svc *Service) (types.Principal, bool) {
 	hdr := strings.TrimSpace(r.Header.Get("Authorization"))
 	if !strings.HasPrefix(strings.ToLower(hdr), "bearer ") {
@@ -1210,7 +1203,18 @@ func resolveBearerPrincipal(r *http.Request, svc *Service) (types.Principal, boo
 			}
 		}
 		bindings, _ := svc.Store().ListRoleBindings(r.Context(), u.ID)
-		go svc.Store().TouchAPITokenLastUsed(context.Background(), tok.ID)
+		svc.touchAPITokenLastUsedAsync(tok.ID)
+		if tok.PrincipalKind == types.PrincipalHuman {
+			return types.Principal{
+				Kind:        types.PrincipalHuman,
+				ID:          u.ID,
+				Subject:     "user:" + u.Email,
+				OwnerUserID: u.ID,
+				Email:       u.Email,
+				DisplayName: u.DisplayName,
+				Roles:       bindings,
+			}, true
+		}
 		return types.Principal{
 			Kind:           types.PrincipalAgentToken,
 			ID:             tok.ID,
