@@ -23,11 +23,37 @@ type ParsedDSN struct {
 	Params       map[string]string
 }
 
-// DefaultPortForEngine returns the canonical default TCP port for built-in engines (0 for SQLite).
+// DefaultPortForEngine returns the canonical default TCP port for built-in engines and domestic aliases (0 for SQLite).
 func DefaultPortForEngine(engine string) int {
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case "tidb":
+		return 4000
+	case "oceanbase", "oceanbase_mysql":
+		return 2883
+	case "doris", "selectdb", "starrocks":
+		return 9030
+	case "gbase", "gbase8a", "gbase-8a":
+		return 5258
+	case "highgo":
+		return 5866
+	case "uxdb":
+		return 52025
+	case "opentenbase":
+		return 11000
+	case "kwdb", "kaiwudb", "cockroachdb", "cockroach":
+		return 26257
+	case "gaussdb_dws", "gaussdb-dws":
+		return 8000
+	}
 	switch classify.CanonicalEngine(engine) {
-	case "postgres":
+	case "postgres", "opengauss":
 		return 5432
+	case "kingbase":
+		return 54321
+	case "dameng":
+		return 5236
+	case "tdengine":
+		return 6041
 	case "mysql":
 		return 3306
 	case "mongodb":
@@ -73,12 +99,13 @@ func ParseDSN(raw, engineHint string) (ParsedDSN, error) {
 		return parseGoMySQLDSN(trimmed, hint)
 	}
 
-	// 3. Standard URL-based DSNs.
-	u, err := url.Parse(trimmed)
+	// 3. Standard URL-based DSNs. Allow underscores in vendor dialect schemes (e.g. gaussdb_dws://)
+	// by normalizing the scheme token before net/url.Parse, which restricts schemes to RFC 3986 characters.
+	rawScheme, u, err := parseDSNURL(trimmed)
 	if err != nil {
 		return ParsedDSN{}, fmt.Errorf("invalid DSN: %w", err)
 	}
-	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	scheme := strings.ToLower(strings.TrimSpace(rawScheme))
 	if scheme == "" {
 		return ParsedDSN{}, fmt.Errorf("DSN must include a scheme (e.g. postgres://, mysql://, sqlite://, mongodb://, redis://)")
 	}
@@ -271,11 +298,21 @@ func resolveDSNScheme(scheme, hint string) (engine, tlsMode string, params map[s
 	switch scheme {
 	case "postgres", "postgresql", "pg":
 		engine = "postgres"
-	case "cockroachdb", "cockroach", "redshift", "yugabytedb", "yugabyte", "greenplum", "alloydb":
+	case "cockroachdb", "cockroach", "redshift", "yugabytedb", "yugabyte", "greenplum", "alloydb",
+		"highgo", "uxdb", "opentenbase", "kwdb", "kaiwudb", "polardb_pg", "polardb-pg", "tdsql_pg", "tdsql-pg":
+		engine = scheme
+	case "opengauss", "gaussdb", "gaussdb_dws", "gaussdb-dws", "vastbase", "mogdb", "gbase8c", "gbase-8c":
+		engine = scheme
+	case "kingbase", "kingbase8", "kingbasees", "kes":
+		engine = scheme
+	case "dameng", "dm", "dm8":
+		engine = scheme
+	case "tdengine", "taos", "taosdata":
 		engine = scheme
 	case "mysql":
 		engine = "mysql"
-	case "mariadb", "tidb", "oceanbase_mysql", "starrocks", "doris":
+	case "mariadb", "tidb", "oceanbase", "oceanbase_mysql", "starrocks", "doris", "selectdb",
+		"polardb", "polardb_mysql", "polardb-mysql", "tdsql", "tdsql_mysql", "tdsql-mysql", "goldendb", "greatsql", "gbase", "gbase8a", "gbase-8a":
 		engine = scheme
 	case "mongodb", "mongo":
 		engine = "mongodb"
@@ -301,8 +338,8 @@ func resolveDSNScheme(scheme, hint string) (engine, tlsMode string, params map[s
 		engine = "oracle"
 	case "elasticsearch", "es":
 		engine = "elasticsearch"
-	case "opensearch":
-		engine = "opensearch"
+	case "opensearch", "easysearch":
+		engine = scheme
 	case "http", "https":
 		canonHint := classify.CanonicalEngine(hint)
 		switch canonHint {
@@ -312,8 +349,11 @@ func resolveDSNScheme(scheme, hint string) (engine, tlsMode string, params map[s
 		case "clickhouse":
 			engine = hint
 			params["protocol"] = "http"
+		case "tdengine":
+			engine = hint
+			params["scheme"] = scheme
 		default:
-			return "", "", nil, fmt.Errorf("scheme %q is ambiguous; pass --engine elasticsearch, opensearch, or clickhouse", scheme)
+			return "", "", nil, fmt.Errorf("scheme %q is ambiguous; pass --engine elasticsearch, opensearch, easysearch, clickhouse, or tdengine", scheme)
 		}
 		if scheme == "https" {
 			tlsMode = "require"
@@ -365,6 +405,24 @@ func looksLikeSQLitePath(s string) bool {
 	return ext == ".db" || ext == ".sqlite" || ext == ".sqlite3"
 }
 
+func parseDSNURL(trimmed string) (rawScheme string, u *url.URL, err error) {
+	sep := strings.Index(trimmed, "://")
+	if sep > 0 {
+		rawScheme = strings.ToLower(strings.TrimSpace(trimmed[:sep]))
+		parseTarget := trimmed
+		if strings.Contains(rawScheme, "_") {
+			parseTarget = strings.ReplaceAll(rawScheme, "_", "-") + trimmed[sep:]
+		}
+		u, err = url.Parse(parseTarget)
+		return rawScheme, u, err
+	}
+	u, err = url.Parse(trimmed)
+	if err != nil {
+		return "", nil, err
+	}
+	return strings.ToLower(strings.TrimSpace(u.Scheme)), u, nil
+}
+
 // RedactDSN masks embedded passwords in a connection string for safe diagnostic display.
 func RedactDSN(raw string) string {
 	trimmed := strings.TrimSpace(raw)
@@ -372,10 +430,16 @@ func RedactDSN(raw string) string {
 		return ""
 	}
 	if strings.Contains(trimmed, "://") {
-		if u, err := url.Parse(trimmed); err == nil && u.User != nil {
+		if rawScheme, u, err := parseDSNURL(trimmed); err == nil && u.User != nil {
 			if _, hasPW := u.User.Password(); hasPW {
 				u.User = url.UserPassword(u.User.Username(), "***")
-				return u.String()
+				masked := u.String()
+				if rawScheme != "" && !strings.EqualFold(rawScheme, u.Scheme) {
+					if sep := strings.Index(masked, "://"); sep >= 0 {
+						return rawScheme + masked[sep:]
+					}
+				}
+				return masked
 			}
 		}
 	}

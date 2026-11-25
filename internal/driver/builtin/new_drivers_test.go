@@ -27,7 +27,7 @@ func TestRegisterAllIncludesNewBuiltinsAndAliases(t *testing.T) {
 	reg := driver.NewRegistry()
 	RegisterAll(reg)
 
-	for _, eng := range []string{"postgres", "mysql", "sqlite", "mongodb", "redis", "clickhouse", "mssql", "oracle", "elasticsearch"} {
+	for _, eng := range []string{"postgres", "opengauss", "kingbase", "dameng", "tdengine", "mysql", "sqlite", "mongodb", "redis", "clickhouse", "mssql", "oracle", "elasticsearch"} {
 		d, ok := reg.Get(eng)
 		if !ok {
 			t.Fatalf("expected built-in driver %q to be registered", eng)
@@ -40,8 +40,30 @@ func TestRegisterAllIncludesNewBuiltinsAndAliases(t *testing.T) {
 	for alias, want := range map[string]string{
 		"sqlserver":  "mssql",
 		"opensearch": "elasticsearch",
+		"easysearch": "elasticsearch",
 		"mariadb":    "mysql",
+		"tidb":       "mysql",
+		"oceanbase":  "mysql",
+		"polardb":    "mysql",
+		"tdsql":      "mysql",
+		"goldendb":   "mysql",
+		"greatsql":   "mysql",
+		"gbase8a":    "mysql",
+		"selectdb":   "mysql",
 		"valkey":     "redis",
+		"gaussdb":    "opengauss",
+		"vastbase":   "opengauss",
+		"mogdb":      "opengauss",
+		"gbase8c":    "opengauss",
+		"kingbase8":  "kingbase",
+		"kingbasees": "kingbase",
+		"dm":         "dameng",
+		"dm8":        "dameng",
+		"taos":       "tdengine",
+		"highgo":     "postgres",
+		"uxdb":       "postgres",
+		"opentenbase": "postgres",
+		"kwdb":       "postgres",
 	} {
 		d, ok := reg.Get(alias)
 		if !ok || d.Metadata().Engine != want {
@@ -403,5 +425,242 @@ func TestElasticsearchEndToEndMockServer(t *testing.T) {
 	wRes, err := rwConn.Execute(context.Background(), "POST /orders/_doc\n{\"order_id\":99}", driver.ExecOpts{})
 	if err != nil || len(wRes.Documents) != 1 || seenWriteCalls.Load() != 1 {
 		t.Fatalf("expected RW write to succeed: res=%+v err=%v writes=%d", wRes, err, seenWriteCalls.Load())
+	}
+}
+
+func TestDamengOpenGaussKingbaseDSNAndPlans(t *testing.T) {
+	// Dameng DSN preserves special characters in secret, wires dialName and sslEncrypt, and bounds dial slots.
+	slot := dmDialSlots.acquire(func(context.Context, string) (net.Conn, error) { return nil, nil })
+	if slot == "" {
+		t.Fatal("expected non-empty dameng dial slot")
+	}
+	dmDSN, err := buildDamengDSN(driver.ConnectionConfig{
+		Engine:       "dameng",
+		Host:         "dm.internal",
+		Port:         5236,
+		DatabaseName: "ORDERS",
+		TLSMode:      "require",
+		Credential:   secrets.ResolvedSecret{Username: "SYSDBA", Secret: "p@ss:w?rd#1"},
+	}, slot)
+	dmDialSlots.release(slot)
+	if err != nil {
+		t.Fatalf("buildDamengDSN: %v", err)
+	}
+	if !strings.Contains(dmDSN, "dm://SYSDBA:p@ss:w?rd#1@dm.internal:5236?") ||
+		!strings.Contains(dmDSN, "schema=ORDERS") ||
+		!strings.Contains(dmDSN, "dialName="+slot) ||
+		!strings.Contains(dmDSN, "sslEncrypt=1") {
+		t.Fatalf("unexpected dameng DSN: %q", dmDSN)
+	}
+
+	// Slot reuse must keep slot count bounded.
+	slot2 := dmDialSlots.acquire(func(context.Context, string) (net.Conn, error) { return nil, nil })
+	dmDialSlots.release(slot2)
+	if slot2 != slot {
+		t.Fatalf("expected released slot %q to be reused, got %q", slot, slot2)
+	}
+
+	// Dameng EXPLAIN plan parsing detects CSCN2 full scans and row estimates.
+	dmFull := &types.PreflightReport{}
+	parseDamengExplainLines([]string{
+		"1   #NSET2: [1, 42000, 128]",
+		"2     #PRJT2: [1, 42000, 128]; exp_num(2)",
+		"3       #CSCN2: [1, 42000, 128]; INDEX33555514(ORDERS)",
+	}, dmFull)
+	if !dmFull.FullScan || dmFull.EstimatedRows != 42000 {
+		t.Fatalf("expected Dameng CSCN2 FullScan=true EstimatedRows=42000, got %+v", dmFull)
+	}
+
+	dmSeek := &types.PreflightReport{}
+	parseDamengExplainLines([]string{
+		"1   #NSET2: [1, 1, 64]",
+		"2     #BLKUP2: [1, 1, 64]; IDX_ORDERS_ID(ORDERS)",
+		"3       #SSEK2: [1, 1, 64]; scan_type(ASC), IDX_ORDERS_ID(ORDERS)",
+	}, dmSeek)
+	if dmSeek.FullScan || dmSeek.EstimatedRows != 1 {
+		t.Fatalf("expected Dameng SSEK2 FullScan=false EstimatedRows=1, got %+v", dmSeek)
+	}
+
+	// openGauss & Kingbase DSN builders apply default ports and libpq sslmode mapping.
+	ogDSN := buildOpenGaussDSN(driver.ConnectionConfig{
+		Engine:       "opengauss",
+		Host:         "og.internal",
+		DatabaseName: "finance",
+		TLSMode:      "verify-full",
+		Credential:   secrets.ResolvedSecret{Username: "gaussdb", Secret: "s3cr@t"},
+	})
+	if !strings.HasPrefix(ogDSN, "opengauss://gaussdb:s3cr%40t@og.internal:5432/finance?") || !strings.Contains(ogDSN, "sslmode=verify-full") {
+		t.Fatalf("unexpected opengauss DSN: %q", ogDSN)
+	}
+	kbDSN := buildKingbaseDSN(driver.ConnectionConfig{
+		Engine:       "kingbase",
+		Host:         "kb.internal",
+		DatabaseName: "app",
+		TLSMode:      "disable",
+		Credential:   secrets.ResolvedSecret{Username: "system", Secret: "pw"},
+	})
+	if !strings.HasPrefix(kbDSN, "kingbase://system:pw@kb.internal:54321/app?") || !strings.Contains(kbDSN, "sslmode=disable") {
+		t.Fatalf("unexpected kingbase DSN: %q", kbDSN)
+	}
+}
+
+func TestTDengineEndToEndMockServer(t *testing.T) {
+	var seenAuth atomic.Value
+	var seenDialCalls atomic.Int32
+	var seenWriteCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth.Store(r.Header.Get("Authorization"))
+		bodyBytes, _ := io.ReadAll(r.Body)
+		sqlText := strings.TrimSpace(string(bodyBytes))
+		upper := strings.ToUpper(sqlText)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case upper == "SELECT SERVER_VERSION()":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":        0,
+				"column_meta": [][]any{{"server_version()", "VARCHAR", 16}},
+				"data":        [][]any{{"3.3.2.0"}},
+				"rows":        1,
+			})
+		case upper == "SHOW DATABASES":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":        0,
+				"column_meta": [][]any{{"name", "VARCHAR", 64}},
+				"data":        [][]any{{"power"}, {"log"}},
+				"rows":        2,
+			})
+		case upper == "SHOW STABLES":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":        0,
+				"column_meta": [][]any{{"stable_name", "VARCHAR", 64}},
+				"data":        [][]any{{"meters"}},
+				"rows":        1,
+			})
+		case upper == "SHOW TABLES":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":        0,
+				"column_meta": [][]any{{"table_name", "VARCHAR", 64}},
+				"data":        [][]any{{"d1001"}},
+				"rows":        1,
+			})
+		case strings.HasPrefix(upper, "DESCRIBE "):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":        0,
+				"column_meta": [][]any{{"field", "VARCHAR", 64}, {"type", "VARCHAR", 16}, {"length", "INT", 4}, {"note", "VARCHAR", 8}},
+				"data":        [][]any{{"ts", "TIMESTAMP", 8, ""}, {"current", "FLOAT", 4, ""}, {"location", "NCHAR", 32, "TAG"}},
+				"rows":        3,
+			})
+		case strings.HasPrefix(upper, "EXPLAIN "):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":        0,
+				"column_meta": [][]any{{"plan", "VARCHAR", 256}},
+				"data":        [][]any{{"FULL TABLE SCAN on meters"}},
+				"rows":        1,
+			})
+		case strings.HasPrefix(upper, "SELECT "):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":        0,
+				"column_meta": [][]any{{"ts", "TIMESTAMP", 8}, {"current", "FLOAT", 4}},
+				"data": [][]any{
+					{"2026-01-01T00:00:00Z", 10.2},
+					{"2026-01-01T00:01:00Z", 10.5},
+					{"2026-01-01T00:02:00Z", 10.8},
+				},
+				"rows": 3,
+			})
+		case strings.HasPrefix(upper, "INSERT "):
+			seenWriteCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":        0,
+				"column_meta": [][]any{},
+				"data":        [][]any{},
+				"rows":        1,
+			})
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 9728, "desc": "unexpected query: " + sqlText})
+		}
+	}))
+	defer srv.Close()
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portStr, _ := net.SplitHostPort(u.Host)
+	port, _ := strconv.Atoi(portStr)
+
+	var hookCalls atomic.Int32
+	drv := &TDengineDriver{}
+	roConn, err := drv.Open(context.Background(), driver.ConnectionConfig{
+		Engine:       "tdengine",
+		Host:         host,
+		Port:         port,
+		DatabaseName: "power",
+		ReadOnly:     true,
+		Credential:   secrets.ResolvedSecret{Username: "root", Secret: "taosdata"},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			seenDialCalls.Add(1)
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+		CloseHook: func() error {
+			hookCalls.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open tdengine: %v", err)
+	}
+
+	if gotAuth, _ := seenAuth.Load().(string); !strings.HasPrefix(gotAuth, "Basic ") {
+		t.Fatalf("expected Basic auth header, got %q", gotAuth)
+	}
+	if seenDialCalls.Load() == 0 {
+		t.Fatal("expected custom DialContext to be invoked")
+	}
+
+	ping, err := roConn.Ping(context.Background())
+	if err != nil || !ping.Reachable || ping.Dialect != "tdengine" || ping.Capabilities.MajorVersion != 3 {
+		t.Fatalf("unexpected Ping result: %+v err=%v", ping, err)
+	}
+	dbs, err := roConn.ListDatabases(context.Background())
+	if err != nil || !slices.Equal(dbs, []string{"power", "log"}) {
+		t.Fatalf("ListDatabases = (%v, %v)", dbs, err)
+	}
+
+	inspector := roConn.(driver.SchemaInspector)
+	tblList, err := inspector.ListTables(context.Background(), driver.SchemaListOpts{})
+	if err != nil || len(tblList.Items) != 2 || tblList.Items[0].Type != "stable" {
+		t.Fatalf("ListTables = (%+v, %v)", tblList, err)
+	}
+	tblDesc, err := inspector.DescribeTable(context.Background(), "meters")
+	if err != nil || len(tblDesc.Columns) != 3 || tblDesc.Columns[2].Extra != "TAG" {
+		t.Fatalf("DescribeTable = (%+v, %v)", tblDesc, err)
+	}
+
+	pf, err := roConn.Preflight(context.Background(), "SELECT * FROM meters WHERE location = 'hz' LIMIT 10", driver.PreflightOpts{})
+	if err != nil || !pf.FullScan {
+		t.Fatalf("expected TDengine EXPLAIN FullScan=true, got %+v err=%v", pf, err)
+	}
+
+	execRes, err := roConn.Execute(context.Background(), "SELECT ts, current FROM meters WHERE location = 'hz' LIMIT 10", driver.ExecOpts{MaxRows: 2, MaxBytes: 65536})
+	if err != nil || !execRes.Truncated || execRes.ReturnedRows != 2 || execRes.FetchedRows != 3 {
+		t.Fatalf("unexpected Execute result: %+v err=%v", execRes, err)
+	}
+
+	if _, err := roConn.Execute(context.Background(), "INSERT INTO d1001 VALUES (NOW, 12.3)", driver.ExecOpts{}); err == nil {
+		t.Fatal("expected ReadOnly mode to block INSERT")
+	}
+	if seenWriteCalls.Load() != 0 {
+		t.Fatal("ReadOnly mode must not send blocked INSERT to server")
+	}
+
+	_ = roConn.CancelAndDiscard()
+	_ = roConn.Close()
+	if hookCalls.Load() != 1 {
+		t.Fatalf("expected CloseHook called once, got %d", hookCalls.Load())
 	}
 }

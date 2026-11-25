@@ -55,13 +55,43 @@ const ALL_SYSTEMS = '__all__'
 
 const DEFAULT_ENGINE_PORTS: Record<string, number> = {
   postgres: 5432,
+  opengauss: 5432,
+  gaussdb: 5432,
+  gaussdb_dws: 8000,
+  vastbase: 5432,
+  mogdb: 5432,
+  gbase8c: 5432,
+  kingbase: 54321,
+  kingbase8: 54321,
+  kingbasees: 54321,
+  highgo: 5866,
+  uxdb: 52025,
+  opentenbase: 11000,
+  kwdb: 26257,
+  dameng: 5236,
+  dm: 5236,
+  dm8: 5236,
+  tdengine: 6041,
   mysql: 3306,
+  tidb: 4000,
+  oceanbase: 2883,
+  oceanbase_mysql: 2883,
+  polardb: 3306,
+  tdsql: 3306,
+  goldendb: 3306,
+  greatsql: 3306,
+  gbase: 5258,
+  gbase8a: 5258,
+  doris: 9030,
+  selectdb: 9030,
+  starrocks: 9030,
   mongodb: 27017,
   redis: 6379,
   clickhouse: 9000,
   mssql: 1433,
   oracle: 1521,
   elasticsearch: 9200,
+  easysearch: 9200,
   sqlite: 0,
 }
 
@@ -902,6 +932,9 @@ export function CatalogTab({
             >
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
+                {instForm.engine && !catalog.engines.some((e) => e.code === instForm.engine) && (
+                  <SelectItem value={instForm.engine}>{instForm.engine}</SelectItem>
+                )}
                 {catalog.engines.map((e) => (
                   <SelectItem key={e.code} value={e.code}>
                     {resolveDisplayItem(catalog.engines, e.code, locale).label}

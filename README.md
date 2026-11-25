@@ -2,7 +2,7 @@
 
 # agent-dbctl
 
-Run PostgreSQL, MySQL, SQLite, ClickHouse, SQL Server, Oracle, MongoDB, Elasticsearch, and Redis queries safely from Claude Code, Codex, Cursor, and OpenCode. Get EXPLAIN scan preflight, per-environment guardrails, human Web approvals, and immutable hash-chained audit logs in a single zero-JVM binary.
+Run PostgreSQL, openGauss/GaussDB, KingbaseES, Dameng DM8, TDengine, MySQL/TiDB/OceanBase, SQLite, ClickHouse, SQL Server, Oracle, MongoDB, Elasticsearch/Easysearch, and Redis queries safely from Claude Code, Codex, Cursor, and OpenCode. Get EXPLAIN scan preflight, per-environment guardrails, human Web approvals, and immutable hash-chained audit logs in a single zero-JVM binary.
 
 > **100% Local Execution · Zero Telemetry · Zero JVM · Keychain-Backed Credentials · Hash-Chained Audit**
 
@@ -91,7 +91,7 @@ make install-local
 |---|---|
 | **Four-Layer Enterprise Catalog** | Organize `System` (with `workspace_paths` + `git_remotes` auto-priority across clones & worktrees) -> `Environment` -> `NetworkProfile` / `CredentialProfile` -> `Instance` / `Target` (`ro_credential_id` & `rw_credential_id` split). Export/import sanitized topology as YAML/JSON. |
 | **Environment Safety Tiers** | **`dev` (`yolo`)** runs freely; **`staging` (`guarded`)** & **`prod` (`strict`)** run EXPLAIN preflight and trigger bilingual (English / 中文) Web approvals (requiring `--reason` by default) on writes, DDL, full table scans, or high-cost Redis/Mongo commands. Custom `Policies -> High-Risk Patterns` rules can enforce secondary confirmation or denials even on `dev` targets. |
-| **Verbatim Dialect Forwarding** | Native PostgreSQL, MySQL/MariaDB/TiDB, SQLite, ClickHouse, SQL Server, Oracle, MongoDB (`RunCommand` JSON), Elasticsearch/OpenSearch, and Redis commands forwarded verbatim—no lossy ORM or SQL translation. |
+| **Verbatim Dialect Forwarding** | Native PostgreSQL/HighGo/UXDB, openGauss/GaussDB/Vastbase/GBase 8c, KingbaseES, Dameng DM8, TDengine, MySQL/MariaDB/TiDB/OceanBase/PolarDB/TDSQL/GoldenDB/GBase 8a/Doris/StarRocks, SQLite, ClickHouse, SQL Server, Oracle, MongoDB (`RunCommand` JSON), Elasticsearch/OpenSearch/Easysearch, and Redis commands forwarded verbatim—no lossy ORM or SQL translation. |
 | **Agent-Friendly CLI Contract** | Dual-audience TTY tables + `--json` `{ok, data, error, meta}` envelope, single-source `describe`, bounded row/byte truncation on intact boundaries, atomic `--out`, and non-replayable write timeouts. |
 | **Pluggable Approvals & Drivers** | Decoupled `ApprovalProvider` (`local-web` built in; extensible to external ticket flows) plus `hashicorp/go-plugin` gRPC external driver subprocesses verified by SHA-256 and `host_api_version`. |
 | **Immutable Hash-Chain Audit** | Append-only SQLite WAL `audit_logs` chained via SHA-256 (`agent-dbctl audit verify`) with query result payloads kept out of the audit ledger. |

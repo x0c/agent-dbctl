@@ -7,16 +7,16 @@ func BuiltinRulePacks() []types.BuiltinRulePack {
 	return []types.BuiltinRulePack{
 		{
 			ID:          "pg-side-effect",
-			Name:        "PostgreSQL Side-Effect & Exfil Guard",
+			Name:        "PostgreSQL / openGauss / Kingbase Side-Effect Guard",
 			Description: "Gates advisory locks, pg_sleep, large generators, recursive CTEs, and blocks server-file/dblink reads.",
-			Engines:     []string{"postgres"},
+			Engines:     []string{"postgres", "opengauss", "kingbase"},
 			Rules: []types.RiskPatternRule{
 				{
 					Name:           "pg-server-file-and-dblink",
-					Description:    "Block PostgreSQL server-side file reads, large-object export, and dblink execution.",
+					Description:    "Block PostgreSQL-family server-side file reads, large-object export, and dblink execution.",
 					BuiltinPack:    "pg-side-effect",
 					Enabled:        true,
-					Engines:        []string{"postgres"},
+					Engines:        []string{"postgres", "opengauss", "kingbase"},
 					Families:       []types.EngineFamily{types.FamilySQL},
 					Action:         types.PatternActionDeny,
 					ConfirmTitle:   "PostgreSQL Server-Side File / Extension Access Denied",
@@ -35,7 +35,7 @@ func BuiltinRulePacks() []types.BuiltinRulePack {
 					Description:    "Require human confirmation for pg_sleep, advisory locks, and sequence side-effects.",
 					BuiltinPack:    "pg-side-effect",
 					Enabled:        true,
-					Engines:        []string{"postgres"},
+					Engines:        []string{"postgres", "opengauss", "kingbase"},
 					Families:       []types.EngineFamily{types.FamilySQL},
 					Action:         types.PatternActionRequireApproval,
 					ConfirmTitle:   "Confirm PostgreSQL Sleep or Session Side Effect",
@@ -53,7 +53,7 @@ func BuiltinRulePacks() []types.BuiltinRulePack {
 					Description:    "Require human confirmation for WITH RECURSIVE or generate_series amplification.",
 					BuiltinPack:    "pg-side-effect",
 					Enabled:        true,
-					Engines:        []string{"postgres"},
+					Engines:        []string{"postgres", "opengauss", "kingbase"},
 					Families:       []types.EngineFamily{types.FamilySQL},
 					Action:         types.PatternActionRequireApproval,
 					ConfirmTitle:   "Confirm Recursive CTE or Series Generator",
@@ -369,6 +369,53 @@ func BuiltinRulePacks() []types.BuiltinRulePack {
 					Action:         types.PatternActionRequireApproval,
 					ConfirmTitle:   "Confirm Oracle Sleep or Unfiltered Query",
 					ConfirmMessage: "Statement invokes DBMS_LOCK.SLEEP or scans an Oracle table without a WHERE filter.",
+					Priority:       85,
+					Condition: types.PatternCondition{
+						Any: []types.PatternCondition{
+							{Type: types.MatcherFunctionCall, Values: []string{"dbms_lock.sleep"}},
+							{Type: types.MatcherRiskFlag, Values: []string{"missing_where"}},
+						},
+					},
+				},
+			},
+		},
+		{
+			ID:          "dameng-sys-guard",
+			Name:        "Dameng DM8 System Procedure & Scan Guard",
+			Description: "Blocks DM8 parameter/package/external-IO procedures and gates DBMS_LOCK.SLEEP or unrestricted table scans.",
+			Engines:     []string{"dameng"},
+			Rules: []types.RiskPatternRule{
+				{
+					Name:           "dameng-system-proc-denied",
+					Description:    "Deny Dameng system parameter, package creation, and UTL_FILE/UTL_HTTP/DBMS_SQL calls.",
+					BuiltinPack:    "dameng-sys-guard",
+					Enabled:        true,
+					Engines:        []string{"dameng"},
+					Families:       []types.EngineFamily{types.FamilySQL},
+					Action:         types.PatternActionDeny,
+					ConfirmTitle:   "Dameng DM8 Privileged System Procedure Denied",
+					ConfirmMessage: "Statement invokes Dameng parameter mutation, system package management, or external UTL/DBMS_SQL calls.",
+					Priority:       100,
+					Condition: types.PatternCondition{
+						Type: types.MatcherFunctionCall,
+						Values: []string{
+							"sf_set_session_para_value", "sf_set_system_para_value",
+							"sp_set_para_value", "sp_set_para_double_value",
+							"sp_create_system_packages", "sp_set_session_readonly",
+							"utl_file*", "utl_http*", "utl_tcp*", "dbms_sql*",
+						},
+					},
+				},
+				{
+					Name:           "dameng-sleep-and-full-scan",
+					Description:    "Require confirmation for DBMS_LOCK.SLEEP or missing WHERE filters on Dameng tables.",
+					BuiltinPack:    "dameng-sys-guard",
+					Enabled:        true,
+					Engines:        []string{"dameng"},
+					Families:       []types.EngineFamily{types.FamilySQL},
+					Action:         types.PatternActionRequireApproval,
+					ConfirmTitle:   "Confirm Dameng Sleep or Unfiltered Query",
+					ConfirmMessage: "Statement invokes DBMS_LOCK.SLEEP or scans a Dameng table without a WHERE filter.",
 					Priority:       85,
 					Condition: types.PatternCondition{
 						Any: []types.PatternCondition{

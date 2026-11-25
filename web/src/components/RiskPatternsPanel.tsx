@@ -35,7 +35,22 @@ import {
 } from '../api'
 import { useI18n, type TranslationKey } from '../lib/i18n'
 
-const ENGINES = ['*', 'postgres', 'mysql', 'sqlite', 'mongodb', 'redis', 'clickhouse', 'mssql', 'oracle', 'elasticsearch'] as const
+const ENGINES = [
+  '*',
+  'postgres',
+  'opengauss',
+  'kingbase',
+  'dameng',
+  'tdengine',
+  'mysql',
+  'sqlite',
+  'mongodb',
+  'redis',
+  'clickhouse',
+  'mssql',
+  'oracle',
+  'elasticsearch',
+] as const
 
 const MATCHER_TYPES: PatternMatcherType[] = [
   'function_call',

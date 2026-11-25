@@ -3,6 +3,9 @@ module github.com/x0c/agent-dbctl
 go 1.26.11
 
 require (
+	gitcode.com/opengauss/openGauss-connector-go-pq v1.0.9
+	gitea.com/kingbase/gokb v0.0.0-20201021123113-29bd62a876c3
+	gitee.com/chunanyong/dm v1.8.23
 	github.com/ClickHouse/clickhouse-go/v2 v2.51.0
 	github.com/go-sql-driver/mysql v1.10.2
 	github.com/hashicorp/go-hclog v1.6.3
@@ -35,6 +38,7 @@ require (
 	github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9 // indirect
 	github.com/golang-sql/sqlexp v0.1.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
+	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
@@ -52,6 +56,7 @@ require (
 	github.com/rogpeppe/go-internal v1.16.0 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/shopspring/decimal v1.6.0 // indirect
+	github.com/tjfoc/gmsm v1.4.1 // indirect
 	github.com/xdg-go/scram v1.4.0 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
@@ -61,6 +66,7 @@ require (
 	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
+	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260817212433-ac3dfec99bb1 // indirect
 	modernc.org/libc v1.80.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

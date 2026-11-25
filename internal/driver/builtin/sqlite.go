@@ -26,6 +26,10 @@ import (
 // RegisterAll registers all Tier-1 built-in pure Go drivers into a registry.
 func RegisterAll(reg *driver.Registry) {
 	reg.Register(&PostgresDriver{})
+	reg.Register(&OpenGaussDriver{})
+	reg.Register(&KingbaseDriver{})
+	reg.Register(&DamengDriver{})
+	reg.Register(&TDengineDriver{})
 	reg.Register(&MySQLDriver{})
 	reg.Register(&SQLiteDriver{})
 	reg.Register(&MongoDriver{})

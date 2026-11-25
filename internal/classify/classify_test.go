@@ -61,6 +61,11 @@ func TestClassifySQL(t *testing.T) {
 		{"comments_only_fail_closed", "-- just a comment\n/* another */", types.RiskUnknown, false, "comments_only"},
 		{"unclosed_quote_fail_closed", "SELECT 'unterminated", types.RiskUnknown, false, "unclosed_literal_or_comment"},
 		{"unknown_verb_fail_closed", "FOOBAR SOMETHING", types.RiskUnknown, false, "unrecognized_statement"},
+		{"dameng_explain_for_select", "EXPLAIN FOR SELECT id FROM orders WHERE id = 1", types.RiskSafeRead, true, ""},
+		{"dameng_explain_for_delete", "EXPLAIN FOR DELETE FROM orders WHERE id = 1", types.RiskHighCostRead, true, "explain_dml"},
+		{"dameng_dual_safe", "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL", types.RiskSafeRead, true, ""},
+		{"dameng_para_admin", "SELECT sf_set_session_para_value('MONITOR_SQL_EXEC', 1) FROM DUAL", types.RiskAdmin, false, "dangerous_admin_function"},
+		{"opengauss_password_notify_admin", "SELECT gs_password_notify('u', 'p')", types.RiskAdmin, false, "dangerous_admin_function"},
 	}
 
 	for _, tc := range cases {

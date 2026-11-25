@@ -1,6 +1,6 @@
 ---
 name: agent-dbctl
-description: "Query, inspect, debug, or modify databases (PostgreSQL, MySQL, SQLite, ClickHouse, SQL Server, Oracle, MongoDB, Elasticsearch, Redis) safely through agent-dbctl instead of raw psql, mysql, clickhouse-client, sqlcmd, sqlplus, mongosh, or redis-cli. Use whenever a task involves inspecting schemas or tables, debugging database state, running SQL/Mongo/Elasticsearch/Redis queries, checking EXPLAIN plans, or submitting staging/production data changes for human Web approval."
+description: "Query, inspect, debug, or modify databases (PostgreSQL, openGauss/GaussDB/Vastbase/GBase 8c, KingbaseES, Dameng DM8, TDengine, MySQL/TiDB/OceanBase/PolarDB/TDSQL/GoldenDB/GBase 8a, SQLite, ClickHouse, SQL Server, Oracle, MongoDB, Elasticsearch/Easysearch, Redis) safely through agent-dbctl instead of raw psql, gsql, ksql, disql, mysql, clickhouse-client, sqlcmd, sqlplus, mongosh, or redis-cli. Use whenever a task involves inspecting schemas or tables, debugging database state, running SQL/Mongo/Elasticsearch/Redis queries, checking EXPLAIN plans, or submitting staging/production data changes for human Web approval."
 ---
 
 # agent-dbctl Skill
@@ -66,7 +66,7 @@ When a database is not yet registered (`db list` returns empty or `db_not_found`
    - `--preflight` connects read-only and runs non-mutating `EXPLAIN` (never `ANALYZE`) on SQL reads or single-statement DML (`INSERT`/`UPDATE`/`DELETE`/`MERGE`) to surface full scans and row estimates before execution.
    - Pass `--verbose` on `exec` when you want full `classification`, `preflight` (`plan_raw`), and `evaluation` (`matched_rules`, `effective_policy`) details alongside results.
 3. **Execute verbatim queries with a clear business reason**:
-   - Pass verbatim engine syntax (PostgreSQL/MySQL/SQLite/ClickHouse/MSSQL/Oracle SQL, MongoDB JSON `RunCommand` such as `{"find":"orders","limit":10}` or `show collections`, Elasticsearch HTTP+JSON or JSON search, or Redis commands). Do not ask `agent-dbctl` to translate dialects.
+   - Pass verbatim engine syntax (PostgreSQL/openGauss/KingbaseES/MySQL/SQLite/ClickHouse/MSSQL/Oracle/Dameng/TDengine SQL, MongoDB JSON `RunCommand` such as `{"find":"orders","limit":10}` or `show collections`, Elasticsearch/Easysearch HTTP+JSON or JSON search, or Redis commands). Do not ask `agent-dbctl` to translate dialects.
    - Pass queries via `--sql`, `--file <path>`, `--stdin`, or as a single optional positional argument (`exec --db <ref> "<query>"`). Prefer `--file <path>` or `--stdin` for multi-line SQL or JSON queries to avoid shell escaping errors.
    - Pass `--format objects` on SQL queries when working with wide tables and you want `records: [{col: val}]` instead of positional `columns` + `rows` arrays.
    - Always pass `--reason "<concise reason>"` on writes, production queries, or any operation that may trigger human approval; by default (`require_reason_for_approval`), approval requests without `--reason` are rejected with exit `2` (`reason_required`).

@@ -284,6 +284,10 @@ func engineQuerySyntaxHint(engine string) string {
 		return "T-SQL (e.g. SELECT TOP 10 * FROM dbo.orders)"
 	case "oracle":
 		return "Oracle SQL (e.g. SELECT * FROM orders FETCH FIRST 10 ROWS ONLY)"
+	case "dameng":
+		return "Dameng DM8 SQL (e.g. SELECT * FROM orders FETCH FIRST 10 ROWS ONLY)"
+	case "tdengine":
+		return "TDengine SQL over /rest/sql (e.g. SELECT * FROM meters LIMIT 10)"
 	default:
 		return ""
 	}
@@ -302,7 +306,7 @@ func buildTargetExamples(targetRef, engine string) []string {
 		out = append(out, fmt.Sprintf(`agent-dbctl exec --db %s '{"index":"logs","query":{"match_all":{}},"size":10}' --json`, targetRef))
 	case "mssql":
 		out = append(out, fmt.Sprintf(`agent-dbctl exec --db %s "SELECT TOP 10 * FROM orders" --json`, targetRef))
-	case "oracle":
+	case "oracle", "dameng":
 		out = append(out, fmt.Sprintf(`agent-dbctl exec --db %s "SELECT * FROM orders FETCH FIRST 10 ROWS ONLY" --json`, targetRef))
 	default:
 		out = append(out, fmt.Sprintf(`agent-dbctl exec --db %s "SELECT * FROM orders LIMIT 10" --json`, targetRef))
@@ -340,10 +344,22 @@ func BuildEngineGuides(drivers []types.DriverMetadata) []EngineGuide {
 		}
 		switch classify.CanonicalEngine(d.Engine) {
 		case "postgres":
-			g.Aliases = []string{"postgresql", "cockroachdb", "redshift", "yugabytedb", "greenplum", "alloydb"}
+			g.Aliases = []string{"postgresql", "cockroachdb", "redshift", "yugabytedb", "greenplum", "alloydb", "highgo", "uxdb", "opentenbase", "kwdb", "polardb_pg", "tdsql_pg"}
 			g.KeyParams = []string{"exec_mode=simple_protocol (for PgBouncer)"}
+		case "opengauss":
+			g.Aliases = []string{"gaussdb", "gaussdb_dws", "vastbase", "mogdb", "gbase8c"}
+			g.KeyParams = []string{"connect_timeout=10", "search_path=public"}
+		case "kingbase":
+			g.Aliases = []string{"kingbase8", "kingbasees", "kes"}
+			g.KeyParams = []string{"connect_timeout=10", "search_path=public"}
+		case "dameng":
+			g.Aliases = []string{"dm", "dm8"}
+			g.KeyParams = []string{"schema=<SCHEMA> (defaults to database_name)", "connectTimeout=10000"}
+		case "tdengine":
+			g.Aliases = []string{"taos", "taosdata"}
+			g.KeyParams = []string{"scheme=http|https", "auth_type=basic|taosd"}
 		case "mysql":
-			g.Aliases = []string{"mariadb", "tidb", "oceanbase_mysql", "starrocks", "doris"}
+			g.Aliases = []string{"mariadb", "tidb", "oceanbase", "oceanbase_mysql", "polardb", "polardb_mysql", "tdsql", "tdsql_mysql", "goldendb", "greatsql", "gbase", "gbase8a", "starrocks", "doris", "selectdb"}
 			g.KeyParams = []string{"charset", "parseTime"}
 		case "sqlite":
 			g.Aliases = []string{"sqlite3"}
@@ -364,7 +380,7 @@ func BuildEngineGuides(drivers []types.DriverMetadata) []EngineGuide {
 			g.Aliases = []string{"oracledb"}
 			g.KeyParams = []string{"sid=<SID> (defaults to service name in database_name)"}
 		case "elasticsearch":
-			g.Aliases = []string{"opensearch", "es"}
+			g.Aliases = []string{"opensearch", "easysearch", "es"}
 			g.KeyParams = []string{"scheme=http|https", "auth_type=basic|api_key|bearer"}
 		}
 		if g.SyntaxHint == "" {

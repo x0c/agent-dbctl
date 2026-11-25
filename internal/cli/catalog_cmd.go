@@ -173,7 +173,7 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 	dbAddCmd.Flags().StringVar(&addOpts.dsn, "dsn", "", "Database connection URI/DSN (avoid inline passwords; prefer --dsn-env or --open-secret)")
 	dbAddCmd.Flags().StringVar(&addOpts.dsnEnv, "dsn-env", "", "Environment variable name containing the DSN")
 	dbAddCmd.Flags().BoolVar(&addOpts.dsnStdin, "dsn-stdin", false, "Read DSN from stdin")
-	dbAddCmd.Flags().StringVar(&addOpts.engine, "engine", "", "Database engine (postgres, mysql, sqlite, mongodb, redis, clickhouse, mssql, oracle, elasticsearch, or alias)")
+	dbAddCmd.Flags().StringVar(&addOpts.engine, "engine", "", "Database engine (postgres, opengauss, kingbase, dameng, tdengine, mysql, sqlite, mongodb, redis, clickhouse, mssql, oracle, elasticsearch, or alias)")
 	dbAddCmd.Flags().StringVar(&addOpts.host, "host", "", "Database host or SQLite file path")
 	dbAddCmd.Flags().IntVar(&addOpts.port, "port", 0, "Database port (defaults by engine)")
 	dbAddCmd.Flags().StringVar(&addOpts.database, "database", "", "Logical database/schema/DB index")

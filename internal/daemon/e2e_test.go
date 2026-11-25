@@ -749,7 +749,7 @@ func TestNewBuiltinEnginesCatalogAndOpenSearchE2E(t *testing.T) {
 	for _, item := range cat.Engines {
 		seenEngines[item.Code] = true
 	}
-	for _, want := range []string{"postgres", "mysql", "sqlite", "mongodb", "redis", "clickhouse", "mssql", "oracle", "elasticsearch"} {
+	for _, want := range []string{"postgres", "opengauss", "kingbase", "dameng", "tdengine", "mysql", "sqlite", "mongodb", "redis", "clickhouse", "mssql", "oracle", "elasticsearch"} {
 		if !seenEngines[want] {
 			t.Fatalf("DisplayCatalog missing built-in engine %q (got %+v)", want, cat.Engines)
 		}
@@ -966,6 +966,52 @@ func TestParseAndRedactDSNAllNineEngines(t *testing.T) {
 			dsn:        "https://elastic:pw@127.0.0.1:9200/logs",
 			hintEngine: "elasticsearch",
 			wantEngine: "elasticsearch", wantHost: "127.0.0.1", wantPort: 9200, wantDB: "logs", wantUser: "elastic", wantPass: true, wantTLS: "require",
+		},
+		{
+			name:       "dameng_dm8",
+			dsn:        "dm8://SYSDBA:pw@127.0.0.1:5236/ORDERS",
+			wantEngine: "dm8", wantHost: "127.0.0.1", wantPort: 5236, wantDB: "ORDERS", wantUser: "SYSDBA", wantPass: true,
+		},
+		{
+			name:       "kingbase_default_port",
+			dsn:        "kingbase://system:pw@127.0.0.1/app",
+			wantEngine: "kingbase", wantHost: "127.0.0.1", wantPort: 54321, wantDB: "app", wantUser: "system", wantPass: true,
+		},
+		{
+			name:       "opengauss_default_port",
+			dsn:        "opengauss://gaussdb:pw@127.0.0.1/finance",
+			wantEngine: "opengauss", wantHost: "127.0.0.1", wantPort: 5432, wantDB: "finance", wantUser: "gaussdb", wantPass: true,
+		},
+		{
+			name:       "gaussdb_dws_default_port",
+			dsn:        "gaussdb_dws://dbadmin:pw@127.0.0.1/dw",
+			wantEngine: "gaussdb_dws", wantHost: "127.0.0.1", wantPort: 8000, wantDB: "dw", wantUser: "dbadmin", wantPass: true,
+		},
+		{
+			name:       "tidb_default_port",
+			dsn:        "tidb://root:pw@127.0.0.1/shop",
+			wantEngine: "tidb", wantHost: "127.0.0.1", wantPort: 4000, wantDB: "shop", wantUser: "root", wantPass: true,
+		},
+		{
+			name:       "oceanbase_default_port",
+			dsn:        "oceanbase://root@127.0.0.1/ob",
+			wantEngine: "oceanbase", wantHost: "127.0.0.1", wantPort: 2883, wantDB: "ob", wantUser: "root",
+		},
+		{
+			name:       "gbase8a_default_port",
+			dsn:        "gbase8a://gbasedbt:pw@127.0.0.1/bi",
+			wantEngine: "gbase8a", wantHost: "127.0.0.1", wantPort: 5258, wantDB: "bi", wantUser: "gbasedbt", wantPass: true,
+		},
+		{
+			name:       "tdengine_default_port",
+			dsn:        "tdengine://root:pw@127.0.0.1/power",
+			wantEngine: "tdengine", wantHost: "127.0.0.1", wantPort: 6041, wantDB: "power", wantUser: "root", wantPass: true,
+		},
+		{
+			name:       "easysearch_https",
+			dsn:        "https://admin:pw@127.0.0.1:9200/logs",
+			hintEngine: "easysearch",
+			wantEngine: "easysearch", wantHost: "127.0.0.1", wantPort: 9200, wantDB: "logs", wantUser: "admin", wantPass: true, wantTLS: "require",
 		},
 	}
 

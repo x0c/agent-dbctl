@@ -49,9 +49,18 @@ var sqlAdminFunctions = map[string]bool{
 	"utl_http.request":        true,
 	"utl_tcp":                 true,
 	"utl_tcp.open_connection": true,
-	"dbms_sql":                true,
-	"dbms_sql.execute":        true,
-	"dbms_pipe":               true,
+	"dbms_sql":                  true,
+	"dbms_sql.execute":          true,
+	"dbms_pipe":                 true,
+	"sf_set_session_para_value": true,
+	"sf_set_system_para_value":  true,
+	"sp_set_para_value":         true,
+	"sp_set_para_double_value":  true,
+	"sp_create_system_packages": true,
+	"sp_set_session_readonly":   true,
+	"pg_switch_xlog":            true,
+	"gs_password_notify":        true,
+	"gs_wlm_readjust_user_space": true,
 }
 
 var sqlWriteFunctions = map[string]bool{
@@ -131,9 +140,19 @@ var sqlExplainModifiers = map[string]bool{
 func CanonicalEngine(engine string) string {
 	e := strings.ToLower(strings.TrimSpace(engine))
 	switch e {
-	case "postgres", "postgresql", "pg", "cockroachdb", "cockroach", "redshift", "yugabytedb", "yugabyte", "greenplum", "alloydb":
+	case "postgres", "postgresql", "pg", "cockroachdb", "cockroach", "redshift", "yugabytedb", "yugabyte", "greenplum", "alloydb",
+		"highgo", "uxdb", "opentenbase", "kwdb", "kaiwudb", "polardb_pg", "polardb-pg", "tdsql_pg", "tdsql-pg":
 		return "postgres"
-	case "mysql", "mariadb", "tidb", "oceanbase", "oceanbase_mysql", "starrocks", "doris":
+	case "opengauss", "gaussdb", "gaussdb_dws", "gaussdb-dws", "vastbase", "mogdb", "gbase8c", "gbase-8c":
+		return "opengauss"
+	case "kingbase", "kingbase8", "kingbasees", "kes":
+		return "kingbase"
+	case "dameng", "dm", "dm8":
+		return "dameng"
+	case "tdengine", "taos", "taosdata":
+		return "tdengine"
+	case "mysql", "mariadb", "tidb", "oceanbase", "oceanbase_mysql", "starrocks", "doris", "selectdb",
+		"polardb", "polardb_mysql", "polardb-mysql", "tdsql", "tdsql_mysql", "tdsql-mysql", "goldendb", "greatsql", "gbase", "gbase8a", "gbase-8a":
 		return "mysql"
 	case "sqlite", "sqlite3", "sqlite-ext":
 		return "sqlite"
@@ -147,7 +166,7 @@ func CanonicalEngine(engine string) string {
 		return "mssql"
 	case "oracle", "oracledb":
 		return "oracle"
-	case "elasticsearch", "es", "opensearch":
+	case "elasticsearch", "es", "opensearch", "easysearch":
 		return "elasticsearch"
 	default:
 		if strings.Contains(e, "mongo") {
@@ -156,7 +175,7 @@ func CanonicalEngine(engine string) string {
 		if strings.Contains(e, "redis") || strings.Contains(e, "valkey") {
 			return "redis"
 		}
-		if strings.Contains(e, "elastic") || strings.Contains(e, "opensearch") {
+		if strings.Contains(e, "elastic") || strings.Contains(e, "opensearch") || strings.Contains(e, "easysearch") {
 			return "elasticsearch"
 		}
 		return e

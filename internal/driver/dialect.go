@@ -21,6 +21,7 @@ type DialectHints struct {
 }
 
 var semverMajorMinorRe = regexp.MustCompile(`v?(\d+)\.(\d+)`)
+var kingbaseVersionRe = regexp.MustCompile(`(?i)V(\d+)R(\d+)`)
 var wireVersionRe = regexp.MustCompile(`(?i)^wire_v(\d+)$`)
 
 // DetectServerCapabilities resolves engine dialect, major/minor version, and feature flags from a live probe.
@@ -38,9 +39,17 @@ func DetectServerCapabilities(engine, serverVersion string, hints DialectHints) 
 
 	switch eng {
 	case "postgres":
-		return detectPostgresCapabilities(caps, ver)
+		return detectPostgresCapabilities(caps, rawEng, ver)
+	case "opengauss":
+		return detectOpenGaussCapabilities(caps, rawEng, ver)
+	case "kingbase":
+		return detectKingbaseCapabilities(caps, ver)
+	case "dameng":
+		return detectDamengCapabilities(caps, ver)
+	case "tdengine":
+		return detectTDengineCapabilities(caps, ver)
 	case "mysql":
-		return detectMySQLCapabilities(caps, ver, hints.VersionComment)
+		return detectMySQLCapabilities(caps, rawEng, ver, hints.VersionComment)
 	case "sqlite":
 		return detectSQLiteCapabilities(caps, ver)
 	case "mongodb":
@@ -54,14 +63,14 @@ func DetectServerCapabilities(engine, serverVersion string, hints DialectHints) 
 	case "oracle":
 		return detectOracleCapabilities(caps, ver)
 	case "elasticsearch":
-		return detectElasticsearchCapabilities(caps, ver, hints)
+		return detectElasticsearchCapabilities(caps, rawEng, ver, hints)
 	default:
 		caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
 		return caps
 	}
 }
 
-func detectPostgresCapabilities(caps types.ServerCapabilities, ver string) types.ServerCapabilities {
+func detectPostgresCapabilities(caps types.ServerCapabilities, rawEng, ver string) types.ServerCapabilities {
 	lower := strings.ToLower(ver)
 	caps.Dialect = "postgres"
 	caps.SupportsExplain = true
@@ -101,6 +110,36 @@ func detectPostgresCapabilities(caps types.ServerCapabilities, ver string) types
 		caps.ExplainFormat = "pg_json"
 		caps.SupportsExplainJSON = true
 		return caps
+	case strings.Contains(lower, "highgo") || rawEng == "highgo":
+		caps.Dialect = "highgo"
+		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "highgo")
+		caps.ExplainFormat = "pg_json"
+		caps.SupportsExplainJSON = true
+		return caps
+	case strings.Contains(lower, "uxdb") || rawEng == "uxdb":
+		caps.Dialect = "uxdb"
+		caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+		caps.ExplainFormat = "pg_json"
+		caps.SupportsExplainJSON = true
+		return caps
+	case strings.Contains(lower, "opentenbase") || rawEng == "opentenbase":
+		caps.Dialect = "opentenbase"
+		caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+		caps.ExplainFormat = "pg_text"
+		caps.SupportsExplainJSON = false
+		return caps
+	case strings.Contains(lower, "kwdb") || strings.Contains(lower, "kaiwudb") || rawEng == "kwdb" || rawEng == "kaiwudb":
+		caps.Dialect = "kwdb"
+		caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+		caps.ExplainFormat = "pg_text"
+		caps.SupportsExplainJSON = false
+		return caps
+	case strings.Contains(lower, "polardb") || rawEng == "polardb_pg" || rawEng == "polardb-pg":
+		caps.Dialect = "polardb_pg"
+		caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+		caps.ExplainFormat = "pg_json"
+		caps.SupportsExplainJSON = true
+		return caps
 	}
 
 	caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
@@ -114,7 +153,83 @@ func detectPostgresCapabilities(caps types.ServerCapabilities, ver string) types
 	return caps
 }
 
-func detectMySQLCapabilities(caps types.ServerCapabilities, ver, comment string) types.ServerCapabilities {
+func detectOpenGaussCapabilities(caps types.ServerCapabilities, rawEng, ver string) types.ServerCapabilities {
+	lower := strings.ToLower(ver)
+	caps.Dialect = "opengauss"
+	caps.SupportsExplain = true
+	caps.SupportsExplainJSON = false
+	caps.ExplainFormat = "pg_text"
+	caps.SupportsReadOnlySession = true
+	caps.SupportsCancelQuery = true
+	caps.SupportsReturning = true
+
+	switch {
+	case strings.Contains(lower, "gbase8c") || rawEng == "gbase8c" || rawEng == "gbase-8c":
+		caps.Dialect = "gbase8c"
+		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "gbase8c")
+	case strings.Contains(lower, "vastbase") || rawEng == "vastbase":
+		caps.Dialect = "vastbase"
+		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "vastbase")
+	case strings.Contains(lower, "mogdb") || rawEng == "mogdb":
+		caps.Dialect = "mogdb"
+		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "mogdb")
+	case strings.Contains(lower, "gaussdb") || rawEng == "gaussdb" || rawEng == "gaussdb_dws" || rawEng == "gaussdb-dws":
+		caps.Dialect = "gaussdb"
+		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "gaussdb")
+	default:
+		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "opengauss")
+	}
+	return caps
+}
+
+func detectKingbaseCapabilities(caps types.ServerCapabilities, ver string) types.ServerCapabilities {
+	caps.Dialect = "kingbase"
+	caps.SupportsExplain = true
+	caps.SupportsExplainJSON = false
+	caps.ExplainFormat = "pg_text"
+	caps.SupportsReadOnlySession = true
+	caps.SupportsCancelQuery = true
+	caps.SupportsReturning = true
+	caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "kingbase")
+	if caps.MajorVersion == 0 {
+		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "v")
+	}
+	if caps.MajorVersion == 0 {
+		if m := kingbaseVersionRe.FindStringSubmatch(ver); len(m) == 3 {
+			caps.MajorVersion, _ = strconv.Atoi(m[1])
+			caps.MinorVersion, _ = strconv.Atoi(m[2])
+		}
+	}
+	return caps
+}
+
+func detectDamengCapabilities(caps types.ServerCapabilities, ver string) types.ServerCapabilities {
+	caps.Dialect = "dameng"
+	caps.SupportsExplain = true
+	caps.SupportsExplainJSON = false
+	caps.ExplainFormat = "dameng_explain"
+	caps.SupportsReadOnlySession = true
+	caps.SupportsCancelQuery = true
+	caps.SupportsReturning = false
+	caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "dm")
+	if caps.MajorVersion == 0 {
+		caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+	}
+	return caps
+}
+
+func detectTDengineCapabilities(caps types.ServerCapabilities, ver string) types.ServerCapabilities {
+	caps.Dialect = "tdengine"
+	caps.SupportsExplain = true
+	caps.SupportsExplainJSON = false
+	caps.ExplainFormat = "tdengine_explain"
+	caps.SupportsReadOnlySession = false
+	caps.SupportsCancelQuery = true
+	caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+	return caps
+}
+
+func detectMySQLCapabilities(caps types.ServerCapabilities, rawEng, ver, comment string) types.ServerCapabilities {
 	lower := strings.ToLower(ver + " " + comment)
 	caps.Dialect = "mysql"
 	caps.SupportsExplain = true
@@ -140,23 +255,59 @@ func detectMySQLCapabilities(caps types.ServerCapabilities, ver, comment string)
 		}
 		caps.SupportsReturning = caps.MajorVersion > 10 || (caps.MajorVersion == 10 && caps.MinorVersion >= 5)
 		return caps
-	case strings.Contains(lower, "oceanbase"):
+	case strings.Contains(lower, "oceanbase") || rawEng == "oceanbase" || rawEng == "oceanbase_mysql":
 		caps.Dialect = "oceanbase_mysql"
 		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "oceanbase")
 		caps.ExplainFormat = "mysql_tabular"
 		caps.SupportsExplainJSON = false
 		return caps
-	case strings.Contains(lower, "starrocks"):
+	case strings.Contains(lower, "starrocks") || rawEng == "starrocks":
 		caps.Dialect = "starrocks"
 		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "starrocks")
 		caps.ExplainFormat = "mysql_tabular"
 		caps.SupportsExplainJSON = false
 		return caps
-	case strings.Contains(lower, "doris"):
+	case strings.Contains(lower, "selectdb") || rawEng == "selectdb":
+		caps.Dialect = "selectdb"
+		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "selectdb")
+		caps.ExplainFormat = "mysql_tabular"
+		caps.SupportsExplainJSON = false
+		return caps
+	case strings.Contains(lower, "doris") || rawEng == "doris":
 		caps.Dialect = "doris"
 		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "doris")
 		caps.ExplainFormat = "mysql_tabular"
 		caps.SupportsExplainJSON = false
+		return caps
+	case strings.Contains(lower, "gbase") || rawEng == "gbase" || rawEng == "gbase8a" || rawEng == "gbase-8a":
+		caps.Dialect = "gbase8a"
+		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "gbase")
+		caps.ExplainFormat = "mysql_tabular"
+		caps.SupportsExplainJSON = false
+		return caps
+	case strings.Contains(lower, "goldendb") || rawEng == "goldendb":
+		caps.Dialect = "goldendb"
+		caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "goldendb")
+		caps.ExplainFormat = "mysql_tabular"
+		caps.SupportsExplainJSON = false
+		return caps
+	case strings.Contains(lower, "tdsql") || rawEng == "tdsql" || rawEng == "tdsql_mysql" || rawEng == "tdsql-mysql":
+		caps.Dialect = "tdsql"
+		caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+		caps.ExplainFormat = "mysql_json_v1"
+		caps.SupportsExplainJSON = true
+		return caps
+	case strings.Contains(lower, "polardb") || rawEng == "polardb" || rawEng == "polardb_mysql" || rawEng == "polardb-mysql":
+		caps.Dialect = "polardb"
+		caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+		caps.ExplainFormat = "mysql_json_v1"
+		caps.SupportsExplainJSON = true
+		return caps
+	case strings.Contains(lower, "greatsql") || rawEng == "greatsql":
+		caps.Dialect = "greatsql"
+		caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+		caps.ExplainFormat = "mysql_json_v1"
+		caps.SupportsExplainJSON = true
 		return caps
 	}
 
@@ -308,11 +459,14 @@ func detectOracleCapabilities(caps types.ServerCapabilities, ver string) types.S
 	return caps
 }
 
-func detectElasticsearchCapabilities(caps types.ServerCapabilities, ver string, hints DialectHints) types.ServerCapabilities {
+func detectElasticsearchCapabilities(caps types.ServerCapabilities, rawEng, ver string, hints DialectHints) types.ServerCapabilities {
 	dist := strings.ToLower(strings.TrimSpace(hints.Distribution + " " + ver))
 	caps.Dialect = "elasticsearch"
-	if strings.Contains(dist, "opensearch") {
+	switch {
+	case strings.Contains(dist, "opensearch"):
 		caps.Dialect = "opensearch"
+	case strings.Contains(dist, "easysearch") || rawEng == "easysearch":
+		caps.Dialect = "easysearch"
 	}
 	caps.ExplainFormat = "es_validate_query"
 	caps.SupportsExplain = true
