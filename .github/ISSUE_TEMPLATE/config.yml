@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/x0c/agent-dbctl/security/advisories/new
+    about: Report vulnerabilities privately. Never attach credentials, tokens, or sensitive query results to a public issue.
+  - name: Roadmap and contribution checks
+    url: https://github.com/x0c/agent-dbctl/blob/main/docs/ROADMAP.md
+    about: Review release priorities and acceptance requirements before proposing broad work.

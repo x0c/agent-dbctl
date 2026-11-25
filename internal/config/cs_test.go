@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -52,8 +53,11 @@ func TestContextsRoundTripAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat contexts.yaml: %v", err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("expected 0600 mode on contexts.yaml, got %o", info.Mode().Perm())
+	}
+	if runtime.GOOS == "windows" && info.Mode().Perm()&0o200 == 0 {
+		t.Fatalf("expected contexts.yaml to remain owner-writable on Windows, got %o", info.Mode().Perm())
 	}
 
 	active, explicit, err = ResolveActiveContext(paths, "")

@@ -11,16 +11,41 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from release_gate import ReleaseGateError, enforce_release_gate, repository_from_remote
+
 root = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser()
 parser.add_argument("--version", required=True)
 parser.add_argument("--source-commit", default="HEAD", help="reviewed commit with the same source tree")
+parser.add_argument("--repository", help="GitHub owner/name; defaults to the origin remote")
+parser.add_argument("--skip-ci-check", action="store_true", help="prerelease-only local packaging without CI attestation")
 args = parser.parse_args()
 
 if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[a-z0-9.]+)?", args.version):
     parser.error("version must be a v-prefixed semantic version (e.g. v0.1.0)")
 if subprocess.check_output(["git", "status", "--porcelain"], cwd=root).strip():
     parser.error("commit the releasable source tree first")
+
+commit = subprocess.check_output(["git", "rev-parse", args.source_commit], cwd=root).decode().strip()
+short_commit = subprocess.check_output(["git", "rev-parse", "--short", commit], cwd=root).decode().strip()
+if subprocess.check_output(["git", "rev-parse", commit + "^{tree}"], cwd=root) != subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=root):
+    parser.error("source commit must have the same tree as HEAD")
+
+repository = args.repository
+if not repository:
+    remote = subprocess.check_output(["git", "remote", "get-url", "origin"], cwd=root).decode()
+    try:
+        repository = repository_from_remote(remote)
+    except ReleaseGateError as exc:
+        parser.error(str(exc))
+try:
+    attestation = enforce_release_gate(args.version, repository, commit, args.skip_ci_check)
+except ReleaseGateError as exc:
+    parser.error(str(exc))
+if attestation:
+    print(f"Verified CI run {attestation['run_id']} for {repository}@{commit}: Linux, macOS, Windows, and server smoke passed.")
+else:
+    print(f"Building unverified prerelease {args.version}; stable releases require green CI.")
 
 subprocess.run(["python3", "scripts/check-public.py"], cwd=root, check=True)
 
@@ -30,11 +55,6 @@ if canonical_skill != embedded_skill:
     parser.error("cmd/agent-dbctl/skill.md is out of sync with skills/agent-dbctl/SKILL.md; run make sync-skill")
 
 subprocess.run(["npm", "run", "build"], cwd=root / "web", check=True)
-
-commit = subprocess.check_output(["git", "rev-parse", args.source_commit], cwd=root).decode().strip()
-short_commit = subprocess.check_output(["git", "rev-parse", "--short", commit], cwd=root).decode().strip()
-if subprocess.check_output(["git", "rev-parse", commit + "^{tree}"], cwd=root) != subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=root):
-    parser.error("source commit must have the same tree as HEAD")
 
 epoch = int(subprocess.check_output(["git", "show", "-s", "--format=%ct", commit], cwd=root))
 archive_time = datetime.fromtimestamp(epoch, timezone.utc).timetuple()[:6]

@@ -35,7 +35,7 @@ services:
       args:
         VERSION: ${AGENT_DBCTL_VERSION:-dev}
         COMMIT: ${AGENT_DBCTL_COMMIT:-docker}
-    image: agent-dbctl:latest
+    image: ${AGENT_DBCTL_IMAGE:-agent-dbctl:latest}
     restart: unless-stopped
     depends_on:
       postgres:

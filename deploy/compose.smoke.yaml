@@ -1,0 +1,29 @@
+# CI-only additions for scripts/server_smoke.py. Never use as a production override.
+services:
+  agent-dbctl:
+    volumes:
+      - ./deploy/server.smoke.yaml:/etc/agent-dbctl/server.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      oidc:
+        condition: service_healthy
+
+  oidc:
+    image: golang:1.26-alpine
+    command: ["go", "run", "/src/oidc_provider.go"]
+    working_dir: /src
+    environment:
+      OIDC_ISSUER: http://oidc:8081
+      GOPROXY: https://goproxy.cn,direct
+    volumes:
+      - ./scripts/tests/oidc_provider.go:/src/oidc_provider.go:ro
+    ports:
+      - "${SMOKE_OIDC_BIND_ADDR:-127.0.0.1:18081}:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

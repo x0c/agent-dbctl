@@ -11,9 +11,14 @@ FROM golang:1.26-alpine AS go-builder
 ARG VERSION=dev
 ARG COMMIT=dev
 WORKDIR /src
+ENV GOPROXY=https://goproxy.cn,direct
 RUN apk add --no-cache git
 COPY go.mod go.sum ./
-RUN go mod download
+RUN n=1; until [ $$n -gt 3 ]; do \
+      go mod download && exit 0; \
+      echo "go mod download attempt $$n failed; retrying" >&2; \
+      n=$$((n+1)); sleep 5; \
+    done; exit 1
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 COPY skills/agent-dbctl/SKILL.md ./cmd/agent-dbctl/skill.md

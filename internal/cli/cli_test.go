@@ -940,6 +940,9 @@ func TestCLIFrictionFixesAndPatternPartialUpdate(t *testing.T) {
 		}
 		return code, env
 	}
+	t.Cleanup(func() {
+		runCLI("daemon", "stop", "--json")
+	})
 
 	dbFile := filepath.Join(t.TempDir(), "friction.db")
 	// 1. Missing env without --safety-tier includes actionable hint and next_commands.

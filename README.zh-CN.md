@@ -8,6 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/x0c/agent-dbctl/releases/latest"><img src="https://img.shields.io/github/v/release/x0c/agent-dbctl" alt="Latest Release"></a>
+  <a href="https://github.com/x0c/agent-dbctl/actions/workflows/ci.yml"><img src="https://github.com/x0c/agent-dbctl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/x0c/agent-dbctl" alt="MIT License"></a>
 </p>
 
@@ -56,6 +57,20 @@ irm https://raw.githubusercontent.com/x0c/agent-dbctl/main/scripts/install.ps1 |
 ```
 
 若新终端提示找不到 `agent-dbctl`，将安装脚本输出的目标目录加入 `PATH` 即可。
+
+团队需要可重复安装时，将 `vX.Y.Z` 替换为已审核的版本号并固定版本，避免跟随 `latest` 自动升级：
+
+```sh
+# macOS / Linux
+export AGENT_DBCTL_VERSION=vX.Y.Z
+curl -fsSL https://raw.githubusercontent.com/x0c/agent-dbctl/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows PowerShell
+$env:AGENT_DBCTL_VERSION = 'vX.Y.Z'
+irm https://raw.githubusercontent.com/x0c/agent-dbctl/main/scripts/install.ps1 | iex
+```
 
 <details>
 <summary>备选方式：从源码构建（需要 Go 1.26.11+ 与 Node.js 22+）</summary>
@@ -198,6 +213,7 @@ agent-dbctl login --token-stdin
 - [CLI 契约与退出码](docs/CLI_CONTRACT.md)
 - [高危读取风险审计矩阵](docs/READ_RISK_AUDIT.md)
 - [外部 gRPC 驱动与审批扩展协议](docs/PLUGIN_PROTOCOL.md)
+- [路线图与发布验收](docs/ROADMAP.md)
 - [安全策略](SECURITY.md) · [贡献指南](CONTRIBUTING.md) · [更新日志](CHANGELOG.md)
 
 ## 许可证

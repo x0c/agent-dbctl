@@ -1,0 +1,45 @@
+# Isolated CI smoke configuration. Uses synthetic users and an in-stack OIDC fixture.
+mode: server
+listen_addr: 0.0.0.0:8080
+public_url: http://127.0.0.1:18080
+allowed_hosts:
+  - 127.0.0.1:8080
+  - localhost:8080
+  - 127.0.0.1:18080
+  - localhost:18080
+trust_proxy_headers: true
+trusted_proxy_cidrs: []
+allow_sqlite_targets: true
+disable_ssh_auth_sock: true
+replicas: 1
+storage:
+  driver: postgres
+  dsn_env: AGENT_DBCTL_STORE_DSN
+pubsub:
+  driver: redis
+result_slot:
+  driver: redis
+  redis_url_env: AGENT_DBCTL_REDIS_URL
+secrets:
+  driver: encrypted_db
+  master_key_env: AGENT_DBCTL_MASTER_KEY
+  allow_exec_provider_for_admin: false
+auth:
+  local_login_enabled: true
+  bootstrap_admin_email: admin@example.com
+  bootstrap_admin_password_env: AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD
+  session_ttl_hours: 1
+  forbid_self_approval: true
+  oidc:
+    enabled: true
+    issuer_url: http://oidc:8081
+    client_id: smoke-client
+    client_secret_env: AGENT_DBCTL_OIDC_SECRET
+    device_flow_enabled: true
+    admin_groups: []
+    admin_emails:
+      - admin@example.com
+    scopes:
+      - openid
+      - profile
+      - email

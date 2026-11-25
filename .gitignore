@@ -7,5 +7,7 @@ internal/webui/dist/*
 !internal/webui/dist/.gitkeep
 *.test
 *.out
+__pycache__/
+*.pyc
 .DS_Store
 tmp/

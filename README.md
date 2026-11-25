@@ -8,6 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/x0c/agent-dbctl/releases/latest"><img src="https://img.shields.io/github/v/release/x0c/agent-dbctl" alt="Latest Release"></a>
+  <a href="https://github.com/x0c/agent-dbctl/actions/workflows/ci.yml"><img src="https://github.com/x0c/agent-dbctl/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/x0c/agent-dbctl" alt="MIT License"></a>
 </p>
 
@@ -56,6 +57,20 @@ irm https://raw.githubusercontent.com/x0c/agent-dbctl/main/scripts/install.ps1 |
 ```
 
 If `agent-dbctl` is not found in a new shell, add the installer's reported directory to `PATH`.
+
+For repeatable team installations, replace `vX.Y.Z` with a reviewed release and pin it instead of following `latest`:
+
+```sh
+# macOS / Linux
+export AGENT_DBCTL_VERSION=vX.Y.Z
+curl -fsSL https://raw.githubusercontent.com/x0c/agent-dbctl/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows PowerShell
+$env:AGENT_DBCTL_VERSION = 'vX.Y.Z'
+irm https://raw.githubusercontent.com/x0c/agent-dbctl/main/scripts/install.ps1 | iex
+```
 
 <details>
 <summary>Alternative: Build from source (Go 1.26.11+ & Node.js 22+)</summary>
@@ -198,6 +213,7 @@ agent-dbctl login --token-stdin
 - [CLI Contract & Exit Codes](docs/CLI_CONTRACT.md)
 - [Read-Risk Audit Matrix](docs/READ_RISK_AUDIT.md)
 - [External gRPC Driver & Approval Plugin Protocol](docs/PLUGIN_PROTOCOL.md)
+- [Roadmap & Release Acceptance](docs/ROADMAP.md)
 - [Security Policy](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md)
 
 ## License

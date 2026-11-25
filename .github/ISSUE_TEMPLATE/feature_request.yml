@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a user outcome and an acceptance-scoped change
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: What are you trying to accomplish, on which platform and database engine? What prevents it today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Requested outcome
+      description: Describe the smallest behavior that would solve the problem, including the agent or human workflow.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance evidence
+      description: Which command, JSON result, Web action, audit record, or deployment behavior would prove this works?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing commands, topology, policy, plugin, or approval-provider options you already tried.
+  - type: textarea
+    id: risk
+    attributes:
+      label: Security and compatibility impact
+      description: Note any effect on credentials, approvals, read-only enforcement, audit integrity, existing CLI contracts, or supported platforms.

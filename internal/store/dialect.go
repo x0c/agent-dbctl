@@ -48,6 +48,13 @@ func (s *Store) q(query string) string {
 }
 
 func (s *Store) dbExec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if !s.isPG() {
+		// A standalone commit between a deferred transaction's first read and
+		// write invalidates that snapshot with SQLITE_BUSY_SNAPSHOT. Share the
+		// same writer lock used by withTx so every SQLite writer is serialized.
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+	}
 	return s.db.ExecContext(ctx, s.q(query), args...)
 }
 
@@ -163,7 +170,9 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
 		return fmt.Errorf("acquire postgres migration lock: %w", err)
 	}
-	defer func() { _, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey) }()
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey)
+	}()
 
 	const schema = `
 CREATE TABLE IF NOT EXISTS schema_migrations (

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### English
+
+- **SQLite write reliability**: Serialized standalone maintenance writes with read-write transactions, preventing `SQLITE_BUSY_SNAPSHOT` / `database is locked (517)` failures during concurrent server authentication and catalog mutations.
+- **Verified stable release gate**: Stable local packaging now requires exact-commit green Linux, macOS, Windows, and Linux server-smoke CI jobs; prerelease-only `--skip-ci-check` preserves offline packaging.
+- **Real server acceptance**: Added an isolated Compose smoke path covering PostgreSQL control-plane storage, Redis events/results, RS256/PKCE OIDC, CLI device confirmation, four-eyes approvals, readback, and audit verification. Added roadmap, issue forms, and repeatable-install documentation.
+
+### 简体中文
+
+- **SQLite 写入可靠性**：将独立维护写入与读写事务串行化，避免服务端认证和目录变更并发时出现 `SQLITE_BUSY_SNAPSHOT` / `database is locked (517)`。
+- **稳定版发布硬门禁**：本地稳定版打包现在要求同一提交的 Linux、macOS、Windows 与 Linux 服务端烟雾 CI 作业全部通过；仅限预发布版本的 `--skip-ci-check` 仍支持离线打包。
+- **真实服务端验收**：新增隔离 Compose 验收链路，覆盖 PostgreSQL 控制面、Redis 事件与结果通道、RS256/PKCE OIDC、CLI 设备确认、四眼审批、数据回读和审计验证；同时补充路线图、问题表单与可重复安装文档。
+
 ## v0.5.0
 
 ### English
