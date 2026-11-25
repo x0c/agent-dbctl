@@ -70,7 +70,6 @@ jobs:
         run: go build -trimpath -o dist/agent-dbctl ./cmd/agent-dbctl
 
   server-smoke:
-    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
