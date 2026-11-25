@@ -32,6 +32,8 @@ AGENT_DBCTL_TEST_RO_PASS='<ro-password>' \
 go test -v ./internal/daemon -run TestLiveMultiDatabaseEngines
 ```
 
+Without a validly licensed KingbaseES test instance, KingbaseES wire behavior (including default `TLSMode` SSL fallback) is verified offline via mock PostgreSQL wire-protocol tests in `internal/driver/builtin` and default-parameter daemon/CLI probes.
+
 > **macOS install note**: `make install-local` stages a temporary file and atomically replaces `~/.local/bin/agent-dbctl` (`mv -f`) to avoid in-place Mach-O signature invalidation (`SIGKILL` / exit 137) on Apple Silicon macOS.
 
 ## Local Release Packaging
