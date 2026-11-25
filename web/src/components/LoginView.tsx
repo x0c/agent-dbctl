@@ -106,7 +106,7 @@ export function LoginView({
           </h1>
         </div>
 
-        <Panel flush className="mb-0">
+        <Panel flush>
           <div className="p-6 space-y-4">
             {error && <Notice tone="error">{error}</Notice>}
 
@@ -178,7 +178,7 @@ export function LoginView({
           </div>
         </Panel>
 
-        <div className="flex items-center justify-center">
+        <div className="mt-2 flex items-center justify-center">
           <button
             type="button"
             onClick={() => setLocale(locale === 'zh' ? 'en' : 'zh')}
