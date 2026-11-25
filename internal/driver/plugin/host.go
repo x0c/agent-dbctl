@@ -2,8 +2,13 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,6 +19,8 @@ import (
 	"github.com/x0c/agent-dbctl/internal/types"
 )
 
+var errStopStream = errors.New("stop stream")
+
 // Manager discovers, verifies, and hosts external gRPC driver plugin subprocesses.
 type Manager struct {
 	pluginsDir string
@@ -22,6 +29,7 @@ type Manager struct {
 	mu         sync.Mutex
 	discovered []DiscoveredPlugin
 	clients    map[string]*hostedPlugin
+	startLocks map[string]*sync.Mutex
 }
 
 type hostedPlugin struct {
@@ -36,6 +44,7 @@ func NewManager(pluginsDir string, registry *driver.Registry) *Manager {
 		pluginsDir: pluginsDir,
 		registry:   registry,
 		clients:    make(map[string]*hostedPlugin),
+		startLocks: make(map[string]*sync.Mutex),
 	}
 }
 
@@ -81,20 +90,43 @@ func (m *Manager) Shutdown() {
 	m.clients = make(map[string]*hostedPlugin)
 }
 
-func (m *Manager) getOrStart(info DiscoveredPlugin) (Service, error) {
+func (m *Manager) lockForPlugin(id string) *sync.Mutex {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	lk, ok := m.startLocks[id]
+	if !ok {
+		lk = &sync.Mutex{}
+		m.startLocks[id] = lk
+	}
+	return lk
+}
 
+func (m *Manager) getOrStart(info DiscoveredPlugin) (Service, error) {
+	m.mu.Lock()
 	if hp, ok := m.clients[info.Manifest.ID]; ok && !hp.client.Exited() {
+		m.mu.Unlock()
+		return hp.svc, nil
+	}
+	m.mu.Unlock()
+
+	// Serialize startup per plugin ID without blocking other plugins or ListDiscovered.
+	startMu := m.lockForPlugin(info.Manifest.ID)
+	startMu.Lock()
+	defer startMu.Unlock()
+
+	m.mu.Lock()
+	if hp, ok := m.clients[info.Manifest.ID]; ok && !hp.client.Exited() {
+		m.mu.Unlock()
 		return hp.svc, nil
 	}
 	if old, ok := m.clients[info.Manifest.ID]; ok {
 		old.client.Kill()
 		delete(m.clients, info.Manifest.ID)
 	}
+	m.mu.Unlock()
 
 	// Re-verify SHA-256 right before spawning to prevent TOCTOU tampering.
-	rechecked := verifyOnePlugin(info.Dir, info.Dir+"/manifest.json")
+	rechecked := verifyOnePlugin(info.Dir, filepath.Join(info.Dir, "manifest.json"))
 	if !rechecked.Verified {
 		return nil, fmt.Errorf("plugin %s verification failed: %s", info.Manifest.ID, rechecked.VerificationErr)
 	}
@@ -122,7 +154,10 @@ func (m *Manager) getOrStart(info DiscoveredPlugin) (Service, error) {
 		client.Kill()
 		return nil, fmt.Errorf("plugin %s returned unexpected RPC type", info.Manifest.ID)
 	}
+
+	m.mu.Lock()
 	m.clients[info.Manifest.ID] = &hostedPlugin{info: rechecked, client: client, svc: svc}
+	m.mu.Unlock()
 	return svc, nil
 }
 
@@ -154,7 +189,7 @@ func (p *pluginDriverAdapter) Classify(ctx context.Context, raw string) (types.C
 	return svc.Classify(ctx, raw)
 }
 
-func (p *pluginDriverAdapter) Open(_ context.Context, cfg driver.ConnectionConfig) (driver.Conn, error) {
+func (p *pluginDriverAdapter) Open(ctx context.Context, cfg driver.ConnectionConfig) (driver.Conn, error) {
 	svc, err := p.manager.getOrStart(p.info)
 	if err != nil {
 		return nil, err
@@ -167,9 +202,92 @@ func (p *pluginDriverAdapter) Open(_ context.Context, cfg driver.ConnectionConfi
 		Username:     cfg.Credential.Username,
 		Password:     cfg.Credential.Secret,
 		ReadOnly:     cfg.ReadOnly,
+		TLSMode:      cfg.TLSMode,
 		Params:       cfg.Params,
 	}
-	return &pluginConn{svc: svc, spec: spec, closeHook: cfg.CloseHook}, nil
+
+	var bridgeClose func() error
+	if cfg.NeedsDialBridge && cfg.DialContext != nil && cfg.Host != "" && cfg.Port > 0 {
+		targetAddr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+		host, port, closeBridge, err := startDialBridge(ctx, cfg.DialContext, targetAddr)
+		if err != nil {
+			return nil, fmt.Errorf("start plugin dial bridge: %w", err)
+		}
+		spec.Host = host
+		spec.Port = port
+		bridgeClose = closeBridge
+	}
+
+	combinedClose := driver.CloseOnce(func() error {
+		var firstErr error
+		if bridgeClose != nil {
+			firstErr = bridgeClose()
+		}
+		if cfg.CloseHook != nil {
+			if err := cfg.CloseHook(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return firstErr
+	})
+
+	return &pluginConn{svc: svc, spec: spec, closeHook: combinedClose}, nil
+}
+
+func startDialBridge(parentCtx context.Context, dialFn func(context.Context, string, string) (net.Conn, error), targetAddr string) (string, int, func() error, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", 0, nil, err
+	}
+	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		_ = ln.Close()
+		return "", 0, nil, fmt.Errorf("unexpected listener address type %T", ln.Addr())
+	}
+
+	bridgeCtx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer cancel()
+		for {
+			localConn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(lc net.Conn) {
+				defer func() { _ = lc.Close() }()
+				dialCtx, dialCancel := context.WithTimeout(bridgeCtx, 15*time.Second)
+				if dl, ok := parentCtx.Deadline(); ok && time.Until(dl) < 15*time.Second && time.Until(dl) > 0 {
+					dialCtx, dialCancel = context.WithDeadline(bridgeCtx, dl)
+				}
+				remoteConn, err := dialFn(dialCtx, "tcp", targetAddr)
+				dialCancel()
+				if err != nil {
+					return
+				}
+				defer func() { _ = remoteConn.Close() }()
+
+				done := make(chan struct{}, 2)
+				go func() {
+					_, _ = io.Copy(remoteConn, lc)
+					done <- struct{}{}
+				}()
+				go func() {
+					_, _ = io.Copy(lc, remoteConn)
+					done <- struct{}{}
+				}()
+				select {
+				case <-done:
+				case <-bridgeCtx.Done():
+				}
+			}(localConn)
+		}
+	}()
+
+	closeFn := func() error {
+		cancel()
+		return ln.Close()
+	}
+	return "127.0.0.1", tcpAddr.Port, closeFn, nil
 }
 
 type pluginConn struct {
@@ -195,6 +313,10 @@ func (c *pluginConn) Execute(ctx context.Context, raw string, opts driver.ExecOp
 	res := &types.ExecResult{Family: types.FamilySQL}
 	buf := driver.RowBuffer{MaxRows: opts.MaxRows, MaxBytes: opts.MaxBytes}
 
+	var pluginFetched int
+	var pluginTruncated bool
+	var pluginCutoff string
+
 	err := c.svc.ExecuteStream(ctx, c.spec, raw, opts.MaxRows, opts.MaxBytes, func(chunk ExecuteChunk) error {
 		if chunk.Error != "" {
 			return fmt.Errorf("%s", chunk.Error)
@@ -208,11 +330,15 @@ func (c *pluginConn) Execute(ctx context.Context, raw string, opts driver.ExecOp
 		for _, row := range chunk.Rows {
 			if buf.TryAcceptRow(row) {
 				res.Rows = append(res.Rows, row)
+			} else if buf.Truncated {
+				return errStopStream
 			}
 		}
 		for _, doc := range chunk.Documents {
 			if buf.TryAcceptRow(doc) {
 				res.Documents = append(res.Documents, doc)
+			} else if buf.Truncated {
+				return errStopStream
 			}
 		}
 		if chunk.KVResult != nil {
@@ -224,22 +350,38 @@ func (c *pluginConn) Execute(ctx context.Context, raw string, opts driver.ExecOp
 		if chunk.AffectedRows != nil {
 			res.AffectedRows = chunk.AffectedRows
 		}
+		if chunk.FetchedRows > pluginFetched {
+			pluginFetched = chunk.FetchedRows
+		}
+		if chunk.Truncated {
+			pluginTruncated = true
+			if chunk.CutoffReason != "" {
+				pluginCutoff = chunk.CutoffReason
+			}
+		}
 		if len(chunk.Messages) > 0 {
 			res.Messages = append(res.Messages, chunk.Messages...)
 		}
 		return nil
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, errStopStream) {
 		return nil, err
 	}
 	res.FetchedRows = buf.FetchedRows
+	if pluginFetched > res.FetchedRows {
+		res.FetchedRows = pluginFetched
+	}
 	res.ReturnedRows = len(res.Rows) + len(res.Documents)
 	if res.Family == types.FamilyKV && res.KVResult != nil && res.ReturnedRows == 0 {
 		res.ReturnedRows = 1
 	}
 	res.ReturnedBytes = buf.ReturnedBytes
-	res.Truncated = buf.Truncated
-	res.CutoffReason = buf.CutoffReason
+	res.Truncated = buf.Truncated || pluginTruncated
+	if buf.Truncated {
+		res.CutoffReason = buf.CutoffReason
+	} else if pluginTruncated {
+		res.CutoffReason = pluginCutoff
+	}
 	res.LatencyMs = time.Since(start).Milliseconds()
 	return res, nil
 }

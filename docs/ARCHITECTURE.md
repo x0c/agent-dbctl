@@ -69,8 +69,8 @@ Enterprise environments involve multiple business systems, shared jump hosts, pr
 
 ### Driver Tiers (Zero JVM)
 
-- **Tier 1 (Built-in Pure Go, `CGO_ENABLED=0`)**: PostgreSQL (`pgx/v5`), MySQL (`go-sql-driver/mysql`), SQLite (`modernc.org/sqlite`), MongoDB (`mongo-go-driver/v2`), Redis (`go-redis/v9`).
-- **Tier 3 (External gRPC Subprocess Plugins)**: Loaded via `hashicorp/go-plugin` over gRPC from `<config_home>/plugins/<id>/manifest.json`. Verified against `host_api_version` and binary SHA-256 before execution. Crashes are isolated to the subprocess.
+- **Tier 1 (Built-in Pure Go, `CGO_ENABLED=0`)**: PostgreSQL (`pgx/v5`), MySQL / MariaDB / TiDB (`go-sql-driver/mysql` via per-connection `mysql.NewConnector`), SQLite (`modernc.org/sqlite`), MongoDB (`mongo-go-driver/v2`), Redis / Valkey (`go-redis/v9`). Drivers adapt across server versions and restricted privilege tiers (e.g., `EXPLAIN` JSON/tree/tabular fallbacks, `transaction_read_only`/`tx_read_only`, `hello`/`isMaster`/`buildInfo` probes, RESP2/RESP3 normalization, and PgBouncer `exec_mode=simple_protocol`).
+- **Tier 3 (External gRPC Subprocess Plugins)**: Loaded via `hashicorp/go-plugin` over gRPC from `<config_home>/plugins/<id>/manifest.json`. Verified against `host_api_version` and binary SHA-256 before execution. Crashes are isolated to the subprocess; daemon-managed network tunnels (`ssh_tunnel`, `socks5`, `http_proxy`) are bridged over an ephemeral authenticated loopback forwarder when `DialContext` is active.
 
 ### Risk Classification & Preflight
 

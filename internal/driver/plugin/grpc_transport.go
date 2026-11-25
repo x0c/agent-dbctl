@@ -35,6 +35,7 @@ type TargetSpec struct {
 	Username     string            `json:"username"`
 	Password     string            `json:"password"`
 	ReadOnly     bool              `json:"read_only"`
+	TLSMode      string            `json:"tls_mode,omitempty"`
 	Params       map[string]string `json:"params,omitempty"`
 }
 
@@ -48,6 +49,9 @@ type ExecuteChunk struct {
 	KVResult      any            `json:"kv_result,omitempty"`
 	RawText       string         `json:"raw_text,omitempty"`
 	AffectedRows  *int64         `json:"affected_rows,omitempty"`
+	FetchedRows   int            `json:"fetched_rows,omitempty"`
+	Truncated     bool           `json:"truncated,omitempty"`
+	CutoffReason  string         `json:"cutoff_reason,omitempty"`
 	Messages      []string       `json:"messages,omitempty"`
 	LatencyMs     int64          `json:"latency_ms,omitempty"`
 	Error         string         `json:"error,omitempty"`
@@ -324,7 +328,9 @@ func (c *grpcClient) Preflight(ctx context.Context, spec TargetSpec, raw string)
 }
 
 func (c *grpcClient) ExecuteStream(ctx context.Context, spec TargetSpec, raw string, maxRows int, maxBytes int64, onChunk func(ExecuteChunk) error) error {
-	stream, err := c.cc.NewStream(ctx, &driverServiceDesc.Streams[0], "/"+serviceName+"/Execute")
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	stream, err := c.cc.NewStream(streamCtx, &driverServiceDesc.Streams[0], "/"+serviceName+"/Execute")
 	if err != nil {
 		return err
 	}

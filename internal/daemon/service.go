@@ -321,22 +321,28 @@ func (s *Service) openDriverConn(ctx context.Context, detail types.TargetDetail,
 		}
 	}
 
-	dialRes, err := netdial.Build(detail.NetworkProfile, bastionCred, inst.TLSMode, inst.Host)
+	dialRes, err := netdial.BuildContext(ctx, detail.NetworkProfile, bastionCred, inst.TLSMode, inst.Host)
 	if err != nil {
 		return nil, err
 	}
 
+	needsBridge := detail.NetworkProfile != nil &&
+		detail.NetworkProfile.Mode != "" &&
+		detail.NetworkProfile.Mode != types.NetworkDirect
+
 	conn, err := drv.Open(ctx, driver.ConnectionConfig{
-		Engine:       inst.Engine,
-		Host:         inst.Host,
-		Port:         inst.Port,
-		DatabaseName: detail.Target.DatabaseName,
-		Params:       inst.Params,
-		ReadOnly:     readOnly,
-		Credential:   resolvedCred,
-		DialContext:  dialRes.DialContext,
-		TLSConfig:    dialRes.TLSConfig,
-		CloseHook:    dialRes.Close,
+		Engine:          inst.Engine,
+		Host:            inst.Host,
+		Port:            inst.Port,
+		DatabaseName:    detail.Target.DatabaseName,
+		Params:          inst.Params,
+		ReadOnly:        readOnly,
+		Credential:      resolvedCred,
+		DialContext:     dialRes.DialContext,
+		NeedsDialBridge: needsBridge,
+		TLSMode:         dialRes.TLSMode,
+		TLSConfig:       dialRes.TLSConfig,
+		CloseHook:       driver.CloseOnce(dialRes.Close),
 	})
 	if err != nil {
 		_ = dialRes.Close()

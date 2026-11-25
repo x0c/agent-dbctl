@@ -21,10 +21,27 @@ type ConnectionConfig struct {
 	DatabaseName string
 	Params       map[string]string
 	ReadOnly     bool
-	Credential   secrets.ResolvedSecret
-	DialContext  func(ctx context.Context, network, addr string) (net.Conn, error)
-	TLSConfig    *tls.Config
-	CloseHook    func() error
+	Credential      secrets.ResolvedSecret
+	DialContext     func(ctx context.Context, network, addr string) (net.Conn, error)
+	NeedsDialBridge bool
+	TLSMode         string
+	TLSConfig       *tls.Config
+	CloseHook       func() error
+}
+
+// CloseOnce wraps fn so repeated Close/CancelAndDiscard calls invoke it at most once.
+func CloseOnce(fn func() error) func() error {
+	if fn == nil {
+		return nil
+	}
+	var once sync.Once
+	var closeErr error
+	return func() error {
+		once.Do(func() {
+			closeErr = fn()
+		})
+		return closeErr
+	}
 }
 
 // PreflightOpts governs non-mutating execution-plan checks.
@@ -116,33 +133,45 @@ type RowBuffer struct {
 	MaxRows  int
 	MaxBytes int64
 
-	FetchedRows  int
+	FetchedRows   int
+	LookaheadRows int
 	ReturnedBytes int64
-	Truncated    bool
-	CutoffReason string
+	Truncated     bool
+	CutoffReason  string
 }
 
 // TryAcceptRow checks whether adding one whole row fits within MaxRows and MaxBytes.
 func (b *RowBuffer) TryAcceptRow(row any) bool {
 	b.FetchedRows++
 	if b.Truncated {
+		b.LookaheadRows++
 		return false
 	}
 	if b.MaxRows > 0 && b.FetchedRows > b.MaxRows {
 		b.Truncated = true
 		b.CutoffReason = "max_rows"
+		b.LookaheadRows++
 		return false
 	}
-	encoded, _ := json.Marshal(row)
+	encoded, err := json.Marshal(row)
+	if err != nil {
+		encoded = []byte(fmt.Sprint(row))
+	}
 	size := int64(len(encoded))
 	// Always allow at least 1 row if FetchedRows == 1 unless caller budget is 0, or check byte limit strictly after 1st row.
 	if b.MaxBytes > 0 && b.ReturnedBytes+size > b.MaxBytes && b.FetchedRows > 1 {
 		b.Truncated = true
 		b.CutoffReason = "max_bytes"
+		b.LookaheadRows++
 		return false
 	}
 	b.ReturnedBytes += size
 	return true
+}
+
+// ShouldStopLookahead returns true once bounded post-truncation row counting has been reached.
+func (b *RowBuffer) ShouldStopLookahead() bool {
+	return b.Truncated && b.LookaheadRows >= 1000
 }
 
 // ExecuteWithCancelGuard runs fn with ctx cancellation watching; on ctx cancel/timeout it invokes
@@ -160,6 +189,9 @@ func ExecuteWithCancelGuard[T any](ctx context.Context, conn Conn, fn func(conte
 
 	select {
 	case res := <-ch:
+		if ctx.Err() != nil {
+			_ = conn.CancelAndDiscard()
+		}
 		return res.val, res.err
 	case <-ctx.Done():
 		_ = conn.CancelAndDiscard()

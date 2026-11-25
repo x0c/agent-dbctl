@@ -120,6 +120,9 @@ func (s *sqliteExtService) ExecuteStream(ctx context.Context, spec drvplugin.Tar
 		Kind:         "summary",
 		Family:       string(res.Family),
 		AffectedRows: res.AffectedRows,
+		FetchedRows:  res.FetchedRows,
+		Truncated:    res.Truncated,
+		CutoffReason: res.CutoffReason,
 		Messages:     res.Messages,
 		LatencyMs:    time.Since(start).Milliseconds(),
 	})

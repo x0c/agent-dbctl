@@ -46,7 +46,8 @@ Defined in [proto/driver/v1/driver.proto](proto/driver/v1/driver.proto):
 - `ListDatabases(TargetSpec) -> DatabaseList`: Enumerates logical databases/schemas on an instance.
 - `Classify(ClassifyRequest) -> Classification`: Classifies raw query/command (`safe_read`, `high_cost_read`, `write`, `ddl`, `admin`, `unknown`) and risk flags.
 - `Preflight(PreflightRequest) -> PreflightReport`: Runs non-mutating execution-plan inspection (`EXPLAIN` without `ANALYZE`).
-- `Execute(ExecuteRequest) -> stream ExecuteChunk`: Streams columns, row/document batches, `affected_rows`, server messages, and final summary so large result sets can be capped cleanly at `max_rows` / `max_bytes` without OOM.
+- `Execute(ExecuteRequest) -> stream ExecuteChunk`: Streams columns, row/document batches, `affected_rows`, server messages, and final summary (`fetched_rows`, `truncated`, `cutoff_reason`, `latency_ms`) so large result sets can be capped cleanly at `max_rows` / `max_bytes` without OOM or lost truncation status.
+- **Network Tunnel & TLS Forwarding**: `TargetSpec` carries `tls_mode`, and when the host configures a bastion/proxy `DialContext`, the host opens an ephemeral per-connection `127.0.0.1` TCP forwarder and rewrites `TargetSpec.Host`/`Port` to the local listener so plugins work transparently across SSH tunnels and proxies without embedding proxy/SSH logic.
 
 ---
 

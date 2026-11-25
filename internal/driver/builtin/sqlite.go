@@ -3,10 +3,16 @@ package builtin
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
+	"net/url"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 
@@ -34,7 +40,7 @@ func (d *SQLiteDriver) Metadata() types.DriverMetadata {
 		DisplayName:  "SQLite",
 		Family:       types.FamilySQL,
 		Tier:         "builtin",
-		Version:      "1.0.0",
+		Version:      "1.1.0",
 		Capabilities: []string{"ping", "list_databases", "preflight", "execute"},
 		Verified:     true,
 		Labels:       map[string]string{"en": "SQLite", "zh": "SQLite"},
@@ -46,32 +52,100 @@ func (d *SQLiteDriver) Classify(_ context.Context, raw string) (types.Classifica
 }
 
 func (d *SQLiteDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (driver.Conn, error) {
-	path := cfg.DatabaseName
-	if path == "" {
-		path = cfg.Host
-	}
-	if path == "" {
-		return nil, fmt.Errorf("sqlite requires database_name or host file path")
-	}
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)", path)
-	if cfg.ReadOnly && path != ":memory:" {
-		dsn += "&_pragma=query_only(1)"
+	dsn, err := buildSQLiteDSN(cfg)
+	if err != nil {
+		return nil, err
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	return &sqliteConn{db: db, cfg: cfg}, nil
+	return &sqliteConn{
+		db:        db,
+		cfg:       cfg,
+		closeHook: driver.CloseOnce(cfg.CloseHook),
+	}, nil
+}
+
+func buildSQLiteDSN(cfg driver.ConnectionConfig) (string, error) {
+	path := strings.TrimSpace(cfg.DatabaseName)
+	if path == "" {
+		path = strings.TrimSpace(cfg.Host)
+	}
+	if path == "" {
+		return "", fmt.Errorf("sqlite requires database_name or host file path")
+	}
+	if path != ":memory:" && !strings.HasPrefix(path, "file:") {
+		path = config.ExpandHomePath(path)
+	}
+
+	q := url.Values{}
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "foreign_keys(1)")
+	if cfg.ReadOnly && path != ":memory:" {
+		// VFS mode=ro prevents accidentally creating empty files on read-only probes.
+		q.Set("mode", "ro")
+		q.Add("_pragma", "query_only(1)")
+	}
+	for k, v := range cfg.Params {
+		key := strings.ToLower(strings.TrimSpace(k))
+		val := strings.TrimSpace(v)
+		switch key {
+		case "journal_mode", "synchronous", "cache_size", "temp_store", "busy_timeout":
+			if val != "" && !strings.ContainsAny(val, ";\r\n") {
+				q.Add("_pragma", fmt.Sprintf("%s(%s)", key, val))
+			}
+		case "mode":
+			if !cfg.ReadOnly && val != "" {
+				q.Set("mode", val)
+			}
+		case "cache":
+			if val != "" {
+				q.Set("cache", val)
+			}
+		}
+	}
+
+	if path == ":memory:" {
+		return "file::memory:?" + q.Encode(), nil
+	}
+	// If already a file: URI, preserve its path/authority cleanly.
+	if strings.HasPrefix(path, "file:") {
+		if u, err := url.Parse(path); err == nil {
+			existing := u.Query()
+			for k, vals := range q {
+				if k == "_pragma" {
+					for _, val := range vals {
+						existing.Add(k, val)
+					}
+				} else if !existing.Has(k) {
+					existing.Set(k, vals[0])
+				}
+			}
+			u.RawQuery = existing.Encode()
+			return u.String(), nil
+		}
+	}
+	u := url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(path),
+		RawQuery: q.Encode(),
+	}
+	return u.String(), nil
 }
 
 type sqliteConn struct {
-	db  *sql.DB
-	cfg driver.ConnectionConfig
+	db        *sql.DB
+	cfg       driver.ConnectionConfig
+	closeHook func() error
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (c *sqliteConn) Ping(ctx context.Context) (types.PingResult, error) {
@@ -136,13 +210,20 @@ func (c *sqliteConn) Preflight(ctx context.Context, raw string, _ driver.Preflig
 		lines = append(lines, detail)
 		rawPlan = append(rawPlan, map[string]any{"id": id, "parent": parent, "detail": detail})
 		upper := strings.ToUpper(detail)
-		if strings.HasPrefix(upper, "SCAN ") && !strings.Contains(upper, "USING COVERING INDEX") && !strings.Contains(upper, "USING INDEX") {
+		if strings.HasPrefix(upper, "SCAN ") && !strings.Contains(upper, "USING COVERING INDEX") && !strings.Contains(upper, "USING INDEX") && !isSQLiteCatalogScan(upper) {
 			report.FullScan = true
 		}
 	}
 	report.PlanSummary = strings.Join(lines, "\n")
 	report.PlanRaw = rawPlan
 	return report, nil
+}
+
+func isSQLiteCatalogScan(upperDetail string) bool {
+	return strings.HasPrefix(upperDetail, "SCAN SQLITE_MASTER") ||
+		strings.HasPrefix(upperDetail, "SCAN SQLITE_SCHEMA") ||
+		strings.HasPrefix(upperDetail, "SCAN SQLITE_TEMP_MASTER") ||
+		strings.HasPrefix(upperDetail, "SCAN SQLITE_TEMP_SCHEMA")
 }
 
 func (c *sqliteConn) Execute(ctx context.Context, raw string, opts driver.ExecOpts) (*types.ExecResult, error) {
@@ -180,14 +261,17 @@ func (c *sqliteConn) Execute(ctx context.Context, raw string, opts driver.ExecOp
 }
 
 func (c *sqliteConn) CancelAndDiscard() error {
-	return c.db.Close()
+	return c.Close()
 }
 
 func (c *sqliteConn) Close() error {
-	if c.cfg.CloseHook != nil {
-		_ = c.cfg.CloseHook()
-	}
-	return c.db.Close()
+	c.closeOnce.Do(func() {
+		if c.closeHook != nil {
+			_ = c.closeHook()
+		}
+		c.closeErr = c.db.Close()
+	})
+	return c.closeErr
 }
 
 func collectSQLRows(rows *sql.Rows, opts driver.ExecOpts) (*types.ExecResult, error) {
@@ -216,15 +300,12 @@ func collectSQLRows(rows *sql.Rows, opts driver.ExecOpts) (*types.ExecResult, er
 		}
 		norm := make([]any, len(cols))
 		for i, v := range scanDest {
-			norm[i] = normalizeSQLValue(v)
+			norm[i] = normalizeTypedSQLValue(v, cols[i].TypeName)
 		}
 		if buf.TryAcceptRow(norm) {
 			outRows = append(outRows, norm)
-		} else if buf.Truncated {
-			// Continue counting remaining rows? Stop early after a bounded lookahead to avoid scanning millions of rows.
-			if buf.FetchedRows >= opts.MaxRows+1000 {
-				break
-			}
+		} else if buf.ShouldStopLookahead() {
+			break
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -242,18 +323,53 @@ func collectSQLRows(rows *sql.Rows, opts driver.ExecOpts) (*types.ExecResult, er
 	}, nil
 }
 
-func normalizeSQLValue(v any) any {
+func normalizeTypedSQLValue(v any, typeName string) any {
 	switch x := v.(type) {
 	case nil:
 		return nil
 	case []byte:
-		var js any
-		if len(x) > 0 && (x[0] == '{' || x[0] == '[') && json.Unmarshal(x, &js) == nil {
-			return js
+		upperType := strings.ToUpper(typeName)
+		isBinaryCol := strings.Contains(upperType, "BLOB") ||
+			strings.Contains(upperType, "BYTEA") ||
+			strings.Contains(upperType, "BINARY")
+		if isBinaryCol && !utf8.Valid(x) {
+			return base64.StdEncoding.EncodeToString(x)
+		}
+		if !isBinaryCol || strings.Contains(upperType, "JSON") {
+			var js any
+			if len(x) > 0 && (x[0] == '{' || x[0] == '[') && json.Unmarshal(x, &js) == nil {
+				return js
+			}
+		}
+		if !utf8.Valid(x) {
+			return base64.StdEncoding.EncodeToString(x)
 		}
 		return string(x)
 	case time.Time:
 		return x.UTC().Format(time.RFC3339Nano)
+	case float64:
+		if math.IsNaN(x) {
+			return "NaN"
+		}
+		if math.IsInf(x, 1) {
+			return "Infinity"
+		}
+		if math.IsInf(x, -1) {
+			return "-Infinity"
+		}
+		return x
+	case float32:
+		f := float64(x)
+		if math.IsNaN(f) {
+			return "NaN"
+		}
+		if math.IsInf(f, 1) {
+			return "Infinity"
+		}
+		if math.IsInf(f, -1) {
+			return "-Infinity"
+		}
+		return x
 	default:
 		return x
 	}
