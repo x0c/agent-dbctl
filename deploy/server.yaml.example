@@ -1,0 +1,59 @@
+# Central C/S server configuration for `agent-dbctl serve`.
+# Copy to `server.yaml` and customize for your environment, or mount directly
+# via Compose (default mounts this file and injects secrets from `.env`).
+
+mode: server
+listen_addr: 0.0.0.0:8080
+
+# Public origin seen by browsers and CLI clients.
+# Non-loopback URLs must use https:// (overridden by AGENT_DBCTL_PUBLIC_URL).
+public_url: http://127.0.0.1:8080
+
+# Additional Host headers allowed when routing behind reverse proxies or overlays.
+allowed_hosts:
+  - 127.0.0.1:8080
+  - localhost:8080
+
+# Trust X-Forwarded-Proto / X-Forwarded-For / X-Forwarded-Host from loopback
+# reverse proxies by default (add proxy subnet CIDRs here when needed).
+trust_proxy_headers: true
+trusted_proxy_cidrs: []
+
+allow_sqlite_targets: false
+disable_ssh_auth_sock: true
+replicas: 1
+
+storage:
+  driver: postgres
+  dsn_env: AGENT_DBCTL_STORE_DSN
+
+pubsub:
+  driver: redis
+
+result_slot:
+  driver: redis
+  redis_url_env: AGENT_DBCTL_REDIS_URL
+
+secrets:
+  driver: encrypted_db
+  master_key_env: AGENT_DBCTL_MASTER_KEY
+  allow_exec_provider_for_admin: false
+
+auth:
+  local_login_enabled: true
+  # Used on first startup when no users exist yet if password env is non-empty.
+  bootstrap_admin_email: admin@example.com
+  bootstrap_admin_password_env: AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD
+  session_ttl_hours: 24
+  forbid_self_approval: true
+  oidc:
+    enabled: false
+    issuer_url: ""
+    client_id: ""
+    client_secret_env: AGENT_DBCTL_OIDC_SECRET
+    device_flow_enabled: true
+    admin_groups: []
+    scopes:
+      - openid
+      - profile
+      - email

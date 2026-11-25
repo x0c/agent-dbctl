@@ -1,0 +1,17 @@
+/.git
+/.gitignore
+/.leakignore
+/.env
+/.env.*
+!/.env.example
+/.corral-pastes
+/dist
+/agent-dbctl
+/agent-dbctl-*
+/web/node_modules
+/internal/webui/dist
+!/internal/webui/dist/.gitkeep
+**/*.db
+**/*.db-*
+**/*.log
+**/.DS_Store

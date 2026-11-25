@@ -85,6 +85,32 @@ make install-local
   <img src="docs/images/audit.png" alt="agent-dbctl 审计日志与哈希链校验" width="49%" />
 </p>
 
+## 团队服务端部署（Docker Compose）
+
+如需企业内集中管控（PostgreSQL 持久化与 AES-GCM 加密凭据托管、Redis 查询结果缓存/事件广播、多角色权限与远程 Web 审批）：
+
+```sh
+cp .env.example .env
+# 编辑 .env：填入 POSTGRES_PASSWORD、AGENT_DBCTL_MASTER_KEY（`openssl rand -hex 32`）
+# 以及首次初始化使用的 AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD
+docker compose up -d --build
+```
+
+如需通过 Caddy 自动签发 HTTPS 证书（例如 `https://dbctl.example.com`）：
+
+```sh
+# 在 .env 中设置 SITE_HOST=dbctl.example.com 与 AGENT_DBCTL_PUBLIC_URL=https://dbctl.example.com，
+# 并在自定义 server.yaml（通过 AGENT_DBCTL_CONFIG_FILE 指定）中放行该域名后启动：
+docker compose --profile tls up -d --build
+```
+
+开发机 CLI 接入远端服务端：
+
+```sh
+agent-dbctl context add prod https://dbctl.example.com --use
+agent-dbctl login --token-stdin
+```
+
 ## 核心特性
 
 | 能力 | 行为说明 |

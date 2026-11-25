@@ -85,6 +85,32 @@ make install-local
   <img src="docs/images/audit.png" alt="agent-dbctl Audit Logs and Hash Chain verification" width="49%" />
 </p>
 
+## Team Server Deployment (Docker Compose)
+
+For central enterprise management (PostgreSQL metadata + AES-GCM encrypted secrets, Redis query relay/pubsub, RBAC users, and remote Web approvals):
+
+```sh
+cp .env.example .env
+# Edit .env: set POSTGRES_PASSWORD, AGENT_DBCTL_MASTER_KEY (`openssl rand -hex 32`),
+# and optionally AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD.
+docker compose up -d --build
+```
+
+For HTTPS termination with Caddy (`https://dbctl.example.com`):
+
+```sh
+# In .env, set SITE_HOST=dbctl.example.com, AGENT_DBCTL_PUBLIC_URL=https://dbctl.example.com,
+# and add your domain to allowed_hosts in a copied config referenced by AGENT_DBCTL_CONFIG_FILE.
+docker compose --profile tls up -d --build
+```
+
+Connect your workstation CLI to the remote server:
+
+```sh
+agent-dbctl context add prod https://dbctl.example.com --use
+agent-dbctl login --token-stdin
+```
+
 ## Why agent-dbctl?
 
 | Capability | Behavior |

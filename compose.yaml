@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-agentdbctl}
+      POSTGRES_USER: ${POSTGRES_USER:-agentdbctl}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-agentdbctl} -d $${POSTGRES_DB:-agentdbctl}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  agent-dbctl:
+    build:
+      context: .
+      args:
+        VERSION: ${AGENT_DBCTL_VERSION:-dev}
+        COMMIT: ${AGENT_DBCTL_COMMIT:-docker}
+    image: agent-dbctl:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${AGENT_DBCTL_BIND_ADDR:-127.0.0.1:8080}:8080"
+    volumes:
+      - "${AGENT_DBCTL_CONFIG_FILE:-./deploy/server.yaml.example}:/etc/agent-dbctl/server.yaml:ro"
+      - app_data:/var/lib/agent-dbctl
+    environment:
+      AGENT_DBCTL_SERVER_CONFIG: /etc/agent-dbctl/server.yaml
+      AGENT_DBCTL_LISTEN_ADDR: ${AGENT_DBCTL_LISTEN_ADDR:-0.0.0.0:8080}
+      AGENT_DBCTL_PUBLIC_URL: ${AGENT_DBCTL_PUBLIC_URL:-http://127.0.0.1:8080}
+      AGENT_DBCTL_STORE_DSN: "postgres://${POSTGRES_USER:-agentdbctl}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-agentdbctl}?sslmode=disable"
+      AGENT_DBCTL_REDIS_URL: "redis://redis:6379/0"
+      AGENT_DBCTL_MASTER_KEY: ${AGENT_DBCTL_MASTER_KEY:?set AGENT_DBCTL_MASTER_KEY in .env}
+      AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD: ${AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD:-}
+      AGENT_DBCTL_OIDC_SECRET: ${AGENT_DBCTL_OIDC_SECRET:-}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["tls"]
+    restart: unless-stopped
+    depends_on:
+      agent-dbctl:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_HOST: ${SITE_HOST:-localhost}
+    volumes:
+      - ./deploy/Caddyfile.example:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  pg_data:
+  redis_data:
+  app_data:
+  caddy_data:
+  caddy_config:

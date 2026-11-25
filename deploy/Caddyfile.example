@@ -1,0 +1,8 @@
+# Optional HTTPS reverse proxy for `compose.yaml --profile tls`.
+# Set SITE_HOST in `.env` (for example: dbctl.example.com) and point
+# AGENT_DBCTL_PUBLIC_URL=https://dbctl.example.com before starting.
+
+{$SITE_HOST:localhost} {
+	encode gzip zstd
+	reverse_proxy agent-dbctl:8080
+}
