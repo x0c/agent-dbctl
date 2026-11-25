@@ -93,6 +93,7 @@ type ServerOIDCConfig struct {
 	ClientSecretEnv   string   `yaml:"client_secret_env" json:"client_secret_env"`
 	DeviceFlowEnabled bool     `yaml:"device_flow_enabled" json:"device_flow_enabled"`
 	AdminGroups       []string `yaml:"admin_groups" json:"admin_groups"`
+	AdminEmails       []string `yaml:"admin_emails" json:"admin_emails"`
 	Scopes            []string `yaml:"scopes" json:"scopes"`
 }
 

@@ -492,6 +492,16 @@ CREATE TABLE IF NOT EXISTS oidc_auth_states (
 	created_at_utc TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS cli_device_codes (
+	device_code_hash TEXT PRIMARY KEY,
+	user_code TEXT NOT NULL UNIQUE,
+	status TEXT NOT NULL DEFAULT 'pending',
+	user_id TEXT NOT NULL DEFAULT '',
+	expires_at_utc TEXT NOT NULL,
+	created_at_utc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cli_device_codes_user_code ON cli_device_codes(user_code);
+
 CREATE TABLE IF NOT EXISTS encrypted_secrets (
 	secret_key TEXT PRIMARY KEY,
 	key_version INTEGER NOT NULL DEFAULT 1,

@@ -718,6 +718,12 @@ export const api = {
     closeEventStream()
   },
 
+  decideDeviceLogin: (userCode: string, decision: 'approve' | 'reject') =>
+    request<{ user_code: string; status: string }>('/api/v1/auth/device/decide', {
+      method: 'POST',
+      body: JSON.stringify({ user_code: userCode, decision }),
+    }),
+
   subscribeEvents: (eventNames: string[], listener: () => void): (() => void) => {
     const attached = new Map<string, EventListener>()
     const es = ensureEventSource()

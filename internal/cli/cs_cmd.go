@@ -437,57 +437,114 @@ func newLoginCmd(ioCtx func() IOContext, version, commit string, exitCode *int) 
 					*exitCode = writeClientInitErr(ic, cErr)
 					return nil
 				}
-				var oidcInfo struct {
-					IssuerURL string   `json:"issuer_url"`
-					ClientID  string   `json:"client_id"`
-					Scopes    []string `json:"scopes"`
-				}
-				if err := unauthClient.DoJSON(cmd.Context(), http.MethodGet, "/rpc/v1/auth/oidc", nil, &oidcInfo); err != nil {
-					*exitCode = writeRPCErr(ic, err)
-					return nil
-				}
-				oidcCl := auth.NewOIDCClient(oidcInfo.IssuerURL, oidcInfo.ClientID, "", oidcInfo.Scopes)
-				dev, err := oidcCl.StartDeviceAuth(cmd.Context())
-				if err != nil {
-					*exitCode = ic.WriteError(types.ErrCodeAuthRequired, false, err.Error(), "Or authenticate non-interactively with `--token-stdin` / `--token-env`.", nil, nil, types.Meta{})
-					return nil
-				}
-				_, _ = fmt.Fprintf(ic.Stderr, "Open %s and enter code: %s\n", dev.VerificationURI, dev.UserCode)
-				if dev.VerificationURIComplete != "" && !ic.NoInput && os.Getenv(config.EnvNoBrowser) != "1" {
-					_ = approval.OpenBrowser(dev.VerificationURIComplete)
-				}
-				deadline := time.Now().Add(time.Duration(dev.ExpiresIn) * time.Second)
-				interval := time.Duration(dev.Interval) * time.Second
-				if interval <= 0 {
-					interval = 5 * time.Second
-				}
-				for time.Now().Before(deadline) {
-					select {
-					case <-cmd.Context().Done():
-						return nil
-					case <-time.After(interval):
+				var startResp types.DeviceCodeStartResponse
+				startErr := unauthClient.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/auth/device/start", map[string]any{}, &startResp)
+				if startErr == nil && startResp.DeviceCode != "" {
+					confirmURL := startResp.VerificationURIComplete
+					if confirmURL == "" {
+						confirmURL = startResp.VerificationURI
 					}
-					tr, pErr := oidcCl.PollDeviceToken(cmd.Context(), dev.DeviceCode)
-					if pErr != nil {
-						continue
+					if !ic.JSONMode {
+						_, _ = fmt.Fprintf(ic.Stderr, "Open %s and confirm code: %s\n", confirmURL, startResp.UserCode)
 					}
-					switch tr.Error {
-					case "":
-						tok = strings.TrimSpace(tr.IDToken)
-						if tok == "" {
-							tok = strings.TrimSpace(tr.AccessToken)
+					if confirmURL != "" && !ic.NoInput && os.Getenv(config.EnvNoBrowser) != "1" {
+						_ = approval.OpenBrowser(confirmURL)
+					}
+					expiresIn := startResp.ExpiresIn
+					if expiresIn <= 0 {
+						expiresIn = 600
+					}
+					interval := time.Duration(startResp.Interval) * time.Second
+					if interval <= 0 {
+						interval = 2 * time.Second
+					}
+					deadline := time.Now().Add(time.Duration(expiresIn) * time.Second)
+					for time.Now().Before(deadline) {
+						select {
+						case <-cmd.Context().Done():
+							return nil
+						case <-time.After(interval):
 						}
-					case "authorization_pending":
-						continue
-					case "slow_down":
-						interval += 5 * time.Second
-						continue
-					default:
-						*exitCode = ic.WriteError(types.ErrCodeAuthRequired, false, fmt.Sprintf("OIDC device login error: %s %s", tr.Error, tr.ErrorDesc), "", nil, nil, types.Meta{})
+						var pollResp types.DeviceCodePollResponse
+						if pErr := unauthClient.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/auth/device/poll", map[string]string{"device_code": startResp.DeviceCode}, &pollResp); pErr != nil {
+							continue
+						}
+						switch pollResp.Status {
+						case "approved":
+							tok = strings.TrimSpace(pollResp.AccessToken)
+						case "pending":
+							continue
+						case "slow_down":
+							interval += 5 * time.Second
+							continue
+						case "denied", "expired", "error":
+							msg := pollResp.ErrorDesc
+							if msg == "" {
+								msg = pollResp.Error
+							}
+							if msg == "" {
+								msg = "device login " + pollResp.Status
+							}
+							*exitCode = ic.WriteError(types.ErrCodeAuthRequired, false, msg, "", nil, nil, types.Meta{})
+							return nil
+						}
+						if tok != "" {
+							break
+						}
+					}
+				} else {
+					var oidcInfo struct {
+						IssuerURL string   `json:"issuer_url"`
+						ClientID  string   `json:"client_id"`
+						Scopes    []string `json:"scopes"`
+					}
+					if err := unauthClient.DoJSON(cmd.Context(), http.MethodGet, "/rpc/v1/auth/oidc", nil, &oidcInfo); err != nil {
+						*exitCode = writeRPCErr(ic, err)
 						return nil
 					}
-					if tok != "" {
-						break
+					oidcCl := auth.NewOIDCClient(oidcInfo.IssuerURL, oidcInfo.ClientID, "", oidcInfo.Scopes)
+					dev, err := oidcCl.StartDeviceAuth(cmd.Context())
+					if err != nil {
+						*exitCode = ic.WriteError(types.ErrCodeAuthRequired, false, err.Error(), "Or authenticate non-interactively with `--token-stdin` / `--token-env`.", nil, nil, types.Meta{})
+						return nil
+					}
+					_, _ = fmt.Fprintf(ic.Stderr, "Open %s and enter code: %s\n", dev.VerificationURI, dev.UserCode)
+					if dev.VerificationURIComplete != "" && !ic.NoInput && os.Getenv(config.EnvNoBrowser) != "1" {
+						_ = approval.OpenBrowser(dev.VerificationURIComplete)
+					}
+					deadline := time.Now().Add(time.Duration(dev.ExpiresIn) * time.Second)
+					interval := time.Duration(dev.Interval) * time.Second
+					if interval <= 0 {
+						interval = 5 * time.Second
+					}
+					for time.Now().Before(deadline) {
+						select {
+						case <-cmd.Context().Done():
+							return nil
+						case <-time.After(interval):
+						}
+						tr, pErr := oidcCl.PollDeviceToken(cmd.Context(), dev.DeviceCode)
+						if pErr != nil {
+							continue
+						}
+						switch tr.Error {
+						case "":
+							tok = strings.TrimSpace(tr.IDToken)
+							if tok == "" {
+								tok = strings.TrimSpace(tr.AccessToken)
+							}
+						case "authorization_pending":
+							continue
+						case "slow_down":
+							interval += 5 * time.Second
+							continue
+						default:
+							*exitCode = ic.WriteError(types.ErrCodeAuthRequired, false, fmt.Sprintf("OIDC device login error: %s %s", tr.Error, tr.ErrorDesc), "", nil, nil, types.Meta{})
+							return nil
+						}
+						if tok != "" {
+							break
+						}
 					}
 				}
 			}

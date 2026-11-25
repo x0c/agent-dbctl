@@ -53,6 +53,7 @@ auth:
     client_secret_env: AGENT_DBCTL_OIDC_SECRET
     device_flow_enabled: true
     admin_groups: []
+    admin_emails: []
     scopes:
       - openid
       - profile

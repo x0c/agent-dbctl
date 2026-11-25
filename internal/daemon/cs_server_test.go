@@ -509,4 +509,57 @@ func TestRemoteServerEnterpriseCS(t *testing.T) {
 	if !auditRes.Valid || auditRes.CheckedCount < 5 {
 		t.Fatalf("expected valid audit chain with entries, got %+v", auditRes)
 	}
+
+	// 4. Built-in CLI Device Confirmation Flow (local server mode without OIDC).
+	var devStart types.DeviceCodeStartResponse
+	if err := unauthRPC.DoJSON(ctx, http.MethodPost, "/rpc/v1/auth/device/start", map[string]any{}, &devStart); err != nil {
+		t.Fatalf("device start: %v", err)
+	}
+	if devStart.Mode != "local" || devStart.DeviceCode == "" || len(devStart.UserCode) != 9 {
+		t.Fatalf("unexpected device start response: %+v", devStart)
+	}
+	var pollPending types.DeviceCodePollResponse
+	if err := unauthRPC.DoJSON(ctx, http.MethodPost, "/rpc/v1/auth/device/poll", map[string]string{"device_code": devStart.DeviceCode}, &pollPending); err != nil {
+		t.Fatalf("device poll pending: %v", err)
+	}
+	if pollPending.Status != "pending" {
+		t.Fatalf("expected pending before decision, got %+v", pollPending)
+	}
+	// Missing CSRF on device decide must be 403.
+	resp, _ = webDo(carolWeb, http.MethodPost, "/api/v1/auth/device/decide", "", map[string]string{
+		"user_code": devStart.UserCode,
+		"decision":  "approve",
+	}, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("device decide without CSRF status=%d, want 403", resp.StatusCode)
+	}
+	resp, raw = webDo(carolWeb, http.MethodPost, "/api/v1/auth/device/decide", carolLogin.CSRFToken, map[string]string{
+		"user_code": devStart.UserCode,
+		"decision":  "approve",
+	}, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("device decide approve status=%d body=%s", resp.StatusCode, string(raw))
+	}
+	var pollApproved types.DeviceCodePollResponse
+	if err := unauthRPC.DoJSON(ctx, http.MethodPost, "/rpc/v1/auth/device/poll", map[string]string{"device_code": devStart.DeviceCode}, &pollApproved); err != nil {
+		t.Fatalf("device poll approved: %v", err)
+	}
+	if pollApproved.Status != "approved" || pollApproved.AccessToken == "" || pollApproved.Email != "carol@corp.example" {
+		t.Fatalf("unexpected approved device poll: %+v", pollApproved)
+	}
+	carolCLI, err := NewRemoteClient(config.ClientContext{
+		Name:       "srv",
+		Endpoint:   tlsSrv.URL,
+		CACertFile: caPath,
+	}, pollApproved.AccessToken)
+	if err != nil {
+		t.Fatalf("carolCLI NewRemoteClient: %v", err)
+	}
+	var carolWho types.Principal
+	if err := carolCLI.DoJSON(ctx, http.MethodGet, "/rpc/v1/whoami", nil, &carolWho); err != nil {
+		t.Fatalf("carolCLI whoami: %v", err)
+	}
+	if carolWho.Email != "carol@corp.example" {
+		t.Fatalf("expected carol@corp.example principal, got %+v", carolWho)
+	}
 }

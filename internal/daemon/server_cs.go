@@ -434,17 +434,12 @@ func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
 			writeHTTPErr(w, http.StatusBadGateway, fmt.Sprintf("oidc token exchange failed: %s %v", tokResp.ErrorDesc, err))
 			return
 		}
-		claims, err := svc.oidcClient.VerifyJWT(r.Context(), tokResp.IDToken, st.Nonce)
+		claims, u, err := verifyAndProvisionOIDCUser(r.Context(), svc, tokResp.IDToken, st.Nonce)
 		if err != nil {
-			writeHTTPErr(w, http.StatusUnauthorized, "verify oidc id_token: "+err.Error())
+			writeHTTPErr(w, http.StatusUnauthorized, err.Error())
 			return
 		}
-		u, _, err := svc.Store().UpsertOIDCUser(r.Context(), claims.Issuer, claims.Subject, claims.Email, claims.Name)
-		if err != nil {
-			writeHTTPErr(w, http.StatusForbidden, err.Error())
-			return
-		}
-		syncOIDCAdminGroups(r.Context(), svc, u.ID, claims.Groups)
+		_ = claims
 		if _, err := issueWebSessionCookie(w, r, svc, u); err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -452,7 +447,7 @@ func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
 		http.Redirect(w, r, sanitizeReturnTo(st.ReturnTo), http.StatusFound)
 	})
 
-	// CLI Device Flow info + token endpoints
+	// CLI Device Flow info + server-mediated browser confirmation endpoints
 	mux.HandleFunc("GET /rpc/v1/auth/oidc", func(w http.ResponseWriter, r *http.Request) {
 		cfg := svc.ServerConfig()
 		if cfg == nil || !cfg.Auth.OIDC.Enabled || !cfg.Auth.OIDC.DeviceFlowEnabled {
@@ -463,6 +458,187 @@ func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
 			"issuer_url": cfg.Auth.OIDC.IssuerURL,
 			"client_id":  cfg.Auth.OIDC.ClientID,
 			"scopes":     cfg.Auth.OIDC.Scopes,
+		})
+	})
+
+	mux.HandleFunc("POST /rpc/v1/auth/device/start", func(w http.ResponseWriter, r *http.Request) {
+		cfg := svc.ServerConfig()
+		if cfg == nil {
+			writeHTTPErr(w, http.StatusNotFound, "server auth is not configured")
+			return
+		}
+		if svc.oidcClient != nil && cfg.Auth.OIDC.DeviceFlowEnabled {
+			dev, err := svc.oidcClient.StartDeviceAuth(r.Context())
+			if err != nil {
+				writeHTTPErr(w, http.StatusBadGateway, "oidc device authorization failed: "+err.Error())
+				return
+			}
+			completeURI := strings.TrimSpace(dev.VerificationURIComplete)
+			if completeURI == "" && dev.VerificationURI != "" && dev.UserCode != "" {
+				sep := "?"
+				if strings.Contains(dev.VerificationURI, "?") {
+					sep = "&"
+				}
+				completeURI = dev.VerificationURI + sep + "user_code=" + url.QueryEscape(dev.UserCode)
+			}
+			writeJSONResp(w, http.StatusOK, types.DeviceCodeStartResponse{
+				Mode:                    "oidc",
+				DeviceCode:              dev.DeviceCode,
+				UserCode:                dev.UserCode,
+				VerificationURI:         dev.VerificationURI,
+				VerificationURIComplete: completeURI,
+				ExpiresIn:               dev.ExpiresIn,
+				Interval:                dev.Interval,
+			})
+			return
+		}
+
+		devCode, err := auth.RandomHex(32)
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		userCode, err := auth.GenerateDeviceUserCode()
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		exp := time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339Nano)
+		if err := svc.Store().CreateCLIDeviceCode(r.Context(), types.CLIDeviceCode{
+			DeviceCodeHash: auth.HashToken(devCode),
+			UserCode:       userCode,
+			Status:         "pending",
+			ExpiresAtUTC:   exp,
+		}); err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		pub := strings.TrimRight(cfg.PublicURL, "/")
+		verifyURI := pub + "/device"
+		writeJSONResp(w, http.StatusOK, types.DeviceCodeStartResponse{
+			Mode:                    "local",
+			DeviceCode:              devCode,
+			UserCode:                userCode,
+			VerificationURI:         verifyURI,
+			VerificationURIComplete: verifyURI + "?user_code=" + url.QueryEscape(userCode),
+			ExpiresIn:               600,
+			Interval:                2,
+		})
+	})
+
+	mux.HandleFunc("POST /rpc/v1/auth/device/poll", func(w http.ResponseWriter, r *http.Request) {
+		cfg := svc.ServerConfig()
+		if cfg == nil {
+			writeHTTPErr(w, http.StatusNotFound, "server auth is not configured")
+			return
+		}
+		var body struct {
+			DeviceCode string `json:"device_code"`
+		}
+		if err := decodeJSONBody(r, &body); err != nil || strings.TrimSpace(body.DeviceCode) == "" {
+			writeHTTPErr(w, http.StatusBadRequest, "device_code is required")
+			return
+		}
+		if svc.oidcClient != nil && cfg.Auth.OIDC.DeviceFlowEnabled {
+			tr, pErr := svc.oidcClient.PollDeviceToken(r.Context(), strings.TrimSpace(body.DeviceCode))
+			if pErr != nil {
+				writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{
+					Status:    "error",
+					Error:     "token_poll_failed",
+					ErrorDesc: pErr.Error(),
+				})
+				return
+			}
+			switch tr.Error {
+			case "":
+			case "authorization_pending":
+				writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{Status: "pending"})
+				return
+			case "slow_down":
+				writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{Status: "slow_down"})
+				return
+			case "access_denied":
+				writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{Status: "denied", Error: tr.Error, ErrorDesc: tr.ErrorDesc})
+				return
+			case "expired_token":
+				writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{Status: "expired", Error: tr.Error, ErrorDesc: tr.ErrorDesc})
+				return
+			default:
+				writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{Status: "error", Error: tr.Error, ErrorDesc: tr.ErrorDesc})
+				return
+			}
+			rawJWT := strings.TrimSpace(tr.IDToken)
+			if rawJWT == "" {
+				writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{
+					Status:    "error",
+					Error:     "missing_id_token",
+					ErrorDesc: "OIDC device token response omitted id_token",
+				})
+				return
+			}
+			_, u, vErr := verifyAndProvisionOIDCUser(r.Context(), svc, rawJWT, "")
+			if vErr != nil {
+				writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{Status: "error", Error: "oidc_verify_failed", ErrorDesc: vErr.Error()})
+				return
+			}
+			tok, mErr := mintCLISessionToken(r.Context(), svc, u, "cli-sso")
+			if mErr != nil {
+				writeHTTPErr(w, http.StatusInternalServerError, mErr.Error())
+				return
+			}
+			writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{Status: "approved", AccessToken: tok, Email: u.Email})
+			return
+		}
+
+		status, userID, err := svc.Store().PollCLIDeviceCode(r.Context(), auth.HashToken(strings.TrimSpace(body.DeviceCode)))
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if status != "approved" {
+			writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{Status: status})
+			return
+		}
+		u, uErr := svc.Store().GetUserByID(r.Context(), userID)
+		if uErr != nil || u.Status != "active" {
+			writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{Status: "denied", Error: "user_inactive"})
+			return
+		}
+		tok, mErr := mintCLISessionToken(r.Context(), svc, u, "cli-web")
+		if mErr != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, mErr.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, types.DeviceCodePollResponse{Status: "approved", AccessToken: tok, Email: u.Email})
+	})
+
+	mux.HandleFunc("POST /api/v1/auth/device/decide", func(w http.ResponseWriter, r *http.Request) {
+		p := rbac.PrincipalFromContext(r.Context())
+		if p.Kind != types.PrincipalHuman || p.ID == "" {
+			writeHTTPErr(w, http.StatusForbidden, "human web session is required to confirm CLI login")
+			return
+		}
+		var body struct {
+			UserCode string `json:"user_code"`
+			Decision string `json:"decision"` // approve | reject
+		}
+		if err := decodeJSONBody(r, &body); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		approve := strings.EqualFold(strings.TrimSpace(body.Decision), "approve")
+		if !approve && !strings.EqualFold(strings.TrimSpace(body.Decision), "reject") {
+			writeHTTPErr(w, http.StatusBadRequest, "decision must be approve or reject")
+			return
+		}
+		dc, err := svc.Store().DecideCLIDeviceCode(r.Context(), p.Subject, body.UserCode, p.ID, approve)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"user_code": dc.UserCode,
+			"status":    dc.Status,
 		})
 	})
 
@@ -812,26 +988,109 @@ func clearWebSessionCookie(w http.ResponseWriter, svc *Service) {
 	})
 }
 
-func syncOIDCAdminGroups(ctx context.Context, svc *Service, userID string, groups []string) {
+func syncOIDCAdminRoles(ctx context.Context, svc *Service, userID string, claims auth.IDTokenClaims) {
 	cfg := svc.ServerConfig()
-	if cfg == nil || len(cfg.Auth.OIDC.AdminGroups) == 0 || len(groups) == 0 {
+	if cfg == nil {
 		return
 	}
-	adminSet := map[string]bool{}
-	for _, g := range cfg.Auth.OIDC.AdminGroups {
-		adminSet[strings.ToLower(strings.TrimSpace(g))] = true
-	}
-	for _, ug := range groups {
-		if adminSet[strings.ToLower(strings.TrimSpace(ug))] {
-			_, _ = svc.Store().UpsertRoleBinding(ctx, "oidc-sync", types.RoleBinding{
-				UserID:    userID,
-				Role:      types.RolePlatformAdmin,
-				ScopeType: types.ScopeGlobal,
-				CreatedBy: "oidc-sync",
-			})
-			return
+	promote := false
+	emailNorm := strings.ToLower(strings.TrimSpace(claims.Email))
+	if emailNorm != "" && (claims.EmailVerified == nil || *claims.EmailVerified) {
+		for _, ae := range cfg.Auth.OIDC.AdminEmails {
+			if strings.ToLower(strings.TrimSpace(ae)) == emailNorm {
+				promote = true
+				break
+			}
 		}
 	}
+	if !promote && len(cfg.Auth.OIDC.AdminGroups) > 0 && len(claims.Groups) > 0 {
+		adminSet := map[string]bool{}
+		for _, g := range cfg.Auth.OIDC.AdminGroups {
+			adminSet[strings.ToLower(strings.TrimSpace(g))] = true
+		}
+		for _, ug := range claims.Groups {
+			if adminSet[strings.ToLower(strings.TrimSpace(ug))] {
+				promote = true
+				break
+			}
+		}
+	}
+	if !promote {
+		return
+	}
+	_, _ = svc.Store().UpsertRoleBinding(ctx, "oidc-sync", types.RoleBinding{
+		UserID:    userID,
+		Role:      types.RolePlatformAdmin,
+		ScopeType: types.ScopeGlobal,
+		CreatedBy: "oidc-sync",
+	})
+}
+
+func verifyAndProvisionOIDCUser(ctx context.Context, svc *Service, rawIDToken, expectedNonce string) (auth.IDTokenClaims, types.User, error) {
+	if svc == nil || svc.oidcClient == nil {
+		return auth.IDTokenClaims{}, types.User{}, fmt.Errorf("OIDC is not enabled")
+	}
+	claims, err := svc.oidcClient.VerifyJWT(ctx, rawIDToken, expectedNonce)
+	if err != nil {
+		return auth.IDTokenClaims{}, types.User{}, fmt.Errorf("verify oidc id_token: %w", err)
+	}
+	if strings.TrimSpace(claims.Email) == "" {
+		return auth.IDTokenClaims{}, types.User{}, fmt.Errorf("oidc token missing email claim")
+	}
+	if claims.EmailVerified != nil && !*claims.EmailVerified {
+		return auth.IDTokenClaims{}, types.User{}, fmt.Errorf("oidc email address is not verified")
+	}
+	u, _, err := svc.Store().UpsertOIDCUser(ctx, claims.Issuer, claims.Subject, claims.Email, claims.Name)
+	if err != nil {
+		return auth.IDTokenClaims{}, types.User{}, err
+	}
+	if u.Status != "active" {
+		return auth.IDTokenClaims{}, types.User{}, fmt.Errorf("user account is disabled")
+	}
+	syncOIDCAdminRoles(ctx, svc, u.ID, claims)
+	return claims, u, nil
+}
+
+func highestUserRole(bindings []types.RoleBinding) types.Role {
+	rank := map[types.Role]int{
+		types.RoleViewer:        1,
+		types.RoleDeveloper:     2,
+		types.RoleApprover:      3,
+		types.RoleSystemAdmin:   4,
+		types.RolePlatformAdmin: 5,
+	}
+	best := types.RoleViewer
+	bestScore := 0
+	for _, b := range bindings {
+		if sc := rank[b.Role]; sc > bestScore {
+			bestScore = sc
+			best = b.Role
+		}
+	}
+	return best
+}
+
+func mintCLISessionToken(ctx context.Context, svc *Service, u types.User, prefixLabel string) (string, error) {
+	plain, prefix, hash, err := auth.GenerateAPIToken()
+	if err != nil {
+		return "", err
+	}
+	bindings, _ := svc.Store().ListRoleBindings(ctx, u.ID)
+	suffix, _ := auth.RandomHex(3)
+	exp := time.Now().UTC().Add(30 * 24 * time.Hour).Format(time.RFC3339Nano)
+	_, err = svc.Store().CreateAPIToken(ctx, "user:"+u.Email, types.APIToken{
+		UserID:       u.ID,
+		OwnerEmail:   u.Email,
+		Name:         fmt.Sprintf("%s-%s-%s", prefixLabel, time.Now().UTC().Format("20060102"), suffix),
+		TokenPrefix:  prefix,
+		TokenHash:    hash,
+		RoleCeiling:  highestUserRole(bindings),
+		ExpiresAtUTC: exp,
+	})
+	if err != nil {
+		return "", err
+	}
+	return plain, nil
 }
 
 func sanitizeReturnTo(raw string) string {
@@ -858,7 +1117,8 @@ func ServerSecurityMiddleware(svc *Service, next http.Handler) http.Handler {
 			return
 		}
 		if path == "/api/v1/auth/config" || path == "/api/v1/auth/login" || path == "/api/v1/auth/logout" ||
-			path == "/api/v1/auth/oidc/login" || path == "/api/v1/auth/oidc/callback" || path == "/rpc/v1/auth/oidc" {
+			path == "/api/v1/auth/oidc/login" || path == "/api/v1/auth/oidc/callback" ||
+			path == "/rpc/v1/auth/oidc" || path == "/rpc/v1/auth/device/start" || path == "/rpc/v1/auth/device/poll" {
 			if path == "/api/v1/auth/login" || path == "/api/v1/auth/logout" {
 				if !isSameOriginServerRequest(r, cfg) {
 					writeHTTPErr(w, http.StatusForbidden, "cross-origin auth mutation blocked")
@@ -968,15 +1228,10 @@ func resolveBearerPrincipal(r *http.Request, svc *Service) (types.Principal, boo
 
 	// 2. Check OIDC JWT from Device Flow / SSO client
 	if svc.oidcClient != nil && strings.Count(rawTok, ".") == 2 {
-		claims, vErr := svc.oidcClient.VerifyJWT(r.Context(), rawTok, "")
-		if vErr != nil || claims.Email == "" {
+		_, u, vErr := verifyAndProvisionOIDCUser(r.Context(), svc, rawTok, "")
+		if vErr != nil {
 			return types.Principal{}, false
 		}
-		u, _, uErr := svc.Store().UpsertOIDCUser(r.Context(), claims.Issuer, claims.Subject, claims.Email, claims.Name)
-		if uErr != nil || u.Status != "active" {
-			return types.Principal{}, false
-		}
-		syncOIDCAdminGroups(r.Context(), svc, u.ID, claims.Groups)
 		bindings, _ := svc.Store().ListRoleBindings(r.Context(), u.ID)
 		return types.Principal{
 			Kind:        types.PrincipalHuman,

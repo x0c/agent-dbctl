@@ -27,6 +27,7 @@ import { AccessTab } from './components/AccessTab'
 import { ApprovalsTab } from './components/ApprovalsTab'
 import { AuditTab } from './components/AuditTab'
 import { CatalogTab, type CatalogSubTab } from './components/CatalogTab'
+import { DeviceAuthView } from './components/DeviceAuthView'
 import { DriversTab } from './components/DriversTab'
 import { LoginView } from './components/LoginView'
 import { PoliciesTab, type PoliciesSubTab } from './components/PoliciesTab'
@@ -44,9 +45,23 @@ function parseDeepLink(): {
   catalogSubTab: CatalogSubTab
   policiesSubTab: PoliciesSubTab
   credentialId: string | null
+  deviceAuth: boolean
+  deviceUserCode: string | null
 } {
   const path = window.location.pathname
   const sp = new URLSearchParams(window.location.search)
+  if (path === '/device' || path === '/device/') {
+    return {
+      tab: 'approvals',
+      approvalId: null,
+      approvalToken: null,
+      catalogSubTab: 'targets',
+      policiesSubTab: 'guardrails',
+      credentialId: null,
+      deviceAuth: true,
+      deviceUserCode: sp.get('user_code'),
+    }
+  }
   const approvalMatch = path.match(/^\/approvals\/([^/]+)$/)
   if (approvalMatch) {
     return {
@@ -56,6 +71,8 @@ function parseDeepLink(): {
       catalogSubTab: 'targets',
       policiesSubTab: 'guardrails',
       credentialId: null,
+      deviceAuth: false,
+      deviceUserCode: null,
     }
   }
   if (path === '/targets' || path.startsWith('/targets/')) {
@@ -66,6 +83,8 @@ function parseDeepLink(): {
       catalogSubTab: 'targets',
       policiesSubTab: 'guardrails',
       credentialId: null,
+      deviceAuth: false,
+      deviceUserCode: null,
     }
   }
   if (path === '/catalog' || path.startsWith('/catalog/')) {
@@ -78,6 +97,8 @@ function parseDeepLink(): {
         catalogSubTab: 'targets',
         policiesSubTab: 'environments',
         credentialId: null,
+        deviceAuth: false,
+        deviceUserCode: null,
       }
     }
     const credential = sp.get('credential')
@@ -94,24 +115,26 @@ function parseDeepLink(): {
       catalogSubTab,
       policiesSubTab: 'guardrails',
       credentialId: credential,
+      deviceAuth: false,
+      deviceUserCode: null,
     }
   }
   if (path === '/policies' || path.startsWith('/policies/')) {
     const rawSub = sp.get('subtab')
     const policiesSubTab: PoliciesSubTab =
       rawSub === 'patterns' || rawSub === 'environments' ? rawSub : 'guardrails'
-    return { tab: 'policies', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab, credentialId: null }
+    return { tab: 'policies', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab, credentialId: null, deviceAuth: false, deviceUserCode: null }
   }
   if (path === '/audit' || path.startsWith('/audit/')) {
-    return { tab: 'audit', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null }
+    return { tab: 'audit', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null, deviceAuth: false, deviceUserCode: null }
   }
   if (path === '/drivers' || path.startsWith('/drivers/')) {
-    return { tab: 'drivers', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null }
+    return { tab: 'drivers', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null, deviceAuth: false, deviceUserCode: null }
   }
   if (path === '/access' || path.startsWith('/access/')) {
-    return { tab: 'access', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null }
+    return { tab: 'access', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null, deviceAuth: false, deviceUserCode: null }
   }
-  return { tab: 'approvals', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null }
+  return { tab: 'approvals', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null, deviceAuth: false, deviceUserCode: null }
 }
 
 export function App() {
@@ -120,10 +143,13 @@ export function App() {
   const [tab, setTab] = useState<Tab>(initialLink.tab)
   const [catalog, setCatalog] = useState<DisplayCatalog>(() => loadCachedCatalog())
   const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null)
-  const [authState, setAuthState] = useState<'authenticated' | 'unauthenticated'>('authenticated')
+  const [authState, setAuthState] = useState<'checking' | 'authenticated' | 'unauthenticated'>(() =>
+    loadCachedCatalog().environments.length > 0 ? 'authenticated' : 'checking',
+  )
   const [authInfo, setAuthInfo] = useState<PublicAuthInfo | null>(null)
   const [pendingCount, setPendingCount] = useState<number>(0)
   const [cmdOpen, setCmdOpen] = useState(false)
+  const [deviceViewOpen, setDeviceViewOpen] = useState(initialLink.deviceAuth)
 
   const handleUnauthenticated = (info?: PublicAuthInfo) => {
     clearCachedCatalog()
@@ -180,10 +206,30 @@ export function App() {
     }
   }
 
+  if (authState === 'checking') {
+    return <div className="min-h-svh bg-background" />
+  }
+
   if (authState === 'unauthenticated') {
     return (
       <>
         <LoginView authInfo={authInfo} onSuccess={refreshBootstrap} />
+        <Toaster />
+      </>
+    )
+  }
+
+  if (deviceViewOpen) {
+    return (
+      <>
+        <DeviceAuthView
+          initialUserCode={initialLink.deviceUserCode}
+          userEmail={bootstrap?.current_user?.email}
+          onDone={() => {
+            window.history.replaceState({}, '', '/')
+            setDeviceViewOpen(false)
+          }}
+        />
         <Toaster />
       </>
     )

@@ -98,6 +98,25 @@ func RandomHex(nBytes int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+const deviceCodeAlphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ" // 32 unambiguous chars
+
+// GenerateDeviceUserCode generates an 8-character XXXX-YYYY confirmation code using unbiased entropy.
+func GenerateDeviceUserCode() (string, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	out := make([]byte, 9)
+	for i := 0; i < 4; i++ {
+		out[i] = deviceCodeAlphabet[b[i]&31]
+	}
+	out[4] = '-'
+	for i := 0; i < 4; i++ {
+		out[5+i] = deviceCodeAlphabet[b[4+i]&31]
+	}
+	return string(out), nil
+}
+
 // ConstantTimeEqual compares two strings without leaking length/prefix timing.
 func ConstantTimeEqual(a, b string) bool {
 	if len(a) == 0 || len(a) != len(b) {

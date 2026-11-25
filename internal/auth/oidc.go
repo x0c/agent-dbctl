@@ -52,15 +52,16 @@ type TokenResponse struct {
 
 // IDTokenClaims represents verified identity claims from an OIDC ID/Access JWT.
 type IDTokenClaims struct {
-	Issuer  string   `json:"iss"`
-	Subject string   `json:"sub"`
-	Email   string   `json:"email"`
-	Name    string   `json:"name"`
-	Groups  []string `json:"groups"`
-	Nonce   string   `json:"nonce"`
-	AudRaw  any      `json:"aud"`
-	Exp     int64    `json:"exp"`
-	Iat     int64    `json:"iat"`
+	Issuer        string   `json:"iss"`
+	Subject       string   `json:"sub"`
+	Email         string   `json:"email"`
+	EmailVerified *bool    `json:"email_verified,omitempty"`
+	Name          string   `json:"name"`
+	Groups        []string `json:"groups"`
+	Nonce         string   `json:"nonce"`
+	AudRaw        any      `json:"aud"`
+	Exp           int64    `json:"exp"`
+	Iat           int64    `json:"iat"`
 }
 
 type jwksSet struct {

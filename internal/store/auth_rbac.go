@@ -482,6 +482,112 @@ func (s *Store) ConsumeOIDCAuthState(ctx context.Context, stateHash string) (typ
 	return st, err
 }
 
+// CreateCLIDeviceCode persists an ephemeral CLI browser confirmation request.
+func (s *Store) CreateCLIDeviceCode(ctx context.Context, dc types.CLIDeviceCode) error {
+	now := nowUTC()
+	if dc.CreatedAtUTC == "" {
+		dc.CreatedAtUTC = now
+	}
+	if dc.Status == "" {
+		dc.Status = "pending"
+	}
+	_, _ = s.dbExec(ctx, `DELETE FROM cli_device_codes WHERE expires_at_utc < ?`, now)
+	_, err := s.dbExec(ctx, `
+		INSERT INTO cli_device_codes(device_code_hash, user_code, status, user_id, expires_at_utc, created_at_utc)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		dc.DeviceCodeHash, strings.ToUpper(strings.TrimSpace(dc.UserCode)), dc.Status, dc.UserID, dc.ExpiresAtUTC, dc.CreatedAtUTC)
+	return err
+}
+
+// DecideCLIDeviceCode marks a pending CLI device code approved or rejected by an authenticated Web user.
+func (s *Store) DecideCLIDeviceCode(ctx context.Context, actor, userCode, userID string, approve bool) (types.CLIDeviceCode, error) {
+	norm := strings.ToUpper(strings.TrimSpace(userCode))
+	if norm == "" {
+		return types.CLIDeviceCode{}, fmt.Errorf("user_code is required")
+	}
+	var out types.CLIDeviceCode
+	now := nowUTC()
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		row := s.txQueryRow(ctx, tx, `
+			SELECT device_code_hash, user_code, status, user_id, expires_at_utc, created_at_utc
+			FROM cli_device_codes WHERE user_code = ?`, norm)
+		if err := row.Scan(&out.DeviceCodeHash, &out.UserCode, &out.Status, &out.UserID, &out.ExpiresAtUTC, &out.CreatedAtUTC); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: confirmation code not found", ErrNotFound)
+			}
+			return err
+		}
+		if exp, ok := parseUTCTime(out.ExpiresAtUTC); !ok || time.Now().UTC().After(exp) {
+			return fmt.Errorf("%w: confirmation code has expired", ErrConflict)
+		}
+		if out.Status != "pending" {
+			return fmt.Errorf("%w: confirmation code already processed (%s)", ErrConflict, out.Status)
+		}
+		nextStatus := "rejected"
+		if approve {
+			nextStatus = "approved"
+		}
+		if _, err := s.txExec(ctx, tx, `
+			UPDATE cli_device_codes SET status = ?, user_id = ? WHERE device_code_hash = ?`,
+			nextStatus, userID, out.DeviceCodeHash); err != nil {
+			return err
+		}
+		out.Status = nextStatus
+		out.UserID = userID
+		return s.appendAuditTx(ctx, tx, actor, "auth.device_decide", out.UserCode, "", map[string]any{
+			"decision": nextStatus,
+			"user_id":  userID,
+		}, now)
+	})
+	return out, err
+}
+
+// PollCLIDeviceCode inspects a pending/decided CLI device code and consumes approved/rejected entries atomically.
+func (s *Store) PollCLIDeviceCode(ctx context.Context, deviceCodeHash string) (status string, userID string, err error) {
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		var dc types.CLIDeviceCode
+		row := s.txQueryRow(ctx, tx, `
+			SELECT device_code_hash, user_code, status, user_id, expires_at_utc, created_at_utc
+			FROM cli_device_codes WHERE device_code_hash = ?`, deviceCodeHash)
+		scanErr := row.Scan(&dc.DeviceCodeHash, &dc.UserCode, &dc.Status, &dc.UserID, &dc.ExpiresAtUTC, &dc.CreatedAtUTC)
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			status = "expired"
+			return nil
+		}
+		if scanErr != nil {
+			return scanErr
+		}
+		if exp, ok := parseUTCTime(dc.ExpiresAtUTC); !ok || time.Now().UTC().After(exp) {
+			_, _ = s.txExec(ctx, tx, `DELETE FROM cli_device_codes WHERE device_code_hash = ?`, deviceCodeHash)
+			status = "expired"
+			return nil
+		}
+		switch dc.Status {
+		case "pending":
+			status = "pending"
+		case "rejected":
+			_, _ = s.txExec(ctx, tx, `DELETE FROM cli_device_codes WHERE device_code_hash = ?`, deviceCodeHash)
+			status = "denied"
+		case "approved":
+			res, uErr := s.txExec(ctx, tx, `DELETE FROM cli_device_codes WHERE device_code_hash = ? AND status = 'approved'`, deviceCodeHash)
+			if uErr != nil {
+				return uErr
+			}
+			n, _ := res.RowsAffected()
+			if n != 1 {
+				status = "expired"
+				return nil
+			}
+			status = "approved"
+			userID = dc.UserID
+		default:
+			status = "expired"
+		}
+		return nil
+	})
+	return status, userID, err
+}
+
 // GetEncryptedSecret implements secrets.EnvelopeRecordStore.
 func (s *Store) GetEncryptedSecret(ctx context.Context, key string) (types.EncryptedSecretRecord, error) {
 	var rec types.EncryptedSecretRecord

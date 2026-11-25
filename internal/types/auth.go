@@ -148,3 +148,33 @@ type EncryptedSecretRecord struct {
 	Ciphertext   []byte `json:"ciphertext"`
 	UpdatedAtUTC string `json:"updated_at_utc"`
 }
+
+// CLIDeviceCode persists pending/decided CLI browser login confirmation requests.
+type CLIDeviceCode struct {
+	DeviceCodeHash string `json:"-"`
+	UserCode       string `json:"user_code"`
+	Status         string `json:"status"` // pending | approved | rejected | consumed
+	UserID         string `json:"user_id,omitempty"`
+	ExpiresAtUTC   string `json:"expires_at_utc"`
+	CreatedAtUTC   string `json:"created_at_utc"`
+}
+
+// DeviceCodeStartResponse starts interactive browser verification for `agent-dbctl login`.
+type DeviceCodeStartResponse struct {
+	Mode                    string `json:"mode"` // oidc | local
+	DeviceCode              string `json:"device_code"`
+	UserCode                string `json:"user_code"`
+	VerificationURI         string `json:"verification_uri"`
+	VerificationURIComplete string `json:"verification_uri_complete,omitempty"`
+	ExpiresIn               int    `json:"expires_in"`
+	Interval                int    `json:"interval"`
+}
+
+// DeviceCodePollResponse returns CLI browser authorization poll status and minted token upon approval.
+type DeviceCodePollResponse struct {
+	Status      string `json:"status"` // pending | slow_down | approved | denied | expired | error
+	AccessToken string `json:"access_token,omitempty"`
+	Email       string `json:"email,omitempty"`
+	Error       string `json:"error,omitempty"`
+	ErrorDesc   string `json:"error_description,omitempty"`
+}
