@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -82,7 +83,7 @@ func buildSQLiteDSN(cfg driver.ConnectionConfig) (string, error) {
 		return "", fmt.Errorf("sqlite requires database_name or host file path")
 	}
 	if path != ":memory:" && !strings.HasPrefix(path, "file:") {
-		path = config.ExpandHomePath(path)
+		path = expandHomePath(path)
 	}
 
 	q := url.Values{}
@@ -321,6 +322,22 @@ func collectSQLRows(rows *sql.Rows, opts driver.ExecOpts) (*types.ExecResult, er
 		Truncated:     buf.Truncated,
 		CutoffReason:  buf.CutoffReason,
 	}, nil
+}
+
+func expandHomePath(p string) string {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return trimmed
+	}
+	if strings.HasPrefix(trimmed, "~/") || strings.HasPrefix(trimmed, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, trimmed[2:])
+		}
+	}
+	return trimmed
 }
 
 func normalizeTypedSQLValue(v any, typeName string) any {
