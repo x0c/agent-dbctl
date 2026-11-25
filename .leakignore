@@ -1,2 +1,4 @@
 # Confirmed synthetic SQL redaction unit-test fixture in c6ac67e (replaced in follow-up commit)
 fp:36e83d2e597557c2
+# Confirmed synthetic Git remote credential-stripping unit-test fixture in f5ec5ee (replaced in follow-up commit)
+fp:9f05ac9c15e9ff4f

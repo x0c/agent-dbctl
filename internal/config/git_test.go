@@ -19,7 +19,7 @@ func TestNormalizeGitRemote(t *testing.T) {
 		{"", ""},
 		{"   ", ""},
 		{"https://github.com/Org/Order-Core.git", "github.com/Org/Order-Core"},
-		{"https://oauth2:secret-token@github.com/org/order-core.git/", "github.com/org/order-core"},
+		{"https://oauth2:pw@github.com/org/order-core.git/", "github.com/org/order-core"},
 		{"https://GitHub.com:443/org/order-core.GIT", "github.com/org/order-core"},
 		{"git@github.com:org/order-core.git", "github.com/org/order-core"},
 		{"ssh://git@github.com/org/order-core.git", "github.com/org/order-core"},
