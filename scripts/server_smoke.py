@@ -104,7 +104,7 @@ def oidc_login(browser: Browser, base: str, oidc_port: int) -> str:
     return bootstrap["ui_csrf_token"]
 
 
-def cli_device_login(binary: Path, base: str, config_home: Path, browser: Browser, csrf: str) -> None:
+def cli_device_login(binary: Path, config_home: Path, oidc_port: int, browser: Browser) -> None:
     env = client_env(config_home)
     pid, fd = pty.fork()
     if pid == 0:
@@ -130,9 +130,8 @@ def cli_device_login(binary: Path, base: str, config_home: Path, browser: Browse
         expect(code is not None, f"CLI did not emit a device confirmation code: {output!r}")
         status, raw, _ = browser.request(
             "POST",
-            base + "/api/v1/auth/device/decide",
+            f"http://127.0.0.1:{oidc_port}/device",
             {"user_code": code, "decision": "approve"},
-            csrf,
         )
         expect(status == 200, f"device confirmation failed: {status} {raw[:500]!r}")
         deadline = time.monotonic() + 30
@@ -251,6 +250,7 @@ def run(args) -> None:
             f"AGENT_DBCTL_BIND_ADDR=127.0.0.1:{args.port}\n"
             f"AGENT_DBCTL_PUBLIC_URL={base}\n"
             f"SMOKE_OIDC_BIND_ADDR=127.0.0.1:{args.oidc_port}\n"
+            f"SMOKE_PUBLIC_OIDC_URL=http://127.0.0.1:{args.oidc_port}\n"
             f"AGENT_DBCTL_IMAGE={image}\n"
             "AGENT_DBCTL_VERSION=smoke\n"
             "AGENT_DBCTL_COMMIT=smoke\n",
@@ -275,7 +275,7 @@ def run(args) -> None:
 
             config_home = temp / "client"
             run_cli(binary, config_home, "context", "add", "smoke", "--endpoint", base, "--auth-mode", "oidc_device", "--use")
-            cli_device_login(binary, base, config_home, admin, admin_csrf)
+            cli_device_login(binary, config_home, args.oidc_port, admin)
             _, who = run_cli(binary, config_home, "whoami")
             expect((who.get("data") or {}).get("kind") == "human", f"CLI login did not mint a human principal: {who}")
 
@@ -343,7 +343,7 @@ def run(args) -> None:
                 "control_plane": "postgres",
                 "event_result_bus": "redis",
                 "web_oidc": "RS256+PKCE",
-                "cli_login": "server-device-confirmation",
+                "cli_login": "oidc-rfc8628-device-flow",
                 "approvals": 2,
                 "audit_entries": audit_data["checked_count"],
                 "target": target["ref"],

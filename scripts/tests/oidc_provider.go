@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,12 +33,20 @@ type authorization struct {
 	Expires   time.Time
 }
 
+type deviceAuthorization struct {
+	UserCode string
+	Approved bool
+	Expires  time.Time
+}
+
 type provider struct {
-	issuer string
-	key    *rsa.PrivateKey
-	kid    string
-	mu     sync.Mutex
-	codes  map[string]authorization
+	issuer      string
+	externalURL string
+	key         *rsa.PrivateKey
+	kid         string
+	mu          sync.Mutex
+	codes       map[string]authorization
+	devices     map[string]*deviceAuthorization
 }
 
 func main() {
@@ -49,7 +58,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	p := &provider{issuer: issuer, key: key, kid: "smoke-rsa-1", codes: map[string]authorization{}}
+	externalURL := strings.TrimRight(os.Getenv("OIDC_EXTERNAL_URL"), "/")
+	if externalURL == "" {
+		externalURL = "http://127.0.0.1:18081"
+	}
+	p := &provider{
+		issuer: issuer, externalURL: externalURL, key: key, kid: "smoke-rsa-1",
+		codes: map[string]authorization{}, devices: map[string]*deviceAuthorization{},
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -58,6 +74,9 @@ func main() {
 	mux.HandleFunc("GET /jwks", p.jwks)
 	mux.HandleFunc("GET /authorize", p.authorize)
 	mux.HandleFunc("POST /token", p.token)
+	mux.HandleFunc("POST /device_authorization", p.deviceAuthorization)
+	mux.HandleFunc("GET /device", p.devicePage)
+	mux.HandleFunc("POST /device", p.deviceDecision)
 	mux.HandleFunc("GET /userinfo", p.userinfo)
 
 	srv := &http.Server{
@@ -87,6 +106,7 @@ func (p *provider) discovery(w http.ResponseWriter, _ *http.Request) {
 		"token_endpoint":                        p.issuer + "/token",
 		"jwks_uri":                              p.issuer + "/jwks",
 		"userinfo_endpoint":                     p.issuer + "/userinfo",
+		"device_authorization_endpoint":         p.issuer + "/device_authorization",
 		"response_types_supported":              []string{"code"},
 		"subject_types_supported":               []string{"public"},
 		"id_token_signing_alg_values_supported": []string{"RS256"},
@@ -137,7 +157,15 @@ func (p *provider) token(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	if r.Form.Get("grant_type") != "authorization_code" || r.Form.Get("client_id") != clientID {
+	if r.Form.Get("client_id") != clientID {
+		writeTokenError(w, "invalid_request")
+		return
+	}
+	if r.Form.Get("grant_type") == "urn:ietf:params:oauth:grant-type:device_code" {
+		p.deviceToken(w, r.Form.Get("device_code"))
+		return
+	}
+	if r.Form.Get("grant_type") != "authorization_code" {
 		writeTokenError(w, "invalid_request")
 		return
 	}
@@ -155,6 +183,87 @@ func (p *provider) token(w http.ResponseWriter, r *http.Request) {
 		writeTokenError(w, "invalid_grant")
 		return
 	}
+	p.issueTokens(w, grant.Nonce)
+}
+
+func (p *provider) deviceAuthorization(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil || r.Form.Get("client_id") != clientID {
+		writeTokenError(w, "invalid_request")
+		return
+	}
+	deviceCode := randomToken(24)
+	raw := make([]byte, 4)
+	if _, err := rand.Read(raw); err != nil {
+		http.Error(w, "random source failed", http.StatusInternalServerError)
+		return
+	}
+	userCode := strings.ToUpper(hex.EncodeToString(raw))
+	userCode = userCode[:4] + "-" + userCode[4:]
+	p.mu.Lock()
+	p.devices[deviceCode] = &deviceAuthorization{UserCode: userCode, Expires: time.Now().Add(10 * time.Minute)}
+	p.mu.Unlock()
+	verificationURI := p.externalURL + "/device"
+	writeJSON(w, http.StatusOK, map[string]any{
+		"device_code":               deviceCode,
+		"user_code":                 userCode,
+		"verification_uri":          verificationURI,
+		"verification_uri_complete": verificationURI + "?user_code=" + userCode,
+		"expires_in":                600,
+		"interval":                  1,
+	})
+}
+
+func (p *provider) devicePage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprintf(w, "<!doctype html><title>Isolated OIDC approval</title><form method=post><input name=user_code value=%q autofocus><button name=decision value=approve>Approve synthetic login</button></form>", r.URL.Query().Get("user_code"))
+}
+
+func (p *provider) deviceDecision(w http.ResponseWriter, r *http.Request) {
+	var userCode, decision string
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		var body struct {
+			UserCode string `json:"user_code"`
+			Decision string `json:"decision"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		userCode, decision = body.UserCode, body.Decision
+	} else if err := r.ParseForm(); err == nil {
+		userCode, decision = r.Form.Get("user_code"), r.Form.Get("decision")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, device := range p.devices {
+		if device.UserCode == userCode && time.Now().Before(device.Expires) {
+			device.Approved = decision == "approve"
+			writeJSON(w, http.StatusOK, map[string]string{"status": "approved"})
+			return
+		}
+	}
+	http.Error(w, "unknown or expired user code", http.StatusNotFound)
+}
+
+func (p *provider) deviceToken(w http.ResponseWriter, deviceCode string) {
+	p.mu.Lock()
+	device, ok := p.devices[deviceCode]
+	if !ok || time.Now().After(device.Expires) {
+		p.mu.Unlock()
+		writeTokenError(w, "expired_token")
+		return
+	}
+	if !device.Approved {
+		p.mu.Unlock()
+		writeTokenError(w, "authorization_pending")
+		return
+	}
+	delete(p.devices, deviceCode)
+	p.mu.Unlock()
+	p.issueTokens(w, "")
+}
+
+func (p *provider) issueTokens(w http.ResponseWriter, nonce string) {
 	now := time.Now()
 	idToken, err := p.signJWT(map[string]any{
 		"iss":            p.issuer,
@@ -162,7 +271,7 @@ func (p *provider) token(w http.ResponseWriter, r *http.Request) {
 		"aud":            clientID,
 		"exp":            now.Add(10 * time.Minute).Unix(),
 		"iat":            now.Unix(),
-		"nonce":          grant.Nonce,
+		"nonce":          nonce,
 		"email":          "admin@example.com",
 		"email_verified": true,
 		"name":           "Smoke Admin",

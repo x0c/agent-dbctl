@@ -17,6 +17,7 @@ services:
     working_dir: /src
     environment:
       OIDC_ISSUER: http://oidc:8081
+      OIDC_EXTERNAL_URL: ${SMOKE_PUBLIC_OIDC_URL:-http://127.0.0.1:18081}
       GOPROXY: https://goproxy.cn,direct
     volumes:
       - ./scripts/tests/oidc_provider.go:/src/oidc_provider.go:ro
