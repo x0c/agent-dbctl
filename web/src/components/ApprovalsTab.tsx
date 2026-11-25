@@ -132,11 +132,11 @@ export function ApprovalsTab({
         title={t('approvals.title')}
         actions={
           <div className="flex items-center gap-2">
-            <div className="flex rounded-md border border-border bg-card p-0.5 text-xs">
+            <div className="flex h-8 items-center rounded-md border border-border bg-card p-0.5 text-xs">
               <button
                 type="button"
                 onClick={() => setFilterStatus('pending')}
-                className={`cursor-pointer rounded px-2.5 py-1 font-medium ${
+                className={`h-full cursor-pointer rounded-sm px-2.5 font-medium ${
                   filterStatus === 'pending' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'
                 }`}
               >
@@ -145,7 +145,7 @@ export function ApprovalsTab({
               <button
                 type="button"
                 onClick={() => setFilterStatus('all')}
-                className={`cursor-pointer rounded px-2.5 py-1 font-medium ${
+                className={`h-full cursor-pointer rounded-sm px-2.5 font-medium ${
                   filterStatus === 'all' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'
                 }`}
               >

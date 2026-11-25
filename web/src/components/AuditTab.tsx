@@ -3,16 +3,10 @@ import {
   Button,
   type ColumnDef,
   DataTable,
-  Input,
+  FilterSelect,
   LoadingButton,
   Notice,
   PageHeader,
-  Panel,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
   Sheet,
   SheetBody,
   SheetContent,
@@ -26,7 +20,7 @@ import {
   toast,
 } from '@x0c/ui'
 import { RefreshCw, ShieldCheck } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   api,
   type AuditEntry,
@@ -51,20 +45,24 @@ export function AuditTab({ catalog }: { catalog: DisplayCatalog }) {
   const [search, setSearch] = useState('')
   const [envFilter, setEnvFilter] = useState('__all')
   const [statusFilter, setStatusFilter] = useState('__all')
+  const [chainActionFilter, setChainActionFilter] = useState('__all')
   const [selectedOp, setSelectedOp] = useState<OperationRecord | null>(null)
 
-  const load = async () => {
+  const load = async (overrides?: { search?: string; env?: string; status?: string }) => {
+    const qSearch = (overrides?.search ?? search).trim()
+    const qEnv = overrides?.env ?? envFilter
+    const qStatus = overrides?.status ?? statusFilter
     setLoading(true)
     setError(null)
     try {
       const [oRes, aRes] = await Promise.all([
         api.listOperations({
-          search: search.trim(),
-          env: envFilter === '__all' ? '' : envFilter,
-          status: statusFilter === '__all' ? '' : statusFilter,
+          search: qSearch,
+          env: qEnv === '__all' ? '' : qEnv,
+          status: qStatus === '__all' ? '' : qStatus,
           limit: '100',
         }),
-        api.listAudit({ search: search.trim(), limit: '150' }),
+        api.listAudit({ limit: '150' }),
       ])
       setOps(oRes.items ?? [])
       setAuditEntries(aRes.items ?? [])
@@ -78,6 +76,31 @@ export function AuditTab({ catalog }: { catalog: DisplayCatalog }) {
   useEffect(() => {
     void load()
   }, [envFilter, statusFilter])
+
+  const hasOpFilters = search.trim() !== '' || envFilter !== '__all' || statusFilter !== '__all'
+
+  const resetOpFilters = () => {
+    setSearch('')
+    if (envFilter === '__all' && statusFilter === '__all') {
+      void load({ search: '' })
+      return
+    }
+    setEnvFilter('__all')
+    setStatusFilter('__all')
+  }
+
+  const chainActions = useMemo(
+    () => Array.from(new Set(auditEntries.map((entry) => entry.action).filter(Boolean))).sort(),
+    [auditEntries],
+  )
+
+  const filteredAuditEntries = useMemo(
+    () =>
+      chainActionFilter === '__all'
+        ? auditEntries
+        : auditEntries.filter((entry) => entry.action === chainActionFilter),
+    [auditEntries, chainActionFilter],
+  )
 
   const handleVerify = async () => {
     setVerifying(true)
@@ -221,64 +244,89 @@ export function AuditTab({ catalog }: { catalog: DisplayCatalog }) {
       )}
       {error && <Notice tone="error">{error}</Notice>}
 
-      <div className="flex flex-wrap items-center gap-3">
-        <Input
-          className="max-w-xs"
-          placeholder={t('audit.searchPlaceholder')}
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && void load()}
-        />
-        <div className="w-44">
-          <Select value={envFilter} onValueChange={setEnvFilter}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__all">{t('audit.allEnvs')}</SelectItem>
-              {catalog.environments.map((e) => (
-                <SelectItem key={e.code} value={e.code}>
-                  {resolveDisplayItem(catalog.environments, e.code, locale).label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="w-48">
-          <Select value={statusFilter} onValueChange={setStatusFilter}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__all">{t('audit.allStatuses')}</SelectItem>
-              {catalog.operation_statuses.map((s) => (
-                <SelectItem key={s.code} value={s.code}>
-                  {resolveDisplayItem(catalog.operation_statuses, s.code, locale).label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <Button variant="outline" size="sm" onClick={() => void load()}>
-          {t('common.filter')}
-        </Button>
-      </div>
-
       <Tabs value={view} onValueChange={(v) => setView(v as 'operations' | 'chain')}>
         <TabsList>
           <TabsTrigger value="operations">{t('audit.tab.operations', { count: ops.length })}</TabsTrigger>
-          <TabsTrigger value="chain">{t('audit.tab.chain', { count: auditEntries.length })}</TabsTrigger>
+          <TabsTrigger value="chain">{t('audit.tab.chain', { count: filteredAuditEntries.length })}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="operations">
-          <Panel flush>
-            <DataTable columns={opColumns} data={ops} searchable={false} emptyLabel={t('audit.emptyOps')} />
-          </Panel>
+          <DataTable
+            columns={opColumns}
+            data={ops}
+            loading={loading}
+            manualFiltering
+            searchValue={search}
+            onSearchChange={setSearch}
+            onSearchSubmit={() => void load()}
+            onSearchClear={() => void load({ search: '' })}
+            searchPlaceholder={t('audit.searchPlaceholder')}
+            searchClearLabel={t('common.clearSearch')}
+            searchInputClassName="sm:w-72"
+            emptyLabel={t('audit.emptyOps')}
+            toolbarLeft={
+              <>
+                <FilterSelect
+                  value={envFilter}
+                  onValueChange={setEnvFilter}
+                  options={[
+                    { value: '__all', label: t('audit.allEnvs') },
+                    ...catalog.environments.map((e) => ({
+                      value: e.code,
+                      label: resolveDisplayItem(catalog.environments, e.code, locale).label,
+                    })),
+                  ]}
+                />
+                <FilterSelect
+                  value={statusFilter}
+                  onValueChange={setStatusFilter}
+                  options={[
+                    { value: '__all', label: t('audit.allStatuses') },
+                    ...catalog.operation_statuses.map((s) => ({
+                      value: s.code,
+                      label: resolveDisplayItem(catalog.operation_statuses, s.code, locale).label,
+                    })),
+                  ]}
+                />
+                <Button variant="outline" size="sm" onClick={() => void load()}>
+                  {t('common.filter')}
+                </Button>
+                {hasOpFilters && (
+                  <Button variant="ghost" size="sm" onClick={resetOpFilters}>
+                    {t('common.reset')}
+                  </Button>
+                )}
+              </>
+            }
+          />
         </TabsContent>
         <TabsContent value="chain">
-          <Panel flush>
-            <DataTable columns={auditColumns} data={auditEntries} searchable={false} emptyLabel={t('audit.emptyAudit')} />
-          </Panel>
+          <DataTable
+            columns={auditColumns}
+            data={filteredAuditEntries}
+            loading={loading}
+            searchPlaceholder={t('audit.chainSearchPlaceholder')}
+            searchClearLabel={t('common.clearSearch')}
+            searchInputClassName="sm:w-72"
+            emptyLabel={t('audit.emptyAudit')}
+            toolbarLeft={
+              <>
+                <FilterSelect
+                  value={chainActionFilter}
+                  onValueChange={setChainActionFilter}
+                  options={[
+                    { value: '__all', label: t('audit.allActions') },
+                    ...chainActions.map((act) => ({ value: act, label: act })),
+                  ]}
+                />
+                {chainActionFilter !== '__all' && (
+                  <Button variant="ghost" size="sm" onClick={() => setChainActionFilter('__all')}>
+                    {t('common.reset')}
+                  </Button>
+                )}
+              </>
+            }
+          />
         </TabsContent>
       </Tabs>
 

@@ -167,7 +167,7 @@ export function PoliciesTab({
       id: 'actions',
       header: '',
       cell: ({ row }) => (
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-1.5">
           <Button
             size="sm"
             variant="outline"
@@ -179,6 +179,22 @@ export function PoliciesTab({
           >
             {t('common.edit')}
           </Button>
+          <ConfirmAction
+            trigger={<Button size="sm" variant="ghost">{t('common.delete')}</Button>}
+            title={t('policies.deleteEnvTitle', { code: row.original.code })}
+            confirmLabel={t('common.delete')}
+            cancelLabel={t('common.cancel')}
+            destructive
+            onConfirm={async () => {
+              try {
+                await api.deleteEnvironment(row.original.code)
+                await onRefreshBootstrap()
+                await load()
+              } catch (err) {
+                toast.error(err instanceof Error ? err.message : t('policies.updateFailed'))
+              }
+            }}
+          />
         </div>
       ),
     },
@@ -409,6 +425,7 @@ export function PoliciesTab({
               data={policies}
               searchPlaceholder={t('common.search')}
               emptyLabel={t('policies.overridesEmpty')}
+              className="rounded-none border-0"
             />
           </Panel>
         </TabsContent>
@@ -418,14 +435,12 @@ export function PoliciesTab({
         </TabsContent>
 
         <TabsContent value="environments" className="pt-2">
-          <Panel flush>
-            <DataTable
-              columns={envColumns}
-              data={envs}
-              searchPlaceholder={t('common.search')}
-              emptyLabel={t('catalog.empty.environments')}
-            />
-          </Panel>
+          <DataTable
+            columns={envColumns}
+            data={envs}
+            searchPlaceholder={t('common.search')}
+            emptyLabel={t('catalog.empty.environments')}
+          />
         </TabsContent>
       </Tabs>
 

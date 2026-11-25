@@ -4,6 +4,7 @@ import {
   type ColumnDef,
   ConfirmAction,
   DataTable,
+  FilterSelect,
   FormDialog,
   FormField,
   Input,
@@ -451,58 +452,38 @@ export function RiskPatternsPanel({
       <Panel
         title={t('patterns.packsTitle')}
         action={
-          <div className="flex items-center gap-2">
-            <div className="w-28">
-              <Select
-                value={packScopeType}
-                onValueChange={(v) => {
-                  const next = v as typeof packScopeType
-                  setPackScopeType(next)
-                  if (next === 'global') setPackScopeId('global')
-                  else if (next === 'env') setPackScopeId(envs[0]?.code ?? '')
-                  else if (next === 'system') setPackScopeId(systems[0]?.id ?? '')
-                  else setPackScopeId(targets[0]?.target.id ?? '')
-                }}
-              >
-                <SelectTrigger size="sm">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="global">global</SelectItem>
-                  <SelectItem value="env">env</SelectItem>
-                  <SelectItem value="system">system</SelectItem>
-                  <SelectItem value="target">target</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <FilterSelect
+              value={packScopeType}
+              className="sm:min-w-[100px]"
+              onValueChange={(v) => {
+                const next = v as typeof packScopeType
+                setPackScopeType(next)
+                if (next === 'global') setPackScopeId('global')
+                else if (next === 'env') setPackScopeId(envs[0]?.code ?? '')
+                else if (next === 'system') setPackScopeId(systems[0]?.id ?? '')
+                else setPackScopeId(targets[0]?.target.id ?? '')
+              }}
+              options={[
+                { value: 'global', label: 'global' },
+                { value: 'env', label: 'env' },
+                { value: 'system', label: 'system' },
+                { value: 'target', label: 'target' },
+              ]}
+            />
             {packScopeType !== 'global' && (
-              <div className="w-40">
-                <Select value={packScopeId} onValueChange={setPackScopeId}>
-                  <SelectTrigger size="sm">
-                    <SelectValue placeholder={t('patterns.col.scope')} />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {packScopeType === 'env' &&
-                      envs.map((e) => (
-                        <SelectItem key={e.code} value={e.code}>
-                          {e.code}
-                        </SelectItem>
-                      ))}
-                    {packScopeType === 'system' &&
-                      systems.map((s) => (
-                        <SelectItem key={s.id} value={s.id}>
-                          {s.slug}
-                        </SelectItem>
-                      ))}
-                    {packScopeType === 'target' &&
-                      targets.map((tg) => (
-                        <SelectItem key={tg.target.id} value={tg.target.id}>
-                          {tg.target.ref}
-                        </SelectItem>
-                      ))}
-                  </SelectContent>
-                </Select>
-              </div>
+              <FilterSelect
+                value={packScopeId}
+                onValueChange={setPackScopeId}
+                placeholder={t('patterns.col.scope')}
+                options={
+                  packScopeType === 'env'
+                    ? envs.map((e) => ({ value: e.code, label: e.code }))
+                    : packScopeType === 'system'
+                      ? systems.map((s) => ({ value: s.id, label: s.slug }))
+                      : targets.map((tg) => ({ value: tg.target.id, label: tg.target.ref }))
+                }
+              />
             )}
           </div>
         }
@@ -567,6 +548,7 @@ export function RiskPatternsPanel({
           loading={loading}
           searchPlaceholder={t('common.search')}
           emptyLabel={t('patterns.emptyRules')}
+          className="rounded-none border-0"
         />
       </Panel>
 

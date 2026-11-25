@@ -8,13 +8,13 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
+  FilterSelect,
   FormDialog,
   FormField,
   Input,
   LoadingButton,
   Notice,
   PageHeader,
-  Panel,
   Select,
   SelectContent,
   SelectItem,
@@ -538,8 +538,8 @@ export function CatalogTab({
           </StatusDot>
         ) : (
           <StatusDot tone="danger">
-            <span className="max-w-[110px] truncate font-mono text-xs text-red-700" title={p.error || t('catalog.unreachable')}>
-              {t('catalog.unreachable')}
+            <span className="max-w-[240px] truncate font-mono text-xs text-red-700" title={p.error || t('catalog.unreachable')}>
+              {p.error ? `${t('catalog.unreachable')}: ${p.error}` : t('catalog.unreachable')}
             </span>
           </StatusDot>
         )
@@ -893,50 +893,64 @@ export function CatalogTab({
         </TabsList>
 
         <TabsContent value="targets">
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="w-60">
-                <Input
-                  placeholder={t('catalog.searchPlaceholder')}
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
+          <DataTable
+            columns={targetColumns}
+            data={filteredTargets}
+            loading={loading}
+            manualFiltering
+            searchValue={searchQuery}
+            onSearchChange={setSearchQuery}
+            searchPlaceholder={t('catalog.searchPlaceholder')}
+            searchClearLabel={t('common.clearSearch')}
+            searchInputClassName="sm:w-72"
+            emptyLabel={t('catalog.empty.targets')}
+            toolbarLeft={
+              <>
+                <FilterSelect
+                  value={systemFilter}
+                  onValueChange={setSystemFilter}
+                  placeholder={t('catalog.filterSystem')}
+                  options={[
+                    { value: ALL_SYSTEMS, label: t('catalog.allSystems', { count: systems.length }) },
+                    ...systems.map((s) => ({ value: s.id, label: `${s.name} (${s.slug})` })),
+                  ]}
                 />
-              </div>
-              <div className="w-56">
-                <Select value={systemFilter} onValueChange={setSystemFilter}>
-                  <SelectTrigger>
-                    <SelectValue placeholder={t('catalog.filterSystem')} />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={ALL_SYSTEMS}>{t('catalog.allSystems', { count: systems.length })}</SelectItem>
-                    {systems.map((s) => (
-                      <SelectItem key={s.id} value={s.id}>
-                        {s.name} ({s.slug})
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-            <LoadingButton
-              variant="outline"
-              size="sm"
-              pending={testingAll}
-              disabled={targets.length === 0}
-              onClick={() => void runTestAll()}
-            >
-              <Wifi className="size-3.5" />
-              {t('catalog.testAll')}
-            </LoadingButton>
-          </div>
-          <Panel flush>
-            <DataTable columns={targetColumns} data={filteredTargets} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.targets')} />
-          </Panel>
+                {(searchQuery.trim() !== '' || systemFilter !== ALL_SYSTEMS) && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setSearchQuery('')
+                      setSystemFilter(ALL_SYSTEMS)
+                    }}
+                  >
+                    {t('common.reset')}
+                  </Button>
+                )}
+              </>
+            }
+            toolbarRight={
+              <LoadingButton
+                variant="outline"
+                size="sm"
+                pending={testingAll}
+                disabled={targets.length === 0}
+                onClick={() => void runTestAll()}
+              >
+                <Wifi className="size-3.5" />
+                {t('catalog.testAll')}
+              </LoadingButton>
+            }
+          />
         </TabsContent>
         <TabsContent value="systems">
-          <Panel flush>
-            <DataTable columns={systemColumns} data={systems} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.systems')} />
-          </Panel>
+          <DataTable
+            columns={systemColumns}
+            data={systems}
+            loading={loading}
+            searchPlaceholder={t('common.search')}
+            emptyLabel={t('catalog.empty.systems')}
+          />
         </TabsContent>
       </Tabs>
 
@@ -1668,27 +1682,50 @@ export function CatalogTab({
           </SheetHeader>
           <SheetBody>
             {resourceSheet && (
-              <div className="space-y-3">
-                <div className="flex justify-end">
-                  <Button size="sm" onClick={() => openResourceCreate(resourceSheet)}>
-                    <Plus className="size-3.5" />
-                    {resourceSheet === 'instances' && t('catalog.resources.newInstance')}
-                    {resourceSheet === 'networks' && t('catalog.resources.newNetwork')}
-                    {resourceSheet === 'credentials' && t('catalog.resources.newCredential')}
-                  </Button>
-                </div>
-                <Panel flush>
-                  {resourceSheet === 'instances' && (
-                    <DataTable columns={instanceColumns} data={instances} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.instances')} />
-                  )}
-                  {resourceSheet === 'networks' && (
-                    <DataTable columns={netColumns} data={networks} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.networks')} />
-                  )}
-                  {resourceSheet === 'credentials' && (
-                    <DataTable columns={credColumns} data={credentials} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.credentials')} />
-                  )}
-                </Panel>
-              </div>
+              <>
+                {resourceSheet === 'instances' && (
+                  <DataTable
+                    columns={instanceColumns}
+                    data={instances}
+                    searchPlaceholder={t('common.search')}
+                    emptyLabel={t('catalog.empty.instances')}
+                    toolbarRight={
+                      <Button size="sm" onClick={() => openResourceCreate('instances')}>
+                        <Plus className="size-3.5" />
+                        {t('catalog.resources.newInstance')}
+                      </Button>
+                    }
+                  />
+                )}
+                {resourceSheet === 'networks' && (
+                  <DataTable
+                    columns={netColumns}
+                    data={networks}
+                    searchPlaceholder={t('common.search')}
+                    emptyLabel={t('catalog.empty.networks')}
+                    toolbarRight={
+                      <Button size="sm" onClick={() => openResourceCreate('networks')}>
+                        <Plus className="size-3.5" />
+                        {t('catalog.resources.newNetwork')}
+                      </Button>
+                    }
+                  />
+                )}
+                {resourceSheet === 'credentials' && (
+                  <DataTable
+                    columns={credColumns}
+                    data={credentials}
+                    searchPlaceholder={t('common.search')}
+                    emptyLabel={t('catalog.empty.credentials')}
+                    toolbarRight={
+                      <Button size="sm" onClick={() => openResourceCreate('credentials')}>
+                        <Plus className="size-3.5" />
+                        {t('catalog.resources.newCredential')}
+                      </Button>
+                    }
+                  />
+                )}
+              </>
             )}
           </SheetBody>
         </SheetContent>

@@ -573,6 +573,8 @@ export const api = {
   listEnvironments: () => request<{ items: EnvironmentRecord[] }>('/api/v1/environments'),
   saveEnvironment: (e: EnvironmentRecord) =>
     request<EnvironmentRecord>('/api/v1/environments', { method: 'POST', body: JSON.stringify(e) }),
+  deleteEnvironment: (code: string) =>
+    request<{ deleted: boolean }>(`/api/v1/environments/${encodeURIComponent(code)}`, { method: 'DELETE' }),
 
   listNetworkProfiles: () => request<{ items: NetworkProfileRecord[] }>('/api/v1/network-profiles'),
   saveNetworkProfile: (n: Partial<NetworkProfileRecord>) =>

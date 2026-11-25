@@ -147,6 +147,7 @@ export function DriversTab() {
           data={drivers}
           searchPlaceholder={t('common.search')}
           emptyLabel={t('drivers.emptyDrivers')}
+          className="rounded-none border-0"
         />
       </Panel>
 
@@ -156,6 +157,7 @@ export function DriversTab() {
           data={plugins}
           searchPlaceholder={t('common.search')}
           emptyLabel={t('drivers.emptyPlugins')}
+          className="rounded-none border-0"
         />
       </Panel>
     </div>
