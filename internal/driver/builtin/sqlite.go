@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -67,11 +68,16 @@ func (d *SQLiteDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (d
 		_ = db.Close()
 		return nil, err
 	}
-	return &sqliteConn{
+	sc := &sqliteConn{
 		db:        db,
 		cfg:       cfg,
 		closeHook: driver.CloseOnce(cfg.CloseHook),
-	}, nil
+	}
+	if cfg.NegotiatedCapabilities != nil {
+		cp := *cfg.NegotiatedCapabilities
+		sc.caps.Store(&cp)
+	}
+	return sc, nil
 }
 
 func buildSQLiteDSN(cfg driver.ConnectionConfig) (string, error) {
@@ -147,6 +153,20 @@ type sqliteConn struct {
 	closeHook func() error
 	closeOnce sync.Once
 	closeErr  error
+	caps      atomic.Pointer[types.ServerCapabilities]
+}
+
+func (c *sqliteConn) Capabilities() *types.ServerCapabilities {
+	return c.caps.Load()
+}
+
+func (c *sqliteConn) ResetSession(ctx context.Context) error {
+	if c.db == nil {
+		return fmt.Errorf("sqlite db handle is closed")
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return c.db.PingContext(pingCtx)
 }
 
 func (c *sqliteConn) Ping(ctx context.Context) (types.PingResult, error) {
@@ -157,7 +177,16 @@ func (c *sqliteConn) Ping(ctx context.Context) (types.PingResult, error) {
 	if err != nil {
 		return types.PingResult{Engine: "sqlite", Reachable: false, LatencyMs: lat, Error: err.Error()}, err
 	}
-	return types.PingResult{Engine: "sqlite", Reachable: true, ServerVersion: ver, LatencyMs: lat}, nil
+	caps := driver.DetectServerCapabilities("sqlite", ver, driver.DialectHints{})
+	c.caps.Store(&caps)
+	return types.PingResult{
+		Engine:        "sqlite",
+		Dialect:       caps.Dialect,
+		Reachable:     true,
+		ServerVersion: ver,
+		Capabilities:  &caps,
+		LatencyMs:     lat,
+	}, nil
 }
 
 func (c *sqliteConn) ListDatabases(ctx context.Context) ([]string, error) {

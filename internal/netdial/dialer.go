@@ -211,9 +211,12 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 	return b.r.Read(p)
 }
 
-func buildSSHTunnel(ctx context.Context, np *types.NetworkProfile, cred secrets.ResolvedSecret, tlsMode string, tlsCfg *tls.Config) (DialResult, error) {
+func dialSSHClient(ctx context.Context, np *types.NetworkProfile, cred secrets.ResolvedSecret) (*ssh.Client, error) {
+	if np == nil {
+		return nil, fmt.Errorf("ssh_tunnel requires network profile")
+	}
 	if np.BastionHost == "" {
-		return DialResult{}, fmt.Errorf("ssh_tunnel requires bastion_host")
+		return nil, fmt.Errorf("ssh_tunnel requires bastion_host")
 	}
 	port := np.BastionPort
 	if port <= 0 {
@@ -224,7 +227,7 @@ func buildSSHTunnel(ctx context.Context, np *types.NetworkProfile, cred secrets.
 		user = cred.Username
 	}
 	if user == "" {
-		return DialResult{}, fmt.Errorf("ssh_tunnel requires bastion_user")
+		return nil, fmt.Errorf("ssh_tunnel requires bastion_user")
 	}
 
 	var authMethods []ssh.AuthMethod
@@ -233,7 +236,7 @@ func buildSSHTunnel(ctx context.Context, np *types.NetworkProfile, cred secrets.
 		if strings.Contains(cred.Secret, "PRIVATE KEY") {
 			signer, err := ssh.ParsePrivateKey([]byte(cred.Secret))
 			if err != nil {
-				return DialResult{}, fmt.Errorf("parse bastion private key: %w", err)
+				return nil, fmt.Errorf("parse bastion private key: %w", err)
 			}
 			authMethods = append(authMethods, ssh.PublicKeys(signer))
 		} else {
@@ -246,7 +249,7 @@ func buildSSHTunnel(ctx context.Context, np *types.NetworkProfile, cred secrets.
 		}
 	}
 	if len(authMethods) == 0 {
-		return DialResult{}, fmt.Errorf("ssh_tunnel requires bastion credential secret (password, private key, or SSH_AUTH_SOCK)")
+		return nil, fmt.Errorf("ssh_tunnel requires bastion credential secret (password, private key, or SSH_AUTH_SOCK)")
 	}
 
 	var hostKeyCallback ssh.HostKeyCallback
@@ -256,7 +259,7 @@ func buildSSHTunnel(ctx context.Context, np *types.NetworkProfile, cred secrets.
 			if agentConn != nil {
 				_ = agentConn.Close()
 			}
-			return DialResult{}, err
+			return nil, err
 		}
 		khPath := filepath.Join(home, ".ssh", "known_hosts")
 		cb, err := knownhosts.New(khPath)
@@ -264,7 +267,7 @@ func buildSSHTunnel(ctx context.Context, np *types.NetworkProfile, cred secrets.
 			if agentConn != nil {
 				_ = agentConn.Close()
 			}
-			return DialResult{}, fmt.Errorf("load known_hosts %s: %w", khPath, err)
+			return nil, fmt.Errorf("load known_hosts %s: %w", khPath, err)
 		}
 		hostKeyCallback = cb
 	} else {
@@ -284,7 +287,7 @@ func buildSSHTunnel(ctx context.Context, np *types.NetworkProfile, cred secrets.
 		if agentConn != nil {
 			_ = agentConn.Close()
 		}
-		return DialResult{}, fmt.Errorf("dial ssh bastion %s: %w", bastionAddr, err)
+		return nil, fmt.Errorf("dial ssh bastion %s: %w", bastionAddr, err)
 	}
 	c, chans, reqs, err := ssh.NewClientConn(rawConn, bastionAddr, cfg)
 	if err != nil {
@@ -292,12 +295,19 @@ func buildSSHTunnel(ctx context.Context, np *types.NetworkProfile, cred secrets.
 		if agentConn != nil {
 			_ = agentConn.Close()
 		}
-		return DialResult{}, fmt.Errorf("ssh handshake %s: %w", bastionAddr, err)
+		return nil, fmt.Errorf("ssh handshake %s: %w", bastionAddr, err)
 	}
 	if agentConn != nil {
 		_ = agentConn.Close()
 	}
-	client := ssh.NewClient(c, chans, reqs)
+	return ssh.NewClient(c, chans, reqs), nil
+}
+
+func buildSSHTunnel(ctx context.Context, np *types.NetworkProfile, cred secrets.ResolvedSecret, tlsMode string, tlsCfg *tls.Config) (DialResult, error) {
+	client, err := dialSSHClient(ctx, np, cred)
+	if err != nil {
+		return DialResult{}, err
+	}
 
 	var closeOnce sync.Once
 	var closeErr error

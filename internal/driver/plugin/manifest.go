@@ -14,7 +14,14 @@ import (
 	"github.com/x0c/agent-dbctl/internal/types"
 )
 
-const SupportedHostAPIVersion = 1
+const (
+	// MinHostAPIVersion is the minimum external plugin host API version supported.
+	MinHostAPIVersion = 1
+	// MaxHostAPIVersion is the latest external plugin host API version supported.
+	MaxHostAPIVersion = 2
+	// SupportedHostAPIVersion is the current default plugin host API version.
+	SupportedHostAPIVersion = MaxHostAPIVersion
+)
 
 // Manifest describes an external Tier-3 driver plugin on disk.
 type Manifest struct {
@@ -86,8 +93,8 @@ func verifyOnePlugin(dir, manifestPath string) DiscoveredPlugin {
 		dp.VerificationErr = "manifest missing required id, engine, or binary field"
 		return dp
 	}
-	if m.HostAPIVersion != SupportedHostAPIVersion {
-		dp.VerificationErr = fmt.Sprintf("incompatible host_api_version %d (supported: %d)", m.HostAPIVersion, SupportedHostAPIVersion)
+	if m.HostAPIVersion < MinHostAPIVersion || m.HostAPIVersion > MaxHostAPIVersion {
+		dp.VerificationErr = fmt.Sprintf("incompatible host_api_version %d (supported: %d..%d)", m.HostAPIVersion, MinHostAPIVersion, MaxHostAPIVersion)
 		return dp
 	}
 

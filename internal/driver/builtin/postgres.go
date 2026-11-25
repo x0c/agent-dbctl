@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -52,11 +53,16 @@ func (d *PostgresDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) 
 	if err != nil {
 		return nil, err
 	}
-	return &postgresConn{
+	pc := &postgresConn{
 		conn:      conn,
 		cfg:       cfg,
 		closeHook: driver.CloseOnce(cfg.CloseHook),
-	}, nil
+	}
+	if cfg.NegotiatedCapabilities != nil {
+		cp := *cfg.NegotiatedCapabilities
+		pc.caps.Store(&cp)
+	}
+	return pc, nil
 }
 
 func buildPGConfig(cfg driver.ConnectionConfig) (*pgx.ConnConfig, error) {
@@ -152,15 +158,35 @@ type postgresConn struct {
 	closeHook func() error
 	closeOnce sync.Once
 	closeErr  error
+	caps      atomic.Pointer[types.ServerCapabilities]
+}
+
+func (c *postgresConn) Capabilities() *types.ServerCapabilities {
+	return c.caps.Load()
+}
+
+func (c *postgresConn) ResetSession(ctx context.Context) error {
+	if c.conn == nil || c.conn.IsClosed() {
+		return fmt.Errorf("postgres connection is closed")
+	}
+	pgConn := c.conn.PgConn()
+	if pgConn == nil {
+		return fmt.Errorf("postgres underlying connection missing")
+	}
+	if txStatus := pgConn.TxStatus(); txStatus != 'I' {
+		return fmt.Errorf("postgres connection has non-idle transaction status %q", txStatus)
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return c.conn.Ping(pingCtx)
 }
 
 func (c *postgresConn) Ping(ctx context.Context) (types.PingResult, error) {
 	start := time.Now()
 	var ver string
-	err := c.conn.QueryRow(ctx, "SHOW server_version").Scan(&ver)
+	err := c.conn.QueryRow(ctx, "SELECT version()").Scan(&ver)
 	if err != nil {
-		// Some PG-wire compatible servers (e.g., Redshift or proxies) lack SHOW server_version.
-		if fallbackErr := c.conn.QueryRow(ctx, "SELECT version()").Scan(&ver); fallbackErr == nil {
+		if fallbackErr := c.conn.QueryRow(ctx, "SHOW server_version").Scan(&ver); fallbackErr == nil {
 			err = nil
 		}
 	}
@@ -168,7 +194,16 @@ func (c *postgresConn) Ping(ctx context.Context) (types.PingResult, error) {
 	if err != nil {
 		return types.PingResult{Engine: "postgres", Reachable: false, LatencyMs: lat, Error: err.Error()}, err
 	}
-	return types.PingResult{Engine: "postgres", Reachable: true, ServerVersion: ver, LatencyMs: lat}, nil
+	caps := driver.DetectServerCapabilities("postgres", ver, driver.DialectHints{})
+	c.caps.Store(&caps)
+	return types.PingResult{
+		Engine:        "postgres",
+		Dialect:       caps.Dialect,
+		Reachable:     true,
+		ServerVersion: ver,
+		Capabilities:  &caps,
+		LatencyMs:     lat,
+	}, nil
 }
 
 func (c *postgresConn) ListDatabases(ctx context.Context) ([]string, error) {
@@ -203,6 +238,10 @@ func (c *postgresConn) Preflight(ctx context.Context, raw string, _ driver.Prefl
 		return report, nil
 	}
 
+	if caps := c.Capabilities(); caps != nil && caps.SupportsExplain && !caps.SupportsExplainJSON {
+		return c.preflightPGText(ctx, raw, report, nil)
+	}
+
 	var jsonStr string
 	if err := c.conn.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+raw).Scan(&jsonStr); err == nil {
 		var nodes []map[string]any
@@ -216,27 +255,41 @@ func (c *postgresConn) Preflight(ctx context.Context, raw string, _ driver.Prefl
 		return report, nil
 	} else {
 		// Fallback for older PostgreSQL (<9.0) or PG-wire engines without FORMAT JSON.
-		rows, textErr := c.conn.Query(ctx, "EXPLAIN "+raw)
-		if textErr != nil {
-			report.Warnings = append(report.Warnings, "EXPLAIN failed: "+err.Error())
-			return report, nil
+		return c.preflightPGText(ctx, raw, report, err)
+	}
+}
+
+func (c *postgresConn) preflightPGText(ctx context.Context, raw string, report *types.PreflightReport, jsonErr error) (*types.PreflightReport, error) {
+	rows, textErr := c.conn.Query(ctx, "EXPLAIN "+raw)
+	if textErr != nil {
+		msgErr := textErr
+		if jsonErr != nil {
+			msgErr = jsonErr
 		}
-		defer rows.Close()
-		var lines []string
-		for rows.Next() {
-			var line string
-			if scanErr := rows.Scan(&line); scanErr == nil {
-				lines = append(lines, line)
-			}
-		}
-		if rows.Err() != nil || len(lines) == 0 {
-			report.Warnings = append(report.Warnings, "EXPLAIN failed: "+err.Error())
-			return report, nil
-		}
-		report.Format = "pg_text"
-		parsePGTextPlan(lines, report)
+		report.Warnings = append(report.Warnings, "EXPLAIN failed: "+msgErr.Error())
 		return report, nil
 	}
+	defer rows.Close()
+	var lines []string
+	for rows.Next() {
+		var line string
+		if scanErr := rows.Scan(&line); scanErr == nil {
+			lines = append(lines, line)
+		}
+	}
+	if rows.Err() != nil || len(lines) == 0 {
+		msgErr := rows.Err()
+		if jsonErr != nil {
+			msgErr = jsonErr
+		}
+		if msgErr != nil {
+			report.Warnings = append(report.Warnings, "EXPLAIN failed: "+msgErr.Error())
+		}
+		return report, nil
+	}
+	report.Format = "pg_text"
+	parsePGTextPlan(lines, report)
+	return report, nil
 }
 
 func walkPGPlan(node map[string]any, report *types.PreflightReport) {

@@ -251,14 +251,35 @@ type DisplayCatalog struct {
 	ApprovalProviders []DisplayMetaItem `json:"approval_providers"`
 }
 
+// ServerCapabilities describes negotiated dialect and feature flags detected from a live server.
+type ServerCapabilities struct {
+	Engine                   string `json:"engine"`
+	Dialect                  string `json:"dialect"`
+	ServerVersion            string `json:"server_version,omitempty"`
+	MajorVersion             int    `json:"major_version,omitempty"`
+	MinorVersion             int    `json:"minor_version,omitempty"`
+	ExplainFormat            string `json:"explain_format,omitempty"`
+	SupportsExplain          bool   `json:"supports_explain"`
+	SupportsExplainJSON      bool   `json:"supports_explain_json"`
+	SupportsReadOnlySession  bool   `json:"supports_read_only_session"`
+	SupportsCancelQuery      bool   `json:"supports_cancel_query"`
+	SupportsReturning        bool   `json:"supports_returning"`
+	SupportsRESP3            bool   `json:"supports_resp3,omitempty"`
+	ClusterMode              bool   `json:"cluster_mode,omitempty"`
+	SupportsAuthorizedDBList bool   `json:"supports_authorized_db_list,omitempty"`
+	DetectedAtUTC            string `json:"detected_at_utc,omitempty"`
+}
+
 // PingResult reports database connectivity probe outcome.
 type PingResult struct {
-	TargetRef     string `json:"target_ref"`
-	InstanceID    string `json:"instance_id"`
-	Engine        string `json:"engine"`
-	Role          string `json:"role"`
-	Reachable     bool   `json:"reachable"`
-	ServerVersion string `json:"server_version,omitempty"`
-	LatencyMs     int64  `json:"latency_ms"`
-	Error         string `json:"error,omitempty"`
+	TargetRef     string              `json:"target_ref"`
+	InstanceID    string              `json:"instance_id"`
+	Engine        string              `json:"engine"`
+	Dialect       string              `json:"dialect,omitempty"`
+	Role          string              `json:"role"`
+	Reachable     bool                `json:"reachable"`
+	ServerVersion string              `json:"server_version,omitempty"`
+	Capabilities  *ServerCapabilities `json:"capabilities,omitempty"`
+	LatencyMs     int64               `json:"latency_ms"`
+	Error         string              `json:"error,omitempty"`
 }

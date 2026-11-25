@@ -15,18 +15,29 @@ import (
 
 // ConnectionConfig carries resolved endpoint, dialer, TLS, and credential info into a Driver.
 type ConnectionConfig struct {
-	Engine       string
-	Host         string
-	Port         int
-	DatabaseName string
-	Params       map[string]string
-	ReadOnly     bool
-	Credential      secrets.ResolvedSecret
-	DialContext     func(ctx context.Context, network, addr string) (net.Conn, error)
-	NeedsDialBridge bool
-	TLSMode         string
-	TLSConfig       *tls.Config
-	CloseHook       func() error
+	Engine                 string
+	Host                   string
+	Port                   int
+	DatabaseName           string
+	Params                 map[string]string
+	ReadOnly               bool
+	Credential             secrets.ResolvedSecret
+	DialContext            func(ctx context.Context, network, addr string) (net.Conn, error)
+	NeedsDialBridge        bool
+	TLSMode                string
+	TLSConfig              *tls.Config
+	CloseHook              func() error
+	NegotiatedCapabilities *types.ServerCapabilities
+}
+
+// DialectAwareConn is optionally implemented by connections that cache negotiated server capabilities.
+type DialectAwareConn interface {
+	Capabilities() *types.ServerCapabilities
+}
+
+// SessionResetter is optionally implemented by connections to validate and reset session state before pool reuse.
+type SessionResetter interface {
+	ResetSession(ctx context.Context) error
 }
 
 // CloseOnce wraps fn so repeated Close/CancelAndDiscard calls invoke it at most once.

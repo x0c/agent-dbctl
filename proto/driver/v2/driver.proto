@@ -1,0 +1,182 @@
+syntax = "proto3";
+
+package driver.v2;
+
+option go_package = "github.com/x0c/agent-dbctl/internal/driver/plugin/v2pb;v2pb";
+
+service DriverPlugin {
+  rpc Metadata(Empty) returns (DriverMetadata);
+  rpc Ping(TargetSpec) returns (PingResult);
+  rpc ListDatabases(TargetSpec) returns (DatabaseList);
+  rpc Classify(ClassifyRequest) returns (Classification);
+  rpc Preflight(PreflightRequest) returns (PreflightReport);
+  rpc Execute(ExecuteRequest) returns (stream ExecuteChunk);
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+}
+
+message Empty {}
+
+message TypedValue {
+  oneof kind {
+    bool null_value = 1;
+    bool bool_value = 2;
+    int64 int64_value = 3;
+    uint64 uint64_value = 4;
+    double float64_value = 5;
+    string string_value = 6;
+    bytes bytes_value = 7;
+    ListValue list_value = 8;
+    StructValue struct_value = 9;
+    bytes json_value = 10;
+  }
+}
+
+message ListValue {
+  repeated TypedValue values = 1;
+}
+
+message StructValue {
+  map<string, TypedValue> fields = 1;
+}
+
+message Row {
+  repeated TypedValue values = 1;
+}
+
+message Column {
+  string name = 1;
+  string type_name = 2;
+}
+
+message DriverMetadata {
+  string id = 1;
+  string engine = 2;
+  string display_name = 3;
+  string family = 4;
+  string tier = 5;
+  string version = 6;
+  int32 host_api_version = 7;
+  repeated string capabilities = 8;
+  bool verified = 9;
+  string verification_error = 10;
+  map<string, string> labels = 11;
+}
+
+message TargetSpec {
+  string engine = 1;
+  string host = 2;
+  int32 port = 3;
+  string database_name = 4;
+  string username = 5;
+  string password = 6;
+  bool read_only = 7;
+  string tls_mode = 8;
+  map<string, string> params = 9;
+}
+
+message ServerCapabilities {
+  string engine = 1;
+  string dialect = 2;
+  string server_version = 3;
+  int32 major_version = 4;
+  int32 minor_version = 5;
+  string explain_format = 6;
+  bool supports_explain = 7;
+  bool supports_explain_json = 8;
+  bool supports_read_only_session = 9;
+  bool supports_cancel_query = 10;
+  bool supports_returning = 11;
+  bool supports_resp3 = 12;
+  bool cluster_mode = 13;
+  bool supports_authorized_db_list = 14;
+  string detected_at_utc = 15;
+}
+
+message PingResult {
+  string target_ref = 1;
+  string instance_id = 2;
+  string engine = 3;
+  string dialect = 4;
+  string role = 5;
+  bool reachable = 6;
+  string server_version = 7;
+  ServerCapabilities capabilities = 8;
+  int64 latency_ms = 9;
+  string error = 10;
+}
+
+message DatabaseList {
+  repeated string databases = 1;
+}
+
+message ClassifyRequest {
+  string raw = 1;
+}
+
+message StatementSummary {
+  string statement_type = 1;
+  string risk_level = 2;
+  repeated string flags = 3;
+  string snippet = 4;
+}
+
+message Classification {
+  string engine = 1;
+  string family = 2;
+  string risk_level = 3;
+  bool is_read_only = 4;
+  int32 statement_count = 5;
+  repeated StatementSummary statements = 6;
+  repeated string risk_flags = 7;
+  string summary = 8;
+}
+
+message PreflightRequest {
+  TargetSpec spec = 1;
+  string raw = 2;
+}
+
+message PreflightReport {
+  bool supported = 1;
+  bool executed = 2;
+  bool full_scan = 3;
+  int64 estimated_rows = 4;
+  string format = 5;
+  string plan_summary = 6;
+  bytes plan_raw_json = 7;
+  repeated string warnings = 8;
+}
+
+message ExecuteRequest {
+  string operation_id = 1;
+  TargetSpec spec = 2;
+  string raw = 3;
+  int32 max_rows = 4;
+  int64 max_bytes = 5;
+}
+
+message ExecuteChunk {
+  string kind = 1;
+  string family = 2;
+  repeated Column columns = 3;
+  repeated Row rows = 4;
+  repeated TypedValue documents = 5;
+  TypedValue kv_result = 6;
+  string raw_text = 7;
+  optional int64 affected_rows = 8;
+  int32 fetched_rows = 9;
+  bool truncated = 10;
+  string cutoff_reason = 11;
+  repeated string messages = 12;
+  int64 latency_ms = 13;
+  string error = 14;
+}
+
+message CancelRequest {
+  string operation_id = 1;
+}
+
+message CancelResponse {
+  bool cancelled = 1;
+  string message = 2;
+}

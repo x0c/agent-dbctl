@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -68,13 +69,18 @@ func (d *MySQLDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (dr
 	var connID uint64
 	_ = db.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&connID)
 
-	return &mysqlConn{
+	mc := &mysqlConn{
 		db:        db,
 		connector: baseConn,
 		connID:    connID,
 		cfg:       cfg,
 		closeHook: driver.CloseOnce(cfg.CloseHook),
-	}, nil
+	}
+	if cfg.NegotiatedCapabilities != nil {
+		cp := *cfg.NegotiatedCapabilities
+		mc.caps.Store(&cp)
+	}
+	return mc, nil
 }
 
 func buildMySQLConfig(cfg driver.ConnectionConfig) (*mysql.Config, error) {
@@ -184,6 +190,20 @@ type mysqlConn struct {
 	closeHook func() error
 	closeOnce sync.Once
 	closeErr  error
+	caps      atomic.Pointer[types.ServerCapabilities]
+}
+
+func (c *mysqlConn) Capabilities() *types.ServerCapabilities {
+	return c.caps.Load()
+}
+
+func (c *mysqlConn) ResetSession(ctx context.Context) error {
+	if c.db == nil {
+		return fmt.Errorf("mysql db handle is closed")
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return c.db.PingContext(pingCtx)
 }
 
 func (c *mysqlConn) Ping(ctx context.Context) (types.PingResult, error) {
@@ -194,7 +214,16 @@ func (c *mysqlConn) Ping(ctx context.Context) (types.PingResult, error) {
 	if err != nil {
 		return types.PingResult{Engine: "mysql", Reachable: false, LatencyMs: lat, Error: err.Error()}, err
 	}
-	return types.PingResult{Engine: "mysql", Reachable: true, ServerVersion: ver, LatencyMs: lat}, nil
+	caps := driver.DetectServerCapabilities("mysql", ver, driver.DialectHints{})
+	c.caps.Store(&caps)
+	return types.PingResult{
+		Engine:        "mysql",
+		Dialect:       caps.Dialect,
+		Reachable:     true,
+		ServerVersion: ver,
+		Capabilities:  &caps,
+		LatencyMs:     lat,
+	}, nil
 }
 
 func (c *mysqlConn) ListDatabases(ctx context.Context) ([]string, error) {
@@ -225,6 +254,9 @@ func (c *mysqlConn) Preflight(ctx context.Context, raw string, _ driver.Prefligh
 		report.Warnings = append(report.Warnings, "EXPLAIN skipped for non-read or multi-statement SQL")
 		return report, nil
 	}
+	if caps := c.Capabilities(); caps != nil && caps.SupportsExplain && !caps.SupportsExplainJSON {
+		return c.preflightMySQLTabular(ctx, raw, report, nil)
+	}
 	var jsonStr string
 	if err := c.db.QueryRowContext(ctx, "EXPLAIN FORMAT=JSON "+raw).Scan(&jsonStr); err == nil {
 		var parsed map[string]any
@@ -236,21 +268,33 @@ func (c *mysqlConn) Preflight(ctx context.Context, raw string, _ driver.Prefligh
 		}
 	} else {
 		// Fallback to classic tabular EXPLAIN for MySQL 5.5, older MariaDB, or TiDB.
-		rows, tabErr := c.db.QueryContext(ctx, "EXPLAIN "+raw)
-		if tabErr != nil {
-			report.Warnings = append(report.Warnings, "EXPLAIN failed: "+err.Error())
-			return report, nil
+		return c.preflightMySQLTabular(ctx, raw, report, err)
+	}
+	return report, nil
+}
+
+func (c *mysqlConn) preflightMySQLTabular(ctx context.Context, raw string, report *types.PreflightReport, jsonErr error) (*types.PreflightReport, error) {
+	rows, tabErr := c.db.QueryContext(ctx, "EXPLAIN "+raw)
+	if tabErr != nil {
+		msgErr := tabErr
+		if jsonErr != nil {
+			msgErr = jsonErr
 		}
-		defer func() { _ = rows.Close() }()
-		tabRes, collectErr := collectSQLRows(rows, driver.ExecOpts{MaxRows: 100})
-		if collectErr != nil {
-			report.Warnings = append(report.Warnings, "EXPLAIN failed: "+err.Error())
-			return report, nil
-		}
-		report.Format = "mysql_tabular"
-		parseMySQLTabularPlan(tabRes, report)
+		report.Warnings = append(report.Warnings, "EXPLAIN failed: "+msgErr.Error())
 		return report, nil
 	}
+	defer func() { _ = rows.Close() }()
+	tabRes, collectErr := collectSQLRows(rows, driver.ExecOpts{MaxRows: 100})
+	if collectErr != nil {
+		msgErr := collectErr
+		if jsonErr != nil {
+			msgErr = jsonErr
+		}
+		report.Warnings = append(report.Warnings, "EXPLAIN failed: "+msgErr.Error())
+		return report, nil
+	}
+	report.Format = "mysql_tabular"
+	parseMySQLTabularPlan(tabRes, report)
 	return report, nil
 }
 

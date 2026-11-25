@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -61,12 +62,17 @@ func (d *MongoDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (dr
 	if dbName == "" {
 		dbName = "admin"
 	}
-	return &mongoConn{
+	mc := &mongoConn{
 		client:    client,
 		dbName:    dbName,
 		cfg:       cfg,
 		closeHook: driver.CloseOnce(cfg.CloseHook),
-	}, nil
+	}
+	if cfg.NegotiatedCapabilities != nil {
+		cp := *cfg.NegotiatedCapabilities
+		mc.caps.Store(&cp)
+	}
+	return mc, nil
 }
 
 func buildMongoClientOptions(cfg driver.ConnectionConfig) (*options.ClientOptions, error) {
@@ -183,6 +189,20 @@ type mongoConn struct {
 	closeHook func() error
 	closeOnce sync.Once
 	closeErr  error
+	caps      atomic.Pointer[types.ServerCapabilities]
+}
+
+func (c *mongoConn) Capabilities() *types.ServerCapabilities {
+	return c.caps.Load()
+}
+
+func (c *mongoConn) ResetSession(ctx context.Context) error {
+	if c.client == nil {
+		return fmt.Errorf("mongodb client is closed")
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return c.client.Ping(pingCtx, nil)
 }
 
 func (c *mongoConn) Ping(ctx context.Context) (types.PingResult, error) {
@@ -191,7 +211,17 @@ func (c *mongoConn) Ping(ctx context.Context) (types.PingResult, error) {
 	err := c.client.Database("admin").RunCommand(ctx, bson.D{{Key: "buildInfo", Value: 1}}).Decode(&info)
 	if err == nil {
 		ver, _ := info["version"].(string)
-		return types.PingResult{Engine: "mongodb", Reachable: true, ServerVersion: ver, LatencyMs: time.Since(start).Milliseconds()}, nil
+		hints := driver.DialectHints{BuildInfoModules: extractStringSlice(info["modules"])}
+		caps := driver.DetectServerCapabilities("mongodb", ver, hints)
+		c.caps.Store(&caps)
+		return types.PingResult{
+			Engine:        "mongodb",
+			Dialect:       caps.Dialect,
+			Reachable:     true,
+			ServerVersion: ver,
+			Capabilities:  &caps,
+			LatencyMs:     time.Since(start).Milliseconds(),
+		}, nil
 	}
 
 	// Shared Atlas tiers, DocumentDB, or restricted roles may block buildInfo.
@@ -200,17 +230,58 @@ func (c *mongoConn) Ping(ctx context.Context) (types.PingResult, error) {
 		return types.PingResult{Engine: "mongodb", Reachable: false, LatencyMs: time.Since(start).Milliseconds(), Error: pingErr.Error()}, pingErr
 	}
 	var ver string
+	var maxWire int
 	var helloOut bson.M
 	if hErr := c.client.Database(c.dbName).RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&helloOut); hErr == nil {
 		if mw, ok := helloOut["maxWireVersion"]; ok {
 			ver = fmt.Sprintf("wire_v%v", mw)
+			if n, ok := asInt64(mw); ok {
+				maxWire = int(n)
+			}
 		}
 	} else if imErr := c.client.Database(c.dbName).RunCommand(ctx, bson.D{{Key: "isMaster", Value: 1}}).Decode(&helloOut); imErr == nil {
 		if mw, ok := helloOut["maxWireVersion"]; ok {
 			ver = fmt.Sprintf("wire_v%v", mw)
+			if n, ok := asInt64(mw); ok {
+				maxWire = int(n)
+			}
 		}
 	}
-	return types.PingResult{Engine: "mongodb", Reachable: true, ServerVersion: ver, LatencyMs: time.Since(start).Milliseconds()}, nil
+	caps := driver.DetectServerCapabilities("mongodb", ver, driver.DialectHints{MaxWireVersion: maxWire})
+	c.caps.Store(&caps)
+	return types.PingResult{
+		Engine:        "mongodb",
+		Dialect:       caps.Dialect,
+		Reachable:     true,
+		ServerVersion: ver,
+		Capabilities:  &caps,
+		LatencyMs:     time.Since(start).Milliseconds(),
+	}, nil
+}
+
+func extractStringSlice(v any) []string {
+	switch xs := v.(type) {
+	case []string:
+		return xs
+	case bson.A:
+		out := make([]string, 0, len(xs))
+		for _, item := range xs {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(xs))
+		for _, item := range xs {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func (c *mongoConn) ListDatabases(ctx context.Context) ([]string, error) {

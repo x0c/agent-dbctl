@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -49,12 +50,17 @@ func (d *RedisDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (dr
 		_ = client.Close()
 		return nil, err
 	}
-	return &redisConn{
+	rc := &redisConn{
 		client:    client,
 		cluster:   isCluster,
 		cfg:       cfg,
 		closeHook: driver.CloseOnce(cfg.CloseHook),
-	}, nil
+	}
+	if cfg.NegotiatedCapabilities != nil {
+		cp := *cfg.NegotiatedCapabilities
+		rc.caps.Store(&cp)
+	}
+	return rc, nil
 }
 
 func buildRedisOptions(cfg driver.ConnectionConfig) (*redis.UniversalOptions, bool, error) {
@@ -142,6 +148,20 @@ type redisConn struct {
 	closeHook func() error
 	closeOnce sync.Once
 	closeErr  error
+	caps      atomic.Pointer[types.ServerCapabilities]
+}
+
+func (c *redisConn) Capabilities() *types.ServerCapabilities {
+	return c.caps.Load()
+}
+
+func (c *redisConn) ResetSession(ctx context.Context) error {
+	if c.client == nil {
+		return fmt.Errorf("redis client is closed")
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return c.client.Ping(pingCtx).Err()
 }
 
 func (c *redisConn) Ping(ctx context.Context) (types.PingResult, error) {
@@ -153,15 +173,42 @@ func (c *redisConn) Ping(ctx context.Context) (types.PingResult, error) {
 
 	// Best-effort INFO server; ACL-restricted or serverless Redis/Valkey may deny INFO while allowing PING.
 	ver := ""
-	if info, err := c.client.Info(ctx, "server").Result(); err == nil {
-		for _, line := range strings.Split(info, "\n") {
-			if strings.HasPrefix(line, "redis_version:") {
-				ver = strings.TrimSpace(strings.TrimPrefix(line, "redis_version:"))
-				break
-			}
+	info := ""
+	if rawInfo, err := c.client.Info(ctx, "server").Result(); err == nil {
+		info = rawInfo
+		ver = parseRedisServerInfo(rawInfo)
+	}
+	caps := driver.DetectServerCapabilities("redis", ver, driver.DialectHints{
+		ClusterMode: c.cluster,
+		InfoServer:  info,
+	})
+	c.caps.Store(&caps)
+	return types.PingResult{
+		Engine:        "redis",
+		Dialect:       caps.Dialect,
+		Reachable:     true,
+		ServerVersion: caps.ServerVersion,
+		Capabilities:  &caps,
+		LatencyMs:     lat,
+	}, nil
+}
+
+func parseRedisServerInfo(info string) string {
+	var redisVer string
+	for _, line := range strings.Split(info, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "valkey_version:"):
+			return strings.TrimSpace(strings.TrimPrefix(line, "valkey_version:"))
+		case strings.HasPrefix(line, "dragonfly_version:"):
+			return strings.TrimSpace(strings.TrimPrefix(line, "dragonfly_version:"))
+		case strings.HasPrefix(line, "keydb_version:"):
+			return strings.TrimSpace(strings.TrimPrefix(line, "keydb_version:"))
+		case strings.HasPrefix(line, "redis_version:"):
+			redisVer = strings.TrimSpace(strings.TrimPrefix(line, "redis_version:"))
 		}
 	}
-	return types.PingResult{Engine: "redis", Reachable: true, ServerVersion: ver, LatencyMs: lat}, nil
+	return redisVer
 }
 
 func (c *redisConn) ListDatabases(ctx context.Context) ([]string, error) {

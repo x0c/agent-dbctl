@@ -19,9 +19,15 @@ const (
 	PluginMapKey         = "driver"
 )
 
-// Handshake is the shared plugin handshake configuration.
+// Handshake is the shared v1 plugin handshake configuration.
 var Handshake = plugin.HandshakeConfig{
 	ProtocolVersion:  1,
+	MagicCookieKey:   HandshakeCookieKey,
+	MagicCookieValue: HandshakeCookieValue,
+}
+
+// VersionedHandshake is used with go-plugin VersionedPlugins to negotiate v1 or v2.
+var VersionedHandshake = plugin.HandshakeConfig{
 	MagicCookieKey:   HandshakeCookieKey,
 	MagicCookieValue: HandshakeCookieValue,
 }
@@ -65,6 +71,13 @@ type Service interface {
 	Classify(ctx context.Context, raw string) (types.Classification, error)
 	Preflight(ctx context.Context, spec TargetSpec, raw string) (*types.PreflightReport, error)
 	ExecuteStream(ctx context.Context, spec TargetSpec, raw string, maxRows int, maxBytes int64, onChunk func(ExecuteChunk) error) error
+}
+
+// CancelableService extends Service with v2 operation-ID execution tracking and out-of-band Cancel RPCs.
+type CancelableService interface {
+	Service
+	ExecuteStreamWithOp(ctx context.Context, opID string, spec TargetSpec, raw string, maxRows int, maxBytes int64, onChunk func(ExecuteChunk) error) error
+	Cancel(ctx context.Context, opID string) (bool, string, error)
 }
 
 // GRPCPlugin adapts Service to hashicorp/go-plugin's GRPCPlugin.

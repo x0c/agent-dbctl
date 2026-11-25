@@ -2,7 +2,7 @@
 
 ## 1. Tier-3 External Driver Plugins (`hashicorp/go-plugin` over gRPC)
 
-External database drivers run as isolated child processes managed via `hashicorp/go-plugin` using gRPC transport (`proto/driver/v1/driver.proto`). There is **zero JVM dependency**; plugins may be implemented in Go, Rust, Python, C++, or any language supporting gRPC.
+External database drivers run as isolated child processes managed via `hashicorp/go-plugin` over gRPC transport using either `proto/driver/v1/driver.proto` (`host_api_version: 1`) or typed `proto/driver/v2/driver.proto` (`host_api_version: 2`). There is **zero JVM dependency**; plugins may be implemented in Go, Rust, Python, C++, or any language supporting gRPC.
 
 ### Discovery & `manifest.json`
 
@@ -23,40 +23,42 @@ Plugins live under `<config_home>/plugins/<plugin-id>/`:
   "engine": "sqlite-ext",
   "display_name": "External SQLite Plugin",
   "family": "sql",
-  "version": "0.1.0",
-  "host_api_version": 1,
+  "version": "0.2.0",
+  "host_api_version": 2,
   "binary": "agent-dbctl-plugin-sqlite",
   "sha256": "<lowercase-64-hex-sha256>",
-  "capabilities": ["ping", "list_databases", "preflight", "execute_stream"]
+  "capabilities": ["ping", "list_databases", "preflight", "execute_stream", "cancel"]
 }
 ```
 
-### Verification Rules
+### Verification Rules & Capability Dispatch
 
-1. **Host API compatibility**: `host_api_version` must match the supported host API (`1`). Incompatible manifests are marked invalid in `plugin list`/`doctor` and never spawned.
-2. **SHA-256 verification**: Before spawning a plugin binary, the host computes its SHA-256 digest and rejects mismatches with `plugin_invalid` (blocking symlinked binaries outside the plugin directory).
-3. **Crash isolation**: A panic or segfault inside a plugin process terminates only that subprocess without crashing the daemon or corrupting other database connections.
+1. **Host API compatibility**: `host_api_version` must be within the supported range (`1..2`). The host negotiates the manifest-declared protocol version explicitly via `hashicorp/go-plugin` `VersionedPlugins` and rejects mismatched negotiations or incompatible manifests in `plugin list`/`doctor` without spawning.
+2. **SHA-256 verification**: Before spawning a plugin binary (and again right before spawn to prevent TOCTOU swaps), the host computes its SHA-256 digest and rejects mismatches with `plugin_invalid` (blocking symlinked binaries outside the plugin directory).
+3. **Capability-gated host dispatch**: Declared `capabilities` govern host RPC routing:
+   - `ListDatabases` is blocked before RPC dispatch unless `"list_databases"` is declared.
+   - `Preflight` returns an explicit unsupported warning without making an RPC unless `"preflight"` is declared.
+   - Out-of-band query `Cancel` is issued by `CancelAndDiscard()` only when `"cancel"` is declared on a `v2` plugin.
+   - Legacy `v1` manifests that omit `capabilities` retain backward-compatible dispatch.
+4. **Crash isolation**: A panic or segfault inside a plugin process terminates only that subprocess without crashing the daemon or corrupting other database connections.
 
-### gRPC Service Contract (`driver.v1.DriverPlugin`)
+### Typed gRPC Service Contract (`driver.v2.DriverPlugin`)
 
-Defined in [proto/driver/v1/driver.proto](proto/driver/v1/driver.proto):
+Defined in [proto/driver/v2/driver.proto](proto/driver/v2/driver.proto) (generated Go stubs in `internal/driver/plugin/v2pb`):
 
-- `Metadata(Empty) -> DriverMetadata`: Reports engine name, family (`sql` | `document` | `kv` | `raw`), version, and capabilities.
-- `Ping(TargetSpec) -> PingResult`: Verifies connectivity and returns server version + latency.
-- `ListDatabases(TargetSpec) -> DatabaseList`: Enumerates logical databases/schemas on an instance.
+- **Lossless `TypedValue` `oneof`**: Encodes `null`, `bool`, signed `int64`, unsigned `uint64`, `float64` (sanitizing `NaN`/`±Inf`), `string`, `bytes`, nested `ListValue`/`StructValue`, and fallback JSON bytes without `google.protobuf.Struct` `float64` precision loss on 64-bit integer keys above $2^{53}$.
+- `Metadata(Empty) -> DriverMetadata`: Reports engine name, family (`sql` | `document` | `kv` | `raw`), version, `host_api_version`, and capabilities.
+- `Ping(TargetSpec) -> PingResult`: Verifies connectivity and returns `dialect`, `server_version`, `ServerCapabilities`, and `latency_ms`.
+- `ListDatabases(TargetSpec) -> DatabaseList`: Enumerates logical databases/schemas on an instance (gated on `"list_databases"`).
 - `Classify(ClassifyRequest) -> Classification`: Classifies raw query/command (`safe_read`, `high_cost_read`, `write`, `ddl`, `admin`, `unknown`) and risk flags.
-- `Preflight(PreflightRequest) -> PreflightReport`: Runs non-mutating execution-plan inspection (`EXPLAIN` without `ANALYZE`).
-- `Execute(ExecuteRequest) -> stream ExecuteChunk`: Streams columns, row/document batches, `affected_rows`, server messages, and final summary (`fetched_rows`, `truncated`, `cutoff_reason`, `latency_ms`) so large result sets can be capped cleanly at `max_rows` / `max_bytes` without OOM or lost truncation status.
+- `Preflight(PreflightRequest) -> PreflightReport`: Runs non-mutating execution-plan inspection (`EXPLAIN` without `ANALYZE`, gated on `"preflight"`).
+- `Execute(ExecuteRequest) -> stream ExecuteChunk`: Associates each execution with a host-generated `operation_id` and streams typed columns, `Row` batches, documents, `kv_result`, `affected_rows`, server messages, and final truncation metadata (`fetched_rows`, `truncated`, `cutoff_reason`, `latency_ms`).
+- `Cancel(CancelRequest) -> CancelResponse`: Out-of-band cancellation RPC invoked by host `CancelAndDiscard()` to abort an active in-flight query by `operation_id` before closing the local stream and loopback dial bridge.
 - **Network Tunnel & TLS Forwarding**: `TargetSpec` carries `tls_mode`, and when the host configures a bastion/proxy `DialContext`, the host opens an ephemeral per-connection `127.0.0.1` TCP forwarder and rewrites `TargetSpec.Host`/`Port` to the local listener so plugins work transparently across SSH tunnels and proxies without embedding proxy/SSH logic.
 
-### Known `v1` Limitations & Pending `v2` Protocol Roadmap
+### Legacy `v1` Compatibility (`driver.v1.DriverPlugin`)
 
-- **Current `v1` Limitations**:
-  - `proto/driver/v1/driver.proto` transports payloads through `google.protobuf.Struct` + JSON marshaling, which converts JSON numbers through `float64` and loses precision on 64-bit integer keys above $2^{53}$.
-  - Host-side `CancelAndDiscard()` closes the local stream and dial bridge, but `v1` has no explicit out-of-band `Cancel` RPC to abort an already-running backend query inside a plugin subprocess.
-  - `Preflight` and `ListDatabases` are dispatched even if a plugin omits those flags from `manifest.json` `capabilities`.
-- **Pending `driver.v2.DriverPlugin` Roadmap (Unimplemented Design Decision)**:
-  - Introduce typed Protobuf messages (native `int64`, `bytes`, typed value `oneof`) alongside `host_api_version: 2`, an explicit `Cancel(OperationRef)` RPC / stateful session handle, and capability-gated host dispatch (`capabilities` enforcement before RPC calls).
+Defined in [proto/driver/v1/driver.proto](proto/driver/v1/driver.proto) using `google.protobuf.Struct` for backward compatibility with `host_api_version: 1` plugins. Dual-mode plugins (such as `cmd/agent-dbctl-plugin-sqlite`) serve both `{1: GRPCPlugin, 2: GRPCPluginV2}` under `VersionedHandshake` and `VersionedPlugins`, while legacy `v1`-only binaries remain supported with `host_api_version: 1` (without lossless 64-bit integer typing or out-of-band `Cancel` RPC).
 
 ---
 

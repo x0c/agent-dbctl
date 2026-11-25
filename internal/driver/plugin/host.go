@@ -9,7 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -33,9 +35,10 @@ type Manager struct {
 }
 
 type hostedPlugin struct {
-	info   DiscoveredPlugin
-	client *plugin.Client
-	svc    Service
+	info            DiscoveredPlugin
+	client          *plugin.Client
+	svc             Service
+	protocolVersion int
 }
 
 // NewManager creates a Tier-3 plugin manager backed by pluginsDir.
@@ -101,11 +104,11 @@ func (m *Manager) lockForPlugin(id string) *sync.Mutex {
 	return lk
 }
 
-func (m *Manager) getOrStart(info DiscoveredPlugin) (Service, error) {
+func (m *Manager) getOrStart(info DiscoveredPlugin) (Service, int, error) {
 	m.mu.Lock()
 	if hp, ok := m.clients[info.Manifest.ID]; ok && !hp.client.Exited() {
 		m.mu.Unlock()
-		return hp.svc, nil
+		return hp.svc, hp.protocolVersion, nil
 	}
 	m.mu.Unlock()
 
@@ -117,7 +120,7 @@ func (m *Manager) getOrStart(info DiscoveredPlugin) (Service, error) {
 	m.mu.Lock()
 	if hp, ok := m.clients[info.Manifest.ID]; ok && !hp.client.Exited() {
 		m.mu.Unlock()
-		return hp.svc, nil
+		return hp.svc, hp.protocolVersion, nil
 	}
 	if old, ok := m.clients[info.Manifest.ID]; ok {
 		old.client.Kill()
@@ -128,12 +131,24 @@ func (m *Manager) getOrStart(info DiscoveredPlugin) (Service, error) {
 	// Re-verify SHA-256 right before spawning to prevent TOCTOU tampering.
 	rechecked := verifyOnePlugin(info.Dir, filepath.Join(info.Dir, "manifest.json"))
 	if !rechecked.Verified {
-		return nil, fmt.Errorf("plugin %s verification failed: %s", info.Manifest.ID, rechecked.VerificationErr)
+		return nil, 0, fmt.Errorf("plugin %s verification failed: %s", info.Manifest.ID, rechecked.VerificationErr)
+	}
+
+	var pImpl plugin.Plugin
+	switch rechecked.Manifest.HostAPIVersion {
+	case 1:
+		pImpl = &GRPCPlugin{}
+	case 2:
+		pImpl = &GRPCPluginV2{}
+	default:
+		return nil, 0, fmt.Errorf("unsupported host_api_version %d", rechecked.Manifest.HostAPIVersion)
 	}
 
 	client := plugin.NewClient(&plugin.ClientConfig{
-		HandshakeConfig:  Handshake,
-		Plugins:          map[string]plugin.Plugin{PluginMapKey: &GRPCPlugin{}},
+		HandshakeConfig: VersionedHandshake,
+		VersionedPlugins: map[int]plugin.PluginSet{
+			rechecked.Manifest.HostAPIVersion: {PluginMapKey: pImpl},
+		},
 		Cmd:              exec.Command(rechecked.BinaryPath), //nolint:gosec // Verified SHA-256 against manifest.json.
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
 		AutoMTLS:         true,
@@ -142,23 +157,33 @@ func (m *Manager) getOrStart(info DiscoveredPlugin) (Service, error) {
 	rpcClient, err := client.Client()
 	if err != nil {
 		client.Kill()
-		return nil, fmt.Errorf("start plugin %s: %w", info.Manifest.ID, err)
+		return nil, 0, fmt.Errorf("start plugin %s: %w", info.Manifest.ID, err)
+	}
+	negotiated := client.NegotiatedVersion()
+	if negotiated != rechecked.Manifest.HostAPIVersion {
+		client.Kill()
+		return nil, 0, fmt.Errorf("plugin %s negotiated protocol v%d, want v%d", info.Manifest.ID, negotiated, rechecked.Manifest.HostAPIVersion)
 	}
 	raw, err := rpcClient.Dispense(PluginMapKey)
 	if err != nil {
 		client.Kill()
-		return nil, fmt.Errorf("dispense plugin %s: %w", info.Manifest.ID, err)
+		return nil, 0, fmt.Errorf("dispense plugin %s: %w", info.Manifest.ID, err)
 	}
 	svc, ok := raw.(Service)
 	if !ok {
 		client.Kill()
-		return nil, fmt.Errorf("plugin %s returned unexpected RPC type", info.Manifest.ID)
+		return nil, 0, fmt.Errorf("plugin %s returned unexpected RPC type", info.Manifest.ID)
 	}
 
 	m.mu.Lock()
-	m.clients[info.Manifest.ID] = &hostedPlugin{info: rechecked, client: client, svc: svc}
+	m.clients[info.Manifest.ID] = &hostedPlugin{
+		info:            rechecked,
+		client:          client,
+		svc:             svc,
+		protocolVersion: negotiated,
+	}
 	m.mu.Unlock()
-	return svc, nil
+	return svc, negotiated, nil
 }
 
 type pluginDriverAdapter struct {
@@ -182,7 +207,7 @@ func (p *pluginDriverAdapter) Metadata() types.DriverMetadata {
 }
 
 func (p *pluginDriverAdapter) Classify(ctx context.Context, raw string) (types.Classification, error) {
-	svc, err := p.manager.getOrStart(p.info)
+	svc, _, err := p.manager.getOrStart(p.info)
 	if err != nil {
 		return types.Classification{}, err
 	}
@@ -190,7 +215,7 @@ func (p *pluginDriverAdapter) Classify(ctx context.Context, raw string) (types.C
 }
 
 func (p *pluginDriverAdapter) Open(ctx context.Context, cfg driver.ConnectionConfig) (driver.Conn, error) {
-	svc, err := p.manager.getOrStart(p.info)
+	svc, protoVer, err := p.manager.getOrStart(p.info)
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +256,20 @@ func (p *pluginDriverAdapter) Open(ctx context.Context, cfg driver.ConnectionCon
 		return firstErr
 	})
 
-	return &pluginConn{svc: svc, spec: spec, closeHook: combinedClose}, nil
+	capSet := make(map[string]struct{}, len(p.info.Manifest.Capabilities))
+	for _, capName := range p.info.Manifest.Capabilities {
+		if norm := strings.ToLower(strings.TrimSpace(capName)); norm != "" {
+			capSet[norm] = struct{}{}
+		}
+	}
+
+	return &pluginConn{
+		svc:             svc,
+		spec:            spec,
+		closeHook:       combinedClose,
+		protocolVersion: protoVer,
+		capabilities:    capSet,
+	}, nil
 }
 
 func startDialBridge(parentCtx context.Context, dialFn func(context.Context, string, string) (net.Conn, error), targetAddr string) (string, int, func() error, error) {
@@ -291,9 +329,24 @@ func startDialBridge(parentCtx context.Context, dialFn func(context.Context, str
 }
 
 type pluginConn struct {
-	svc       Service
-	spec      TargetSpec
-	closeHook func() error
+	svc             Service
+	spec            TargetSpec
+	closeHook       func() error
+	protocolVersion int
+	capabilities    map[string]struct{}
+
+	opSeq      atomic.Uint64
+	opMu       sync.Mutex
+	activeOpID string
+	cancelExec context.CancelFunc
+}
+
+func (c *pluginConn) hasCapability(name string) bool {
+	if len(c.capabilities) == 0 && c.protocolVersion <= 1 {
+		return true
+	}
+	_, ok := c.capabilities[strings.ToLower(strings.TrimSpace(name))]
+	return ok
 }
 
 func (c *pluginConn) Ping(ctx context.Context) (types.PingResult, error) {
@@ -301,10 +354,20 @@ func (c *pluginConn) Ping(ctx context.Context) (types.PingResult, error) {
 }
 
 func (c *pluginConn) ListDatabases(ctx context.Context) ([]string, error) {
+	if !c.hasCapability("list_databases") {
+		return nil, fmt.Errorf("plugin %q does not declare list_databases capability", c.spec.Engine)
+	}
 	return c.svc.ListDatabases(ctx, c.spec)
 }
 
 func (c *pluginConn) Preflight(ctx context.Context, raw string, _ driver.PreflightOpts) (*types.PreflightReport, error) {
+	if !c.hasCapability("preflight") {
+		return &types.PreflightReport{
+			Supported: false,
+			Executed:  false,
+			Warnings:  []string{fmt.Sprintf("plugin %q does not declare preflight capability", c.spec.Engine)},
+		}, nil
+	}
 	return c.svc.Preflight(ctx, c.spec, raw)
 }
 
@@ -317,7 +380,7 @@ func (c *pluginConn) Execute(ctx context.Context, raw string, opts driver.ExecOp
 	var pluginTruncated bool
 	var pluginCutoff string
 
-	err := c.svc.ExecuteStream(ctx, c.spec, raw, opts.MaxRows, opts.MaxBytes, func(chunk ExecuteChunk) error {
+	onChunk := func(chunk ExecuteChunk) error {
 		if chunk.Error != "" {
 			return fmt.Errorf("%s", chunk.Error)
 		}
@@ -363,7 +426,31 @@ func (c *pluginConn) Execute(ctx context.Context, raw string, opts driver.ExecOp
 			res.Messages = append(res.Messages, chunk.Messages...)
 		}
 		return nil
-	})
+	}
+
+	var err error
+	if cs, ok := c.svc.(CancelableService); ok {
+		opID := fmt.Sprintf("plugop_%d_%d", time.Now().UnixNano(), c.opSeq.Add(1))
+		execCtx, cancelExec := context.WithCancel(ctx)
+		c.opMu.Lock()
+		c.activeOpID = opID
+		c.cancelExec = cancelExec
+		c.opMu.Unlock()
+
+		defer func() {
+			cancelExec()
+			c.opMu.Lock()
+			if c.activeOpID == opID {
+				c.activeOpID = ""
+				c.cancelExec = nil
+			}
+			c.opMu.Unlock()
+		}()
+
+		err = cs.ExecuteStreamWithOp(execCtx, opID, c.spec, raw, opts.MaxRows, opts.MaxBytes, onChunk)
+	} else {
+		err = c.svc.ExecuteStream(ctx, c.spec, raw, opts.MaxRows, opts.MaxBytes, onChunk)
+	}
 	if err != nil && !errors.Is(err, errStopStream) {
 		return nil, err
 	}
@@ -387,6 +474,21 @@ func (c *pluginConn) Execute(ctx context.Context, raw string, opts driver.ExecOp
 }
 
 func (c *pluginConn) CancelAndDiscard() error {
+	c.opMu.Lock()
+	opID := c.activeOpID
+	cancelExec := c.cancelExec
+	c.opMu.Unlock()
+
+	if opID != "" && c.hasCapability("cancel") {
+		if cs, ok := c.svc.(CancelableService); ok {
+			cancelCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, _, _ = cs.Cancel(cancelCtx, opID)
+			cancel()
+		}
+	}
+	if cancelExec != nil {
+		cancelExec()
+	}
 	return c.Close()
 }
 
