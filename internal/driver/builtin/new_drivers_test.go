@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	sqldriver "database/sql/driver"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -1184,5 +1185,165 @@ func TestOpenGaussKingbaseDamengCustomDialWiringAndCleanup(t *testing.T) {
 				t.Fatalf("expected custom DialContext to be invoked for %s", tc.name)
 			}
 		})
+	}
+}
+
+func TestAllNetworkDriversDefaultTLSModeDialWiring(t *testing.T) {
+	cases := []struct {
+		name   string
+		drv    driver.Driver
+		eng    string
+		db     string
+		params map[string]string
+	}{
+		{name: "postgres", drv: &PostgresDriver{}, eng: "postgres", db: "app"},
+		{name: "opengauss", drv: &OpenGaussDriver{}, eng: "opengauss", db: "postgres"},
+		{name: "kingbase", drv: &KingbaseDriver{}, eng: "kingbase", db: "kingbase"},
+		{name: "dameng", drv: &DamengDriver{}, eng: "dameng", db: "SYSDBA"},
+		{name: "tdengine", drv: &TDengineDriver{}, eng: "tdengine", db: "power"},
+		{name: "mysql", drv: &MySQLDriver{}, eng: "mysql", db: "app"},
+		{name: "mongodb", drv: &MongoDriver{}, eng: "mongodb", db: "app", params: map[string]string{"serverSelectionTimeoutMS": "250", "connectTimeoutMS": "250"}},
+		{name: "redis", drv: &RedisDriver{}, eng: "redis", db: "0", params: map[string]string{"dial_timeout": "250ms", "read_timeout": "250ms"}},
+		{name: "clickhouse", drv: &ClickHouseDriver{}, eng: "clickhouse", db: "default"},
+		{name: "mssql", drv: &MSSQLDriver{}, eng: "mssql", db: "master"},
+		{name: "oracle", drv: &OracleDriver{}, eng: "oracle", db: "FREEPDB1"},
+		{name: "elasticsearch", drv: &ElasticsearchDriver{}, eng: "elasticsearch", db: "orders"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = ln.Close() }()
+			go func() {
+				for {
+					c, aErr := ln.Accept()
+					if aErr != nil {
+						return
+					}
+					_ = c.Close()
+				}
+			}()
+
+			host, portStr, _ := net.SplitHostPort(ln.Addr().String())
+			port, _ := strconv.Atoi(portStr)
+
+			var dialCalls atomic.Int32
+			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			defer cancel()
+			_, openErr := tc.drv.Open(ctx, driver.ConnectionConfig{
+				Engine:       tc.eng,
+				Host:         host,
+				Port:         port,
+				DatabaseName: tc.db,
+				Params:       tc.params,
+				// Intentionally leave TLSMode empty ("") and TLSConfig nil to test zero-config defaults.
+				Credential: secrets.ResolvedSecret{Username: "u", Secret: "p"},
+				DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+					dialCalls.Add(1)
+					var d net.Dialer
+					return d.DialContext(dctx, network, addr)
+				},
+			})
+			if openErr == nil || strings.TrimSpace(openErr.Error()) == "" {
+				t.Fatalf("expected non-empty error against immediate-close stub listener for %s, got %v", tc.name, openErr)
+			}
+			if dialCalls.Load() == 0 {
+				t.Fatalf("expected %s with default empty TLSMode to reach DialContext, openErr=%v", tc.name, openErr)
+			}
+		})
+	}
+}
+
+func TestKingbaseDefaultTLSFallbackToSSLOnPGHBAREquirement(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	var sawPlainStartup atomic.Bool
+	var sawSSLRequest atomic.Bool
+	go func() {
+		for {
+			c, aErr := ln.Accept()
+			if aErr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				var hdr [8]byte
+				if _, rErr := io.ReadFull(conn, hdr[:]); rErr != nil {
+					return
+				}
+				code := binary.BigEndian.Uint32(hdr[4:8])
+				if code == 80877103 {
+					sawSSLRequest.Store(true)
+					// Decline SSL cleanly with 'N' so retry terminates fast without handshake hang.
+					_, _ = conn.Write([]byte{'N'})
+					return
+				}
+				sawPlainStartup.Store(true)
+				length := int(binary.BigEndian.Uint32(hdr[0:4]))
+				if length > 8 && length < 4096 {
+					rest := make([]byte, length-8)
+					_, _ = io.ReadFull(conn, rest)
+				}
+				// PG ErrorResponse ('E'): Severity FATAL + Code 28000 + Message requiring SSL.
+				fields := append([]byte{'S'}, "FATAL\x00"...)
+				fields = append(fields, 'C')
+				fields = append(fields, "28000\x00"...)
+				fields = append(fields, 'M')
+				fields = append(fields, "pg_hba.conf rejects connection without SSL encryption\x00"...)
+				fields = append(fields, 0)
+				var pkt []byte
+				pkt = append(pkt, 'E')
+				var sz [4]byte
+				binary.BigEndian.PutUint32(sz[:], uint32(len(fields)+4))
+				pkt = append(pkt, sz[:]...)
+				pkt = append(pkt, fields...)
+				_, _ = conn.Write(pkt)
+			}(c)
+		}
+	}()
+
+	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, openErr := (&KingbaseDriver{}).Open(ctx, driver.ConnectionConfig{
+		Engine:       "kingbase",
+		Host:         host,
+		Port:         port,
+		DatabaseName: "kingbase",
+		Credential:   secrets.ResolvedSecret{Username: "system", Secret: "pw"},
+		DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(dctx, network, addr)
+		},
+	})
+	if openErr == nil {
+		t.Fatal("expected Open to fail after mock server declined SSL")
+	}
+	if !sawPlainStartup.Load() {
+		t.Fatalf("expected initial plaintext StartupMessage attempt, err=%v", openErr)
+	}
+	if !sawSSLRequest.Load() {
+		t.Fatalf("expected KingbaseDriver to retry with sslmode=require SSLRequest after pg_hba error, err=%v", openErr)
+	}
+}
+
+func TestDamengInvalidSchemaHelper(t *testing.T) {
+	if !isDamengInvalidSchemaErr(errors.New("Error -2103: Invalid schema name [adb_rw].")) {
+		t.Fatal("expected DM8 -2103 error to be detected")
+	}
+	if isDamengInvalidSchemaErr(errors.New("Error -2501: Invalid username or password")) {
+		t.Fatal("did not expect auth error to match invalid schema")
+	}
+	if isDamengInvalidSchemaErr(nil) {
+		t.Fatal("nil error must return false")
 	}
 }

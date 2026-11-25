@@ -1066,6 +1066,36 @@ func TestLiveMultiDatabaseEngines(t *testing.T) {
 		if done.Status != types.OpSucceeded || done.Result == nil || done.Result.AffectedRows == nil || *done.Result.AffectedRows != 1 {
 			t.Fatalf("expected Dameng write affected=1, got %+v", done)
 		}
+
+		// Lowercase schema name (adb_rw) on case-sensitive DM8 triggers automatic uppercase schema fallback (-2103 retry).
+		lowerTgt, err := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/dev/dameng-lower",
+			Alias:           "live-dev-dameng-lower",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "dev",
+			InstanceID:      inst.ID,
+			DatabaseName:    "adb_rw",
+			ROCredentialID:  dmRO,
+			RWCredentialID:  dmRW,
+		})
+		if err != nil {
+			t.Fatalf("upsert dameng lowercase target: %v", err)
+		}
+		lowerDet, err := svc.ResolveTarget(ctx, lowerTgt.Ref, "")
+		if err != nil {
+			t.Fatalf("resolve dameng lowercase target: %v", err)
+		}
+		if lp := svc.PingTarget(ctx, lowerDet); !lp.Reachable || lp.Dialect != "dameng" {
+			t.Fatalf("Dameng lowercase schema Ping failed: %+v", lp)
+		}
+		lowerRead, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: lowerTgt.Alias,
+			Query:            "SELECT COUNT(*) AS CNT FROM ORDERS",
+			Wait:             true,
+		})
+		if err != nil || lowerRead.Status != types.OpSucceeded || len(lowerRead.Result.Rows) != 1 {
+			t.Fatalf("Dameng lowercase schema query failed: %+v err=%v", lowerRead, err)
+		}
 	})
 
 	// ---- 11. TDengine ----

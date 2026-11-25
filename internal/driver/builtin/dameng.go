@@ -136,7 +136,15 @@ func buildDamengDSN(cfg driver.ConnectionConfig, dialSlot string) (string, error
 	return fmt.Sprintf("dm://%s:%s@%s?%s", user, pass, net.JoinHostPort(host, strconv.Itoa(port)), q.Encode()), nil
 }
 
-func (d *DamengDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (driver.Conn, error) {
+func isDamengInvalidSchemaErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "-2103") || strings.Contains(lower, "invalid schema")
+}
+
+func openDamengSQLDB(ctx context.Context, cfg driver.ConnectionConfig) (*sql.DB, string, error) {
 	var dialSlot string
 	if cfg.DialContext != nil {
 		dialSlot = dmDialSlots.acquire(func(dctx context.Context, addr string) (net.Conn, error) {
@@ -153,14 +161,14 @@ func (d *DamengDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (d
 	dsn, err := buildDamengDSN(cfg, dialSlot)
 	if err != nil {
 		releaseSlot()
-		return nil, err
+		return nil, "", err
 	}
 
 	baseDrv := &dm.DmDriver{}
 	baseConn, err := baseDrv.OpenConnector(dsn)
 	if err != nil {
 		releaseSlot()
-		return nil, err
+		return nil, "", err
 	}
 
 	connector := sqldriver.Connector(baseConn)
@@ -178,17 +186,41 @@ func (d *DamengDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (d
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		releaseSlot()
+		return nil, "", err
+	}
+	return db, dialSlot, nil
+}
+
+func (d *DamengDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (driver.Conn, error) {
+	activeCfg := cfg
+	db, dialSlot, err := openDamengSQLDB(ctx, activeCfg)
+	if err != nil && isDamengInvalidSchemaErr(err) {
+		if dbName := strings.TrimSpace(cfg.DatabaseName); dbName != "" {
+			if upper := strings.ToUpper(dbName); upper != dbName {
+				// DM8 defaults to case-sensitive identifiers where unquoted schemas are uppercase.
+				retryCfg := cfg
+				retryCfg.DatabaseName = upper
+				if retryDB, retrySlot, retryErr := openDamengSQLDB(ctx, retryCfg); retryErr == nil {
+					activeCfg = retryCfg
+					db = retryDB
+					dialSlot = retrySlot
+					err = nil
+				}
+			}
+		}
+	}
+	if err != nil {
 		return nil, err
 	}
 
 	dc := &damengConn{
 		db:        db,
-		cfg:       cfg,
+		cfg:       activeCfg,
 		dialSlot:  dialSlot,
-		closeHook: driver.CloseOnce(cfg.CloseHook),
+		closeHook: driver.CloseOnce(activeCfg.CloseHook),
 	}
-	if cfg.NegotiatedCapabilities != nil {
-		cp := *cfg.NegotiatedCapabilities
+	if activeCfg.NegotiatedCapabilities != nil {
+		cp := *activeCfg.NegotiatedCapabilities
 		dc.caps.Store(&cp)
 	}
 	return dc, nil
