@@ -1265,3 +1265,170 @@ func TestTDengineFullApprovalAndAuditLifecycleE2E(t *testing.T) {
 		t.Fatalf("VerifyAuditChain failed: %+v err=%v", verify, err)
 	}
 }
+
+func TestOnboardingDefaultsInlineEnvAndScanReadMode(t *testing.T) {
+	srv, _ := setupIsolatedServer(t)
+	svc := srv.Service()
+	ctx := context.Background()
+
+	// 1. Unknown --env without --safety-tier returns structured TargetLookupError with actionable NextCommands.
+	_, err := svc.AdminAddDatabase(ctx, "qa", daemon.DBAddRequest{
+		Engine: "sqlite",
+		Host:   filepath.Join(t.TempDir(), "missing-env.db"),
+		System: "friction-sys",
+		Env:    "uat",
+	})
+	le, ok := err.(*daemon.TargetLookupError)
+	if !ok || le.Code != types.ErrCodeNotFound || le.Hint == "" || len(le.NextCommands) == 0 {
+		t.Fatalf("expected structured TargetLookupError for missing env, got %T (%v)", err, err)
+	}
+
+	// 2. Inline --safety-tier creates new environment in --dry-run (without persisting) and real execution.
+	uatDBPath := filepath.Join(t.TempDir(), "uat.db")
+	dryPlan, err := svc.AdminAddDatabase(ctx, "qa", daemon.DBAddRequest{
+		Engine:       "sqlite",
+		Host:         uatDBPath,
+		System:       "friction-sys",
+		Env:          "uat",
+		SafetyTier:   types.SafetyTierStrict,
+		ScanReadMode: types.ScanReadReasonOnly,
+		DryRun:       true,
+	})
+	if err != nil {
+		t.Fatalf("AdminAddDatabase inline env dry-run: %v", err)
+	}
+	if dryPlan.Actions["environment"] != "created" || dryPlan.Actions["policy"] != "created" ||
+		dryPlan.Target.SafetyTier != types.SafetyTierStrict || dryPlan.Target.ScanReadMode != types.ScanReadReasonOnly || !dryPlan.Target.Writable {
+		t.Fatalf("unexpected dry-run TargetSummary/Actions: %+v", dryPlan)
+	}
+	if _, err := svc.Store().ResolveEnvironment(ctx, "uat"); err == nil {
+		t.Fatalf("expected dry-run not to persist environment uat")
+	}
+
+	// 3. Real non-sqlite DB add in yolo (dev) defaults AccessLevel to read_write; strict (prod) defaults to read_only.
+	devPG, err := svc.AdminAddDatabase(ctx, "qa", daemon.DBAddRequest{
+		Engine:   "postgres",
+		Host:     "127.0.0.1",
+		Port:     5432,
+		Database: "orders",
+		System:   "shop",
+		Env:      "dev",
+		User:     "devuser",
+	})
+	if err != nil {
+		t.Fatalf("AdminAddDatabase dev postgres: %v", err)
+	}
+	if devPG.AccessLevel != string(types.AccessReadWrite) || !devPG.Target.Writable {
+		t.Fatalf("expected yolo env to default AccessLevel=read_write and Writable=true, got %+v", devPG)
+	}
+
+	prodPG, err := svc.AdminAddDatabase(ctx, "qa", daemon.DBAddRequest{
+		Engine:   "postgres",
+		Host:     "127.0.0.1",
+		Port:     5432,
+		Database: "orders",
+		System:   "shop",
+		Env:      "prod",
+		User:     "prodreader",
+	})
+	if err != nil {
+		t.Fatalf("AdminAddDatabase prod postgres: %v", err)
+	}
+	if prodPG.AccessLevel != string(types.AccessReadOnly) || prodPG.Target.Writable {
+		t.Fatalf("expected strict env to default AccessLevel=read_only and Writable=false, got %+v", prodPG)
+	}
+
+	// 4. SQLite file diagnostics when --test runs before DB file exists, followed by full-scan read policy test.
+	prodSQLitePath := filepath.Join(t.TempDir(), "prod-orders.db")
+	missingPingRes, err := svc.AdminAddDatabase(ctx, "qa", daemon.DBAddRequest{
+		Engine:       "sqlite",
+		Host:         prodSQLitePath,
+		System:       "shop",
+		Env:          "prod",
+		Alias:        "prod-sqlite",
+		ScanReadMode: types.ScanReadRequireApproval,
+		Test:         true,
+	})
+	if err != nil {
+		t.Fatalf("AdminAddDatabase prod sqlite with --test: %v", err)
+	}
+	if missingPingRes.Ping == nil || missingPingRes.Ping.Reachable || !strings.Contains(missingPingRes.Ping.Error, "does not exist yet") {
+		t.Fatalf("expected explanatory non-existent sqlite ping error, got %+v", missingPingRes.Ping)
+	}
+
+	// Seed a dev alias pointing to the same SQLite file to populate schema/rows (also verifies sqlite writes work).
+	if _, err := svc.AdminAddDatabase(ctx, "qa", daemon.DBAddRequest{
+		Engine: "sqlite",
+		Host:   prodSQLitePath,
+		System: "shop",
+		Env:    "dev",
+		Alias:  "dev-sqlite",
+	}); err != nil {
+		t.Fatalf("AdminAddDatabase dev sqlite: %v", err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT)`,
+		`INSERT INTO orders (status) VALUES ('open'), ('closed')`,
+	} {
+		wr, err := svc.Execute(ctx, types.ExecRequest{TargetRefOrAlias: "dev-sqlite", Query: stmt, Wait: true})
+		if err != nil || wr.Status != types.OpSucceeded {
+			t.Fatalf("seed dev sqlite %q failed: %+v err=%v", stmt, wr, err)
+		}
+	}
+
+	// Default prod SQLite full-scan SELECT COUNT(*) triggers waiting_approval.
+	scanReqWait, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: "prod-sqlite",
+		Query:            "SELECT COUNT(*) FROM orders",
+		Reason:           "check row count",
+		Wait:             false,
+	})
+	if err != nil || scanReqWait.Status != types.OpWaitingApproval {
+		t.Fatalf("expected SELECT COUNT(*) on prod sqlite to wait for approval, got %+v err=%v", scanReqWait, err)
+	}
+	_, _ = svc.CancelOperation(ctx, "qa", scanReqWait.OperationID)
+
+	// Switch prod-sqlite scan_read_mode=reason_only -> without --reason rejected with reason_required; with --reason executes immediately.
+	if _, err := svc.AdminSetTargetScanReadMode(ctx, "qa", "prod-sqlite", types.ScanReadReasonOnly, false); err != nil {
+		t.Fatalf("AdminSetTargetScanReadMode: %v", err)
+	}
+	noReasonRes, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: "prod-sqlite",
+		Query:            "SELECT COUNT(*) FROM orders",
+		Wait:             true,
+	})
+	if err != nil || noReasonRes.Status != types.OpDenied || noReasonRes.ErrorCode != types.ErrCodeReasonRequired {
+		t.Fatalf("expected reason_required without --reason, got %+v err=%v", noReasonRes, err)
+	}
+	withReasonRes, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: "prod-sqlite",
+		Query:            "SELECT * FROM orders WHERE status = 'open' LIMIT 1",
+		Reason:           "troubleshoot open orders",
+		Wait:             true,
+	})
+	if err != nil || withReasonRes.Status != types.OpSucceeded || withReasonRes.ApprovalID != "" {
+		t.Fatalf("expected scan read with --reason to succeed without approval, got %+v err=%v", withReasonRes, err)
+	}
+
+	// Writes in prod still require human approval despite scan_read_mode=reason_only, and RO-only target denies writes.
+	writeProd, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: "prod-sqlite",
+		Query:            "INSERT INTO orders (status) VALUES ('hack')",
+		Reason:           "write attempt",
+		Wait:             false,
+	})
+	if err != nil || writeProd.Status != types.OpWaitingApproval {
+		t.Fatalf("expected prod write to still require approval, got %+v err=%v", writeProd, err)
+	}
+	_, _ = svc.CancelOperation(ctx, "qa", writeProd.OperationID)
+
+	writeROTarget, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: prodPG.Target.Ref,
+		Query:            "DELETE FROM orders WHERE id = 1",
+		Reason:           "write attempt on ro target",
+		Wait:             true,
+	})
+	if err != nil || writeROTarget.Status != types.OpDenied || writeROTarget.ErrorCode != types.ErrCodePolicyDenied {
+		t.Fatalf("expected ro-only target write denial, got %+v err=%v", writeROTarget, err)
+	}
+}

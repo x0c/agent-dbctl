@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.4.0
+
+### English
+
+- **13 zero-JVM built-in drivers & Xinchuang database dialects**: Added pure-Go drivers for **openGauss / GaussDB**, **KingbaseES**, **Dameng DM8**, and **TDengine**, plus **Easysearch** dialect support across schema introspection (`db schema`) and read-only `EXPLAIN` preflight.
+- **Agent-friendly onboarding defaults & inline environment creation**: `db add` now defaults `--access-level` to `read_write` in `yolo` environments (keeping `read_only` in `guarded`/`strict`), supports `--safety-tier <yolo|guarded|strict>` to create missing `--env` entries inline (including `--dry-run`), returns full `TargetSummary` fields (`safety_tier`, `writable`, `scan_read_mode`) in `--dry-run`, and emits structured `hint` + runnable `next_commands` when environments, networks, or credentials are missing.
+- **Scoped full-scan read policy (`scan_read_mode`)**: Added `allow` / `reason_only` / `require_approval` policy control on targets, systems, and environments via `--scan-read-mode` (`db add`, `db set`, `policy set`), topology export/apply, and the Web Console `Policies` modal—letting safe `EXPLAIN` full-scan reads (`SELECT COUNT(*)`, unindexed `LIMIT 1`) run immediately when `--reason` is passed under `reason_only` while failing fast with `reason_required` if omitted and keeping writes/DDL/custom risk rules gated by approval.
+- **Portable Git remote workspace matching & Web UI refinements**: Added automatic normalized `git_remotes` binding (`system set --git-remote`, `db add --git-remote`) across Git worktrees and subdirectories; streamlined the Web Console around `Systems & Databases` with a one-shot `Add Database` modal, secondary `Resources` drawer, `Environments` under `Policies & Guardrails`, and a minimal topbar.
+- **CLI diagnostics & partial rule updates**: Fixed `pattern set` partial CLI updates so `--enabled=false` or single-flag changes preserve existing conditions/actions; added recovery hints on read-only target write denials (`ErrCodePolicyDenied`) and full-scan waits; clarified non-existent SQLite `mode=ro` probe failures in `db add --test` and `db test`.
+
+### 简体中文
+
+- **13 大零 JVM 内置驱动与信创数据库适配**：新增 **openGauss / GaussDB**、**KingbaseES（人大金仓）**、**Dameng DM8（达梦）** 与 **TDengine** 纯 Go 内置驱动，并支持 **Easysearch** 方言，全部统一接入只读 `db schema` 结构探查与无副作用 `EXPLAIN` 预检。
+- **更符合 Agent 直觉的接入默认值与内联建环境**：`db add` 在 `yolo` 环境中将 `--access-level` 默认提升为 `read_write`（`guarded`/`strict` 保持默认 `read_only`），新增 `--safety-tier <yolo|guarded|strict>` 支持在一次调用中内联创建缺失环境（含 `--dry-run` 预演），补全 `--dry-run` 下的 `safety_tier`/`writable`/`scan_read_mode` 摘要字段，并在缺少环境/网络/凭据时返回结构化 `hint` 与可直接执行的 `next_commands`。
+- **分级全表扫描读策略（`scan_read_mode`）**：支持通过 `db add`、`db set`、`policy set` 的 `--scan-read-mode` 参数、拓扑导入导出及 Web 控制台 `Policies` 弹窗按目标/系统/环境配置 `allow` / `reason_only` / `require_approval`；开启 `reason_only` 后，`SELECT COUNT(*)`、无索引 `LIMIT 1` 等安全全表扫描读在提供 `--reason` 时免审批直接放行，未提供 `--reason` 时快速返回 `reason_required`，而写操作、DDL 及自定义高危规则仍严格走审批门禁。
+- **Git Remote 跨工作区绑定与 Web 控制台精简化**：新增标准化 `git_remotes` 绑定与多工作树/子目录自动识别；Web 控制台聚焦 `Systems & Databases` 主视图（内置一键 `Add Database` 弹窗）、将实例/网络/凭据模板收敛进 `Resources` 抽屉、将 `Environments` 归入 `Policies & Guardrails`，并简化顶部控制栏。
+- **CLI 诊断与部分参数更新修复**：修复 `pattern set` 仅传部分参数（如 `--enabled=false`）时覆盖原有匹配条件和动作的问题；为只读目标写入拒绝（`ErrCodePolicyDenied`）及全表扫描触发审批补充可执行恢复命令；为不存在的 SQLite 文件在 `db add --test` / `db test` 的 `mode=ro` 失败信息补充清晰原因说明。
+
 ## v0.3.0
 
 ### English

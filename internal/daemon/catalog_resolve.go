@@ -31,6 +31,8 @@ type TargetLookupError struct {
 	Candidates        []types.TargetDetail
 	SimilarNames      []string
 	UnsearchedSources []string
+	Hint              string
+	NextCommands      []string
 }
 
 func (e *TargetLookupError) Error() string {
@@ -224,6 +226,7 @@ func SummarizeTarget(d types.TargetDetail) types.TargetSummary {
 		Database:        d.Target.DatabaseName,
 		Status:          d.Target.Status,
 		Writable:        writable,
+		ScanReadMode:    d.EffectivePolicy.ScanReadMode,
 		MaxRows:         d.EffectivePolicy.MaxRows,
 		ExecTimeoutSec:  d.EffectivePolicy.ExecTimeoutSec,
 		WorkspaceMatch:  d.WorkspaceMatch,

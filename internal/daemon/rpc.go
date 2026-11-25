@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -506,9 +507,10 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 	})
 	mux.HandleFunc("POST /rpc/v1/targets", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Target types.Target `json:"target"`
-			DryRun bool         `json:"dry_run"`
-			Actor  string       `json:"actor"`
+			Target       types.Target        `json:"target"`
+			DryRun       bool                `json:"dry_run"`
+			Actor        string              `json:"actor"`
+			ScanReadMode *types.ScanReadMode `json:"scan_read_mode,omitempty"`
 		}
 		if err := decodeJSONBody(r, &req); err != nil {
 			writeRPCInvalidErr(w, err.Error())
@@ -518,6 +520,12 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
+		}
+		if req.ScanReadMode != nil && *req.ScanReadMode != "" {
+			if _, pErr := svc.AdminSetTargetScanReadMode(r.Context(), req.Actor, firstNonEmpty(res.Item.ID, res.Item.Ref), *req.ScanReadMode, req.DryRun); pErr != nil {
+				writeRPCStoreErr(w, pErr)
+				return
+			}
 		}
 		writeJSONResp(w, http.StatusOK, res)
 	})
@@ -742,6 +750,11 @@ func writeRPCInvalidErr(w http.ResponseWriter, msg string) {
 }
 
 func writeRPCStoreErr(w http.ResponseWriter, err error) {
+	var le *TargetLookupError
+	if errors.As(err, &le) {
+		writeLookupErr(w, le)
+		return
+	}
 	switch {
 	case storeErrIsNotFound(err):
 		writeJSONResp(w, http.StatusNotFound, map[string]any{
@@ -788,6 +801,8 @@ func writeLookupErr(w http.ResponseWriter, err error) {
 			"candidates":         le.Candidates,
 			"similar_names":      le.SimilarNames,
 			"unsearched_sources": le.UnsearchedSources,
+			"hint":               le.Hint,
+			"next_commands":      le.NextCommands,
 		})
 		return
 	}
@@ -808,6 +823,8 @@ type LookupError struct {
 	Candidates        []types.TargetDetail `json:"candidates"`
 	SimilarNames      []string             `json:"similar_names"`
 	UnsearchedSources []string             `json:"unsearched_sources"`
+	Hint              string               `json:"hint,omitempty"`
+	NextCommands      []string             `json:"next_commands,omitempty"`
 }
 
 func (e *LookupError) Error() string { return e.Message }

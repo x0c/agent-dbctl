@@ -1376,7 +1376,7 @@ func (q *txSnapshotQuerier) ListPolicies(ctx context.Context) ([]types.PolicyRul
 			allow_safe_read, require_approval_on_high_cost_read, require_approval_on_write,
 			require_approval_on_ddl, require_approval_on_admin, require_approval_on_unknown,
 			allow_multi_statement, exec_timeout_sec, approval_timeout_sec, max_rows, max_bytes, explain_max_rows,
-			approval_provider, created_at_utc, updated_at_utc
+			scan_read_mode, approval_provider, created_at_utc, updated_at_utc
 		FROM policies ORDER BY scope_type ASC, name ASC`)
 	if err != nil {
 		return nil, err
@@ -1389,7 +1389,7 @@ func (q *txSnapshotQuerier) ListPolicies(ctx context.Context) ([]types.PolicyRul
 		if err := rows.Scan(&p.ID, &p.Name, &p.ScopeType, &p.ScopeID,
 			&aSafe, &rHigh, &rWrite, &rDDL, &rAdmin, &rUnk, &aMulti,
 			&execT, &appT, &maxR, &maxB, &expR,
-			&p.ApprovalProvider, &p.CreatedAtUTC, &p.UpdatedAtUTC); err != nil {
+			&p.ScanReadMode, &p.ApprovalProvider, &p.CreatedAtUTC, &p.UpdatedAtUTC); err != nil {
 			return nil, err
 		}
 		p.AllowSafeRead = nullIntToBoolPtr(aSafe)

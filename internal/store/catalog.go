@@ -913,7 +913,7 @@ func (s *Store) ListPolicies(ctx context.Context) ([]types.PolicyRuleSet, error)
 			allow_safe_read, require_approval_on_high_cost_read, require_approval_on_write,
 			require_approval_on_ddl, require_approval_on_admin, require_approval_on_unknown,
 			allow_multi_statement, exec_timeout_sec, approval_timeout_sec, max_rows, max_bytes, explain_max_rows,
-			approval_provider, created_at_utc, updated_at_utc
+			approval_provider, scan_read_mode, created_at_utc, updated_at_utc
 		FROM policies ORDER BY scope_type ASC, name ASC`)
 	if err != nil {
 		return nil, err
@@ -929,7 +929,7 @@ func (s *Store) ListPolicies(ctx context.Context) ([]types.PolicyRuleSet, error)
 		if err := rows.Scan(&p.ID, &p.Name, &p.ScopeType, &p.ScopeID,
 			&aSafe, &rHigh, &rWrite, &rDDL, &rAdmin, &rUnk, &aMulti,
 			&execT, &appT, &maxR, &maxB, &expR,
-			&p.ApprovalProvider, &p.CreatedAtUTC, &p.UpdatedAtUTC); err != nil {
+			&p.ApprovalProvider, &p.ScanReadMode, &p.CreatedAtUTC, &p.UpdatedAtUTC); err != nil {
 			return nil, err
 		}
 		p.AllowSafeRead = nullIntToBoolPtr(aSafe)
@@ -994,8 +994,8 @@ func (s *Store) upsertPolicyTx(ctx context.Context, tx *sql.Tx, actor string, p 
 			allow_safe_read, require_approval_on_high_cost_read, require_approval_on_write,
 			require_approval_on_ddl, require_approval_on_admin, require_approval_on_unknown,
 			allow_multi_statement, exec_timeout_sec, approval_timeout_sec, max_rows, max_bytes, explain_max_rows,
-			approval_provider, created_at_utc, updated_at_utc
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			approval_provider, scan_read_mode, created_at_utc, updated_at_utc
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			scope_type = excluded.scope_type,
@@ -1013,13 +1013,14 @@ func (s *Store) upsertPolicyTx(ctx context.Context, tx *sql.Tx, actor string, p 
 			max_bytes = excluded.max_bytes,
 			explain_max_rows = excluded.explain_max_rows,
 			approval_provider = excluded.approval_provider,
+			scan_read_mode = excluded.scan_read_mode,
 			updated_at_utc = excluded.updated_at_utc`,
 		p.ID, p.Name, p.ScopeType, p.ScopeID,
 		boolPtrToNullInt(p.AllowSafeRead), boolPtrToNullInt(p.RequireApprovalOnHighCostRead), boolPtrToNullInt(p.RequireApprovalOnWrite),
 		boolPtrToNullInt(p.RequireApprovalOnDDL), boolPtrToNullInt(p.RequireApprovalOnAdmin), boolPtrToNullInt(p.RequireApprovalOnUnknown),
 		boolPtrToNullInt(p.AllowMultiStatement), intPtrToNullInt(p.ExecTimeoutSec), intPtrToNullInt(p.ApprovalTimeoutSec),
 		intPtrToNullInt(p.MaxRows), int64PtrToNullInt(p.MaxBytes), int64PtrToNullInt(p.ExplainMaxRows),
-		p.ApprovalProvider, p.CreatedAtUTC, p.UpdatedAtUTC)
+		p.ApprovalProvider, string(p.ScanReadMode), p.CreatedAtUTC, p.UpdatedAtUTC)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return p, fmt.Errorf("%w: duplicate policy name %q", ErrConflict, p.Name)

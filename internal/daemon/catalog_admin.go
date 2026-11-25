@@ -55,6 +55,7 @@ type DBAddRequest struct {
 	GitRemotes            []string          `json:"git_remotes,omitempty"`
 	NoWorkspace           bool              `json:"no_workspace,omitempty"`
 	Env                   string            `json:"env,omitempty"`
+	SafetyTier            types.SafetyTier  `json:"safety_tier,omitempty"`
 	Instance              string            `json:"instance,omitempty"`
 	Role                  types.InstanceRole `json:"role,omitempty"`
 	Network               string            `json:"network,omitempty"`
@@ -69,6 +70,7 @@ type DBAddRequest struct {
 	SecretValue           string            `json:"secret_value,omitempty"`
 	SecretProvided        bool              `json:"secret_provided,omitempty"`
 	Status                types.TargetStatus `json:"status,omitempty"`
+	ScanReadMode          types.ScanReadMode `json:"scan_read_mode,omitempty"`
 	Description           string            `json:"description,omitempty"`
 	DryRun                bool              `json:"dry_run,omitempty"`
 	Test                  bool              `json:"test,omitempty"`
@@ -78,6 +80,7 @@ type DBAddRequest struct {
 type DBAddResponse struct {
 	DryRun         bool                      `json:"dry_run"`
 	Status         string                    `json:"status"` // planned | created | updated | unchanged
+	AccessLevel    string                    `json:"access_level,omitempty"`
 	Target         types.TargetSummary       `json:"target"`
 	Actions        map[string]string         `json:"actions"`
 	MissingSecrets []types.MissingSecretInfo `json:"missing_secrets,omitempty"`
@@ -862,6 +865,22 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 	actor = defaultActor(actor)
 	var warnings []string
 
+	switch req.ScanReadMode {
+	case "", types.ScanReadAllow, types.ScanReadReasonOnly, types.ScanReadRequireApproval:
+	default:
+		return DBAddResponse{}, fmt.Errorf("invalid scan_read_mode %q (expected allow, reason_only, or require_approval)", req.ScanReadMode)
+	}
+	switch req.SafetyTier {
+	case "", types.SafetyTierYOLO, types.SafetyTierGuarded, types.SafetyTierStrict:
+	default:
+		return DBAddResponse{}, fmt.Errorf("invalid safety_tier %q (expected yolo, guarded, or strict)", req.SafetyTier)
+	}
+	switch req.AccessLevel {
+	case "", types.AccessReadOnly, types.AccessReadWrite:
+	default:
+		return DBAddResponse{}, fmt.Errorf("invalid access_level %q (expected read_only or read_write)", req.AccessLevel)
+	}
+
 	var parsed ParsedDSN
 	if strings.TrimSpace(req.DSN) != "" {
 		var err error
@@ -990,16 +1009,42 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 		}
 	}
 
-	// 2. Environment verification.
+	// 2. Environment verification (or inline creation when --safety-tier is provided).
 	envCode := firstNonEmpty(strings.TrimSpace(req.Env), "dev")
-	envObj, err := s.store.ResolveEnvironment(ctx, envCode)
-	if err != nil {
+	var envObj types.Environment
+	envAction := "unchanged"
+	if curEnv, err := s.store.ResolveEnvironment(ctx, envCode); err == nil {
+		envObj = curEnv
+		if req.SafetyTier != "" && envObj.SafetyTier != req.SafetyTier {
+			return DBAddResponse{}, fmt.Errorf("environment %q already exists with safety_tier %q (requested %q); run `agent-dbctl env set %s --safety-tier %s --json` to change it", envObj.Code, envObj.SafetyTier, req.SafetyTier, envObj.Code, req.SafetyTier)
+		}
+	} else if req.SafetyTier != "" {
+		envRes, err := s.AdminUpsertEnvironment(ctx, actor, types.Environment{
+			Code:       envCode,
+			SafetyTier: req.SafetyTier,
+		}, req.DryRun)
+		if err != nil {
+			return DBAddResponse{}, err
+		}
+		envObj = envRes.Item
+		envAction = envRes.Action
+	} else {
 		envs, _ := s.store.ListEnvironments(ctx)
 		var codes []string
 		for _, e := range envs {
 			codes = append(codes, e.Code)
 		}
-		return DBAddResponse{}, fmt.Errorf("%w (available environments: %s)", err, strings.Join(codes, ", "))
+		return DBAddResponse{}, &TargetLookupError{
+			Code:         types.ErrCodeNotFound,
+			Message:      fmt.Sprintf("environment %q not found (available environments: %s)", envCode, strings.Join(codes, ", ")),
+			SimilarNames: codes,
+			Hint:         fmt.Sprintf("Create %q first with `env set`, or create it inline by passing `--safety-tier <yolo|guarded|strict>` to `db add`.", envCode),
+			NextCommands: []string{
+				fmt.Sprintf("agent-dbctl env set --code %s --safety-tier guarded --json", envCode),
+				fmt.Sprintf("agent-dbctl db add --env %s --safety-tier guarded --json", envCode),
+				"agent-dbctl env list --json",
+			},
+		}
 	}
 
 	// 3. NetworkProfile resolution (optional).
@@ -1007,7 +1052,18 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 	if strings.TrimSpace(req.Network) != "" {
 		np, err := s.store.ResolveNetworkProfile(ctx, req.Network)
 		if err != nil {
-			return DBAddResponse{}, err
+			nets, _ := s.store.ListNetworkProfiles(ctx)
+			names := make([]string, 0, len(nets))
+			for _, n := range nets {
+				names = append(names, n.Name)
+			}
+			return DBAddResponse{}, &TargetLookupError{
+				Code:         types.ErrCodeNotFound,
+				Message:      fmt.Sprintf("network profile %q not found", req.Network),
+				SimilarNames: names,
+				Hint:         "Inspect configured network profiles with `network list` or omit --network for direct connections.",
+				NextCommands: []string{"agent-dbctl network list --json"},
+			}
 		}
 		netID = np.ID
 	}
@@ -1025,14 +1081,36 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 	if strings.TrimSpace(req.ROCred) != "" {
 		cp, err := s.store.ResolveCredentialProfile(ctx, req.ROCred)
 		if err != nil {
-			return DBAddResponse{}, err
+			creds, _ := s.store.ListCredentialProfiles(ctx)
+			names := make([]string, 0, len(creds))
+			for _, c := range creds {
+				names = append(names, c.Name)
+			}
+			return DBAddResponse{}, &TargetLookupError{
+				Code:         types.ErrCodeNotFound,
+				Message:      fmt.Sprintf("read-only credential %q not found", req.ROCred),
+				SimilarNames: names,
+				Hint:         "Inspect available credentials with `cred list` or let `db add` create an implicit profile via --user / --access-level.",
+				NextCommands: []string{"agent-dbctl cred list --json"},
+			}
 		}
 		roCredID = cp.ID
 	}
 	if strings.TrimSpace(req.RWCred) != "" {
 		cp, err := s.store.ResolveCredentialProfile(ctx, req.RWCred)
 		if err != nil {
-			return DBAddResponse{}, err
+			creds, _ := s.store.ListCredentialProfiles(ctx)
+			names := make([]string, 0, len(creds))
+			for _, c := range creds {
+				names = append(names, c.Name)
+			}
+			return DBAddResponse{}, &TargetLookupError{
+				Code:         types.ErrCodeNotFound,
+				Message:      fmt.Sprintf("read-write credential %q not found", req.RWCred),
+				SimilarNames: names,
+				Hint:         "Inspect available credentials with `cred list` or let `db add` create an implicit profile via --user / --access-level read_write.",
+				NextCommands: []string{"agent-dbctl cred list --json"},
+			}
 		}
 		rwCredID = cp.ID
 	}
@@ -1060,7 +1138,11 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 		}
 		accLevel := req.AccessLevel
 		if accLevel == "" {
-			accLevel = types.AccessReadOnly
+			if envObj.SafetyTier == types.SafetyTierYOLO {
+				accLevel = types.AccessReadWrite
+			} else {
+				accLevel = types.AccessReadOnly
+			}
 		}
 		credName := strings.TrimSpace(req.CredName)
 		if credName == "" {
@@ -1145,6 +1227,9 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 		"instance":   "unchanged",
 		"target":     "unchanged",
 	}
+	if req.SafetyTier != "" || envAction != "unchanged" {
+		actions["environment"] = envAction
+	}
 
 	var missingSecrets []types.MissingSecretInfo
 	if req.DryRun {
@@ -1206,22 +1291,24 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 		}
 		actions["target"] = tgtAction
 
+		if req.ScanReadMode != "" {
+			polRes, err := s.AdminSetTargetScanReadMode(ctx, actor, tgtInput.ID, req.ScanReadMode, true)
+			if err != nil {
+				return DBAddResponse{}, err
+			}
+			actions["policy"] = polRes.Action
+		}
+
+		summary := s.dryRunTargetSummary(ctx, sysObj, envObj, tgtInput, engine, roCredID, rwCredID, req.ScanReadMode)
 		overall := "planned"
-		if actions["system"] == "unchanged" && actions["credential"] == "unchanged" && actions["instance"] == "unchanged" && actions["target"] == "unchanged" {
+		if envAction == "unchanged" && actions["system"] == "unchanged" && actions["credential"] == "unchanged" && actions["instance"] == "unchanged" && actions["target"] == "unchanged" && (actions["policy"] == "" || actions["policy"] == "unchanged") {
 			overall = "unchanged"
 		}
 		return DBAddResponse{
-			DryRun: true,
-			Status: overall,
-			Target: types.TargetSummary{
-				Ref:      ref,
-				Alias:    tgtInput.Alias,
-				System:   sysObj.Slug,
-				Env:      envObj.Code,
-				Engine:   engine,
-				Database: dbName,
-				Status:   tgtInput.Status,
-			},
+			DryRun:         true,
+			Status:         overall,
+			AccessLevel:    summarizeTargetAccessLevel(tgtInput.ROCredentialID, tgtInput.RWCredentialID, summary.Writable),
+			Target:         summary,
 			Actions:        actions,
 			MissingSecrets: missingSecrets,
 			Warnings:       warnings,
@@ -1284,20 +1371,30 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 	}
 	actions["target"] = tgtRes.Action
 
+	if req.ScanReadMode != "" {
+		polRes, err := s.AdminSetTargetScanReadMode(ctx, actor, tgtRes.Item.ID, req.ScanReadMode, false)
+		if err != nil {
+			return DBAddResponse{}, err
+		}
+		actions["policy"] = polRes.Action
+	}
+
 	detail, err := s.ResolveTarget(ctx, tgtRes.Item.Ref, req.WorkspaceCWD, req.WorkspaceGitRemotes...)
 	if err != nil {
 		return DBAddResponse{}, err
 	}
 
 	overall := tgtRes.Action
-	if overall == "unchanged" && (actions["system"] != "unchanged" || actions["credential"] != "unchanged" || actions["instance"] != "unchanged") {
+	if overall == "unchanged" && (envAction != "unchanged" || actions["system"] != "unchanged" || actions["credential"] != "unchanged" || actions["instance"] != "unchanged" || (actions["policy"] != "" && actions["policy"] != "unchanged")) {
 		overall = "updated"
 	}
 
+	summary := SummarizeTarget(detail)
 	resp := DBAddResponse{
 		DryRun:         false,
 		Status:         overall,
-		Target:         SummarizeTarget(detail),
+		AccessLevel:    summarizeTargetAccessLevel(detail.Target.ROCredentialID, detail.Target.RWCredentialID, summary.Writable),
+		Target:         summary,
 		Actions:        actions,
 		MissingSecrets: missingSecrets,
 		Warnings:       warnings,
@@ -1502,6 +1599,110 @@ func (s *Service) AdminUpsertPolicy(ctx context.Context, actor string, p types.P
 		Action: action,
 		Item:   saved,
 	}, nil
+}
+
+// AdminSetTargetScanReadMode creates or updates a target-scoped policy's ScanReadMode without disturbing other overrides.
+func (s *Service) AdminSetTargetScanReadMode(ctx context.Context, actor, targetIDOrRef string, mode types.ScanReadMode, dryRun bool) (AdminMutationResult[types.PolicyRuleSet], error) {
+	actor = defaultActor(actor)
+	switch mode {
+	case types.ScanReadAllow, types.ScanReadReasonOnly, types.ScanReadRequireApproval:
+	default:
+		return AdminMutationResult[types.PolicyRuleSet]{}, fmt.Errorf("invalid scan_read_mode %q (expected allow, reason_only, or require_approval)", mode)
+	}
+	if strings.TrimSpace(targetIDOrRef) == "" && dryRun {
+		return AdminMutationResult[types.PolicyRuleSet]{
+			DryRun: true,
+			Status: "planned",
+			Action: "created",
+			Item: types.PolicyRuleSet{
+				ScopeType:    "target",
+				ScanReadMode: mode,
+			},
+		}, nil
+	}
+	tgt, err := s.store.ResolveTargetRecord(ctx, targetIDOrRef)
+	if err != nil {
+		return AdminMutationResult[types.PolicyRuleSet]{}, err
+	}
+	policies, err := s.store.ListPolicies(ctx)
+	if err != nil {
+		return AdminMutationResult[types.PolicyRuleSet]{}, err
+	}
+	var existing *types.PolicyRuleSet
+	for _, p := range policies {
+		if (tgt.PolicyOverrideID != "" && p.ID == tgt.PolicyOverrideID) ||
+			(p.ScopeType == "target" && p.ScopeID == tgt.ID) {
+			cp := p
+			existing = &cp
+			break
+		}
+	}
+	if existing != nil {
+		existing.ScanReadMode = mode
+		return s.AdminUpsertPolicy(ctx, actor, *existing, dryRun)
+	}
+	return s.AdminUpsertPolicy(ctx, actor, types.PolicyRuleSet{
+		Name:         sanitizeSlug(tgt.Ref) + "-policy",
+		ScopeType:    "target",
+		ScopeID:      tgt.ID,
+		ScanReadMode: mode,
+	}, dryRun)
+}
+
+func summarizeTargetAccessLevel(roCredID, rwCredID string, writable bool) string {
+	if rwCredID != "" {
+		return string(types.AccessReadWrite)
+	}
+	if roCredID != "" {
+		return string(types.AccessReadOnly)
+	}
+	if writable {
+		return string(types.AccessReadWrite)
+	}
+	return string(types.AccessReadOnly)
+}
+
+func (s *Service) dryRunTargetSummary(ctx context.Context, sysObj types.System, envObj types.Environment, tgtInput types.Target, engine, roCredID, rwCredID string, overrideScanMode types.ScanReadMode) types.TargetSummary {
+	global, _ := s.store.GetGlobalSecurityConfig(ctx)
+	policies, _ := s.store.ListPolicies(ctx)
+	var linked []types.System
+	if len(tgtInput.LinkedSystemIDs) > 0 {
+		if allSys, err := s.store.ListSystems(ctx); err == nil {
+			byID := make(map[string]types.System, len(allSys))
+			for _, sys := range allSys {
+				byID[sys.ID] = sys
+			}
+			for _, id := range tgtInput.LinkedSystemIDs {
+				if sys, ok := byID[id]; ok {
+					linked = append(linked, sys)
+				}
+			}
+		}
+	}
+	eff := policy.ResolveEffectivePolicyWithSystems(global, &envObj, &sysObj, linked, tgtInput, policies)
+	if overrideScanMode != "" {
+		eff.ScanReadMode = overrideScanMode
+	}
+	hasRWPath := rwCredID != "" || (roCredID == "" && rwCredID == "")
+	frozen := eff.ProdReadOnlyFreeze && eff.SafetyTier == types.SafetyTierStrict
+	writable := tgtInput.Status == types.TargetActive && hasRWPath && !frozen
+
+	return types.TargetSummary{
+		Ref:             tgtInput.Ref,
+		Alias:           tgtInput.Alias,
+		System:          sysObj.Slug,
+		Env:             envObj.Code,
+		SafetyTier:      eff.SafetyTier,
+		Engine:          engine,
+		Database:        tgtInput.DatabaseName,
+		Status:          tgtInput.Status,
+		Writable:        writable,
+		ScanReadMode:    eff.ScanReadMode,
+		MaxRows:         eff.MaxRows,
+		ExecTimeoutSec:  eff.ExecTimeoutSec,
+		QuerySyntaxHint: engineQuerySyntaxHint(engine),
+		Description:     tgtInput.Description,
+	}
 }
 
 // AdminDeletePolicy removes a PolicyRuleSet by ID or name.

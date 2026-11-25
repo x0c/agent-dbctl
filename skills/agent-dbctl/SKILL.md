@@ -32,12 +32,12 @@ When a database is not yet registered (`db list` returns empty or `db_not_found`
 
 1. **One-shot registration (`db add`)**:
    - Unless `--no-workspace` is set, `db list` and `db add` automatically detect local `workspace_paths` and canonicalized `git_remotes` (supporting Git worktrees and subdirectories) to reuse matching systems instead of creating duplicates from worktree directory names. Pass `--git-remote <url>` (or `system set --git-remote <url>`) to bind additional remotes explicitly.
-   - **Zero-secret Web handoff (recommended when human will enter password)**: leave password blank and pass `--open-secret` so the browser opens straight to that credential's password dialog:
+   - **Zero-secret Web handoff & sensible defaults**: `db add --env dev` (`yolo`) defaults `--access-level` to `read_write`, while `guarded`/`strict` environments default to `read_only` (pass `--access-level read_write` if writes are needed on `guarded`). Pass `--safety-tier <yolo|guarded|strict>` to create a new `--env` inline in the same call, and `--scan-read-mode reason_only` to allow full-scan safe reads with `--reason` without browser popups. Leave password blank and pass `--open-secret` so the browser opens straight to that credential's password dialog:
      ```sh
      "$BIN" db add --engine postgres --host 127.0.0.1 --port 5432 --database orders \
        --system order-core --env prod --user app_ro --open-secret --json
      ```
-   - **DSN / automated secret sources**: pass `--dsn` / `--dsn-env` / `--dsn-stdin`, or pair flags with `--secret-env <VAR>` / `--secret-stdin` / `--secret-file <path>`, `--cred-kind env_ref --env-var-name <VAR>`, or `--cred-kind exec_provider --exec-command "<cmd>"`. Preview first with `--dry-run`; probe immediately with `--test`.
+   - **DSN / automated secret sources**: pass `--dsn` / `--dsn-env` / `--dsn-stdin`, or pair flags with `--secret-env <VAR>` / `--secret-stdin` / `--secret-file <path>`, `--cred-kind env_ref --env-var-name <VAR>`, or `--cred-kind exec_provider --exec-command "<cmd>"`. Preview first with `--dry-run`; probe immediately with `--test` (note: SQLite read-only probes require the DB file to exist on disk).
    - When `missing_secrets` appears in output, share `setup_url` or run `"$BIN" ui open --credential <name-or-id>` so the human enters the password into Keychain directly.
 2. **Bulk declarative topology (`topology`)**:
    - Print the exact YAML schema & field guide offline: `"$BIN" topology schema`

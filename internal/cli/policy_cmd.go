@@ -178,9 +178,13 @@ func registerPolicyCommands(
 			}
 			rows := make([][]string, 0, len(res.Items))
 			for _, p := range res.Items {
-				rows = append(rows, []string{p.ID, p.Name, p.ScopeType, p.ScopeID, p.ApprovalProvider})
+				scanMode := string(p.ScanReadMode)
+				if scanMode == "" {
+					scanMode = "-"
+				}
+				rows = append(rows, []string{p.ID, p.Name, p.ScopeType, p.ScopeID, scanMode, p.ApprovalProvider})
 			}
-			renderTable(ic.Stdout, []string{"ID", "NAME", "SCOPE_TYPE", "SCOPE_ID", "PROVIDER"}, rows)
+			renderTable(ic.Stdout, []string{"ID", "NAME", "SCOPE_TYPE", "SCOPE_ID", "SCAN_READ", "PROVIDER"}, rows)
 			return nil
 		},
 	}
@@ -202,6 +206,7 @@ func registerPolicyCommands(
 		maxRows             int
 		maxBytes            int64
 		explainMaxRows      int64
+		scanReadMode        string
 		approvalProvider    string
 		dryRun              bool
 	}
@@ -302,6 +307,9 @@ func registerPolicyCommands(
 				v := polSet.explainMaxRows
 				cur.ExplainMaxRows = &v
 			}
+			if cmd.Flags().Changed("scan-read-mode") {
+				cur.ScanReadMode = types.ScanReadMode(polSet.scanReadMode)
+			}
 			if cmd.Flags().Changed("approval-provider") {
 				cur.ApprovalProvider = polSet.approvalProvider
 			}
@@ -336,6 +344,7 @@ func registerPolicyCommands(
 	policySetCmd.Flags().IntVar(&polSet.maxRows, "max-rows", 0, "Scoped max rows ceiling")
 	policySetCmd.Flags().Int64Var(&polSet.maxBytes, "max-bytes", 0, "Scoped max bytes ceiling")
 	policySetCmd.Flags().Int64Var(&polSet.explainMaxRows, "explain-max-rows", 0, "Scoped preflight row limit")
+	policySetCmd.Flags().StringVar(&polSet.scanReadMode, "scan-read-mode", "", "Full-scan safe-read handling (allow|reason_only|require_approval)")
 	policySetCmd.Flags().StringVar(&polSet.approvalProvider, "approval-provider", "", "Approval provider (local-web|webhook)")
 	policySetCmd.Flags().BoolVar(&polSet.dryRun, "dry-run", false, "Preview change without saving")
 	annotateCommand(policySetCmd, RiskWriteLocal, "agent-dbctl policy set prod-strict --scope-type env --scope-id prod --max-rows 200 --json")
@@ -431,7 +440,13 @@ func registerPolicyCommands(
 				setExitCode(ic.WriteError(types.ErrCodeInvalidUsage, false, "--file and --stdin are mutually exclusive.", "", nil, nil, types.Meta{}))
 				return nil
 			}
+			client, err := ensureDaemon(ic, version, commit)
+			if err != nil {
+				setExitCode(writeClientInitErr(ic, err))
+				return nil
+			}
 			var rule types.RiskPatternRule
+			var existingRule *types.RiskPatternRule
 			if patSet.file != "" || patSet.stdin {
 				var raw []byte
 				var err error
@@ -447,6 +462,54 @@ func registerPolicyCommands(
 				if err := yamlOrJSONDecode(raw, &rule); err != nil {
 					setExitCode(ic.WriteError(types.ErrCodeInvalidUsage, false, err.Error(), "", nil, nil, types.Meta{}))
 					return nil
+				}
+			} else if len(args) == 1 {
+				key := strings.TrimSpace(args[0])
+				var listed struct {
+					Items []types.RiskPatternRule `json:"items"`
+				}
+				if err := client.DoJSON(cmd.Context(), http.MethodGet, "/rpc/v1/risk-patterns", nil, &listed); err == nil {
+					var nameMatches []types.RiskPatternRule
+					for _, item := range listed.Items {
+						if item.ID == key {
+							cp := item
+							existingRule = &cp
+							break
+						}
+						if strings.EqualFold(item.Name, key) {
+							nameMatches = append(nameMatches, item)
+						}
+					}
+					if existingRule == nil && len(nameMatches) > 0 {
+						if cmd.Flags().Changed("scope-type") || cmd.Flags().Changed("scope-id") {
+							for _, item := range nameMatches {
+								if (!cmd.Flags().Changed("scope-type") || strings.EqualFold(item.ScopeType, patSet.scopeType)) &&
+									(!cmd.Flags().Changed("scope-id") || strings.EqualFold(item.ScopeID, patSet.scopeID) || patSet.scopeID == "") {
+									cp := item
+									existingRule = &cp
+									break
+								}
+							}
+						} else if len(nameMatches) == 1 {
+							cp := nameMatches[0]
+							existingRule = &cp
+						} else {
+							for _, item := range nameMatches {
+								if item.ScopeType == "global" {
+									cp := item
+									existingRule = &cp
+									break
+								}
+							}
+							if existingRule == nil {
+								cp := nameMatches[0]
+								existingRule = &cp
+							}
+						}
+					}
+				}
+				if existingRule != nil {
+					rule = *existingRule
 				}
 			}
 			if len(args) == 1 && rule.Name == "" {
@@ -464,7 +527,7 @@ func registerPolicyCommands(
 			if rule.ScopeType == "global" && rule.ScopeID == "" {
 				rule.ScopeID = "global"
 			}
-			if cmd.Flags().Changed("action") {
+			if cmd.Flags().Changed("action") || (existingRule == nil && rule.Action == "") {
 				rule.Action = types.PatternAction(patSet.action)
 			}
 			if cmd.Flags().Changed("regex") {
@@ -474,13 +537,20 @@ func registerPolicyCommands(
 					Target:        patSet.regexTarget,
 					CaseSensitive: patSet.caseSensitive,
 				}
+			} else if existingRule != nil && rule.Condition.Type == types.MatcherRegex {
+				if cmd.Flags().Changed("target") {
+					rule.Condition.Target = patSet.regexTarget
+				}
+				if cmd.Flags().Changed("case-sensitive") {
+					rule.Condition.CaseSensitive = patSet.caseSensitive
+				}
 			}
 			if cmd.Flags().Changed("engine") {
 				rule.Engines = patSet.engines
 			}
 			if cmd.Flags().Changed("enabled") {
 				rule.Enabled = patSet.enabled
-			} else if patSet.file == "" && !patSet.stdin {
+			} else if existingRule == nil && patSet.file == "" && !patSet.stdin {
 				rule.Enabled = true
 			}
 			if cmd.Flags().Changed("priority") {
@@ -497,11 +567,6 @@ func registerPolicyCommands(
 			}
 			if cmd.Flags().Changed("description") {
 				rule.Description = patSet.description
-			}
-			client, err := ensureDaemon(ic, version, commit)
-			if err != nil {
-				setExitCode(writeClientInitErr(ic, err))
-				return nil
 			}
 			var res daemon.AdminMutationResult[types.RiskPatternRule]
 			if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/risk-patterns", map[string]any{

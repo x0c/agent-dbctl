@@ -237,6 +237,7 @@ export interface PolicyRuleSet {
   max_rows?: number | null
   max_bytes?: number | null
   explain_max_rows?: number | null
+  scan_read_mode?: 'allow' | 'reason_only' | 'require_approval' | ''
   approval_provider?: string
 }
 

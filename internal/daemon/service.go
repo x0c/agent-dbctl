@@ -491,7 +491,25 @@ func (s *Service) PingTarget(ctx context.Context, detail types.TargetDetail) typ
 	defer cancel()
 	conn, err := s.openDriverConn(connCtx, detail, types.AccessReadOnly, false)
 	if err != nil {
-		res.Error = err.Error()
+		msg := err.Error()
+		if classify.CanonicalEngine(res.Engine) == "sqlite" && strings.Contains(strings.ToLower(msg), "unable to open database file") && detail.Instance != nil {
+			dbPath := strings.TrimSpace(detail.Target.DatabaseName)
+			if dbPath == "" {
+				dbPath = strings.TrimSpace(detail.Instance.Host)
+			}
+			if dbPath != "" && dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
+				checkPath := dbPath
+				if strings.HasPrefix(checkPath, "~/") {
+					if home, hErr := os.UserHomeDir(); hErr == nil {
+						checkPath = home + checkPath[1:]
+					}
+				}
+				if _, statErr := os.Stat(checkPath); os.IsNotExist(statErr) {
+					msg += fmt.Sprintf(" (SQLite file %q does not exist yet; read-only probes open with mode=ro and do not create empty files — create the file or run a write query in a yolo environment first)", dbPath)
+				}
+			}
+		}
+		res.Error = msg
 		return res
 	}
 	defer func() { _ = conn.Close() }()
@@ -743,10 +761,14 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 	if cfgErr == nil {
 		requireReason = globalCfg.RequireReasonForApproval
 	}
-	if eval.Decision == types.DecisionRequireApproval && requireReason && strings.TrimSpace(req.Reason) == "" {
+	if ((eval.Decision == types.DecisionRequireApproval && requireReason) || eval.RequireReason) && strings.TrimSpace(req.Reason) == "" {
 		resp := buildExecResponseSkeleton(detail, cls, pf, eval, types.OpDenied)
 		resp.ErrorCode = types.ErrCodeReasonRequired
-		resp.ErrorMessage = "A business reason (--reason) is required when requesting human approval."
+		if eval.RequireReason && eval.Decision == types.DecisionAllow {
+			resp.ErrorMessage = "A business reason (--reason) is required for scan-read queries on this target (scan_read_mode=reason_only)."
+		} else {
+			resp.ErrorMessage = "A business reason (--reason) is required when requesting human approval."
+		}
 		return resp, nil
 	}
 	redacted := req.Query

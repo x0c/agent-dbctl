@@ -871,3 +871,79 @@ func TestCLISystemGitRemoteAndWorktreeResolution(t *testing.T) {
 		t.Fatalf("unexpected normalized git_remotes: %+v", remotes)
 	}
 }
+
+func TestCLIFrictionFixesAndPatternPartialUpdate(t *testing.T) {
+	bin := buildTestCLI(t)
+	cfgHome := t.TempDir()
+
+	runCLI := func(args ...string) (int, types.Envelope) {
+		t.Helper()
+		cmd := exec.Command(bin, args...)
+		cmd.Env = append(os.Environ(),
+			config.EnvConfigHome+"="+cfgHome,
+			config.EnvSecretBackend+"=file",
+			config.EnvNoBrowser+"=1",
+			config.EnvSession+"=cli-friction-test",
+			config.EnvNoSkillSync+"=1",
+		)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		code := 0
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				code = ee.ExitCode()
+			} else {
+				t.Fatalf("run %v: %v", args, err)
+			}
+		}
+		var env types.Envelope
+		if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+			t.Fatalf("invalid json for %v: %v\nstdout=%s\nstderr=%s", args, err, stdout.String(), stderr.String())
+		}
+		return code, env
+	}
+
+	dbFile := filepath.Join(t.TempDir(), "friction.db")
+	// 1. Missing env without --safety-tier includes actionable hint and next_commands.
+	code, env := runCLI("db", "add", "--engine", "sqlite", "--host", dbFile, "--env", "staging-missing", "--no-workspace", "--json")
+	if code == 0 || env.OK || env.Error == nil || len(env.Error.NextCommands) == 0 || !strings.Contains(env.Error.Hint, "--safety-tier") {
+		t.Fatalf("expected missing env hint and next_commands, got code=%d env=%+v", code, env)
+	}
+
+	// 2. Inline --safety-tier creates environment + sets --scan-read-mode in one `db add` call.
+	code, env = runCLI("db", "add", "--engine", "sqlite", "--host", dbFile, "--system", "orders", "--env", "uat", "--safety-tier", "guarded", "--scan-read-mode", "reason_only", "--alias", "uat-orders", "--no-workspace", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("inline env db add failed: code=%d env=%+v", code, env)
+	}
+	tgtSummary := env.Data.(map[string]any)["target"].(map[string]any)
+	if tgtSummary["safety_tier"] != "guarded" || tgtSummary["scan_read_mode"] != "reason_only" {
+		t.Fatalf("unexpected inline env target summary: %+v", tgtSummary)
+	}
+
+	// 3. `db set --scan-read-mode allow` updates scan_read_mode cleanly.
+	code, env = runCLI("db", "set", "uat-orders", "--scan-read-mode", "allow", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("db set --scan-read-mode failed: code=%d env=%+v", code, env)
+	}
+	code, env = runCLI("db", "show", "uat-orders", "--json")
+	if code != 0 || !env.OK || env.Data.(map[string]any)["scan_read_mode"] != "allow" {
+		t.Fatalf("expected db show scan_read_mode=allow, got code=%d env=%+v", code, env)
+	}
+
+	// 4. `pattern set` partial flag update (`--enabled=false`) preserves existing Condition & Action.
+	code, env = runCLI("pattern", "set", "block-full-update", "--scope-type", "env", "--scope-id", "uat", "--action", "deny", "--regex", `\bUPDATE\b`, "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("pattern set create failed: code=%d env=%+v", code, env)
+	}
+	code, env = runCLI("pattern", "set", "block-full-update", "--enabled=false", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("pattern set partial disable failed: code=%d env=%+v", code, env)
+	}
+	item := env.Data.(map[string]any)["item"].(map[string]any)
+	cond := item["condition"].(map[string]any)
+	if item["enabled"] != false || item["action"] != "deny" || item["scope_type"] != "env" || cond["pattern"] != `\bUPDATE\b` {
+		t.Fatalf("expected partial pattern set to preserve condition/action/scope, got %+v", item)
+	}
+}

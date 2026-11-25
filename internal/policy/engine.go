@@ -59,6 +59,7 @@ func ResolveEffectivePolicyWithSystems(
 	switch tier {
 	case types.SafetyTierYOLO:
 		eff.AllowMultiStatement = true
+		eff.ScanReadMode = types.ScanReadAllow
 		eff.Sources["safety_tier"] = envLabel
 	case types.SafetyTierGuarded:
 		eff.RequireApprovalOnHighCostRead = true
@@ -67,6 +68,7 @@ func ResolveEffectivePolicyWithSystems(
 		eff.RequireApprovalOnAdmin = true
 		eff.RequireApprovalOnUnknown = true
 		eff.AllowMultiStatement = false
+		eff.ScanReadMode = types.ScanReadRequireApproval
 		eff.Sources["safety_tier"] = envLabel
 	case types.SafetyTierStrict:
 		eff.RequireApprovalOnHighCostRead = true
@@ -75,8 +77,10 @@ func ResolveEffectivePolicyWithSystems(
 		eff.RequireApprovalOnAdmin = true
 		eff.RequireApprovalOnUnknown = true
 		eff.AllowMultiStatement = !global.BlockMultiStatementInProd
+		eff.ScanReadMode = types.ScanReadRequireApproval
 		eff.Sources["safety_tier"] = envLabel
 	}
+	eff.Sources["scan_read_mode"] = envLabel
 	eff.Sources["allow_safe_read"] = envLabel
 	eff.Sources["require_approval_on_high_cost_read"] = envLabel
 	eff.Sources["require_approval_on_write"] = envLabel
@@ -147,6 +151,10 @@ func ResolveEffectivePolicyWithSystems(
 		if p.ApprovalProvider != "" {
 			eff.ApprovalProvider = p.ApprovalProvider
 			eff.Sources["approval_provider"] = src
+		}
+		if p.ScanReadMode != "" {
+			eff.ScanReadMode = p.ScanReadMode
+			eff.Sources["scan_read_mode"] = src
 		}
 	}
 
@@ -277,7 +285,17 @@ func EvaluateQuery(
 		return eval
 	}
 
+	scanMode := eff.ScanReadMode
+	if scanMode == "" {
+		if eff.SafetyTier == types.SafetyTierYOLO {
+			scanMode = types.ScanReadAllow
+		} else {
+			scanMode = types.ScanReadRequireApproval
+		}
+	}
+
 	var reasons []string
+	var scanReasons []string
 	if cls.StatementCount > 1 && !eff.AllowMultiStatement {
 		reasons = append(reasons, "multi_statement_requires_approval")
 	}
@@ -287,12 +305,12 @@ func EvaluateQuery(
 		if !eff.AllowSafeRead {
 			reasons = append(reasons, "safe_read_requires_approval")
 		}
-		if eff.SafetyTier != types.SafetyTierYOLO && preflight != nil {
+		if scanMode != types.ScanReadAllow && preflight != nil {
 			if preflight.FullScan {
-				reasons = append(reasons, "preflight_full_scan")
+				scanReasons = append(scanReasons, "preflight_full_scan")
 			}
 			if preflight.EstimatedRows > 0 && eff.ExplainMaxRows > 0 && preflight.EstimatedRows > eff.ExplainMaxRows {
-				reasons = append(reasons, fmt.Sprintf("preflight_estimated_rows_exceeded(%d>%d)", preflight.EstimatedRows, eff.ExplainMaxRows))
+				scanReasons = append(scanReasons, fmt.Sprintf("preflight_estimated_rows_exceeded(%d>%d)", preflight.EstimatedRows, eff.ExplainMaxRows))
 			}
 		}
 	case types.RiskHighCostRead:
@@ -340,6 +358,10 @@ func EvaluateQuery(
 		}
 	}
 
+	if scanMode != types.ScanReadReasonOnly && len(scanReasons) > 0 {
+		reasons = append(reasons, scanReasons...)
+	}
+
 	if patternDeny != nil {
 		eval.Decision = types.DecisionDeny
 		eval.DenyCode = types.ErrCodePolicyDenied
@@ -355,16 +377,20 @@ func EvaluateQuery(
 		default:
 			eval.DenyMessage = fmt.Sprintf("Blocked by custom risk pattern rule %q", patternDeny.RuleName)
 		}
-		eval.TriggerReasons = deduplicateStrings(reasons)
+		eval.TriggerReasons = deduplicateStrings(append(reasons, scanReasons...))
 		return eval
 	}
 
 	if len(reasons) > 0 {
 		eval.Decision = types.DecisionRequireApproval
-		eval.TriggerReasons = deduplicateStrings(reasons)
+		eval.TriggerReasons = deduplicateStrings(append(reasons, scanReasons...))
 		if patternApprovalProvider != "" {
 			eval.EffectivePolicy.ApprovalProvider = patternApprovalProvider
 		}
+	} else if scanMode == types.ScanReadReasonOnly && len(scanReasons) > 0 {
+		eval.Decision = types.DecisionAllow
+		eval.RequireReason = true
+		eval.TriggerReasons = deduplicateStrings(scanReasons)
 	}
 	return eval
 }

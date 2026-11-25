@@ -255,3 +255,73 @@ func TestLinkedSystemsMonotonicityAndReadOnlyTarget(t *testing.T) {
 		t.Fatalf("expected linked system pattern escalation, got %+v", evRead)
 	}
 }
+
+func TestScanReadModeModes(t *testing.T) {
+	global := types.GlobalSecurityConfig{
+		ExecTimeoutSec:          15,
+		ApprovalTimeoutSec:      120,
+		MaxRows:                 200,
+		MaxBytes:                262144,
+		ExplainMaxRows:          1000,
+		ProdReadOnlyFreeze:      true,
+		DefaultApprovalProvider: "local-web",
+	}
+	strictEnv := &types.Environment{Code: "prod", SafetyTier: types.SafetyTierStrict}
+	sys := &types.System{ID: "sys1", Slug: "orders"}
+	tgt := types.Target{
+		ID:              "tgt_prod",
+		Ref:             "orders/prod/main",
+		OwnerSystemID:   "sys1",
+		EnvironmentCode: "prod",
+		ROCredentialID:  "cred_ro",
+		RWCredentialID:  "cred_rw",
+		Status:          types.TargetActive,
+	}
+	scanPF := &types.PreflightReport{Supported: true, Executed: true, FullScan: true, EstimatedRows: 50000}
+	safeRead := types.Classification{RiskLevel: types.RiskSafeRead, IsReadOnly: true, StatementCount: 1}
+
+	// Default strict requires human approval on full-scan read.
+	effDefault := policy.ResolveEffectivePolicy(global, strictEnv, sys, tgt, nil)
+	if effDefault.ScanReadMode != types.ScanReadRequireApproval {
+		t.Fatalf("expected default strict scan_read_mode=require_approval, got %q", effDefault.ScanReadMode)
+	}
+	evDefault := policy.EvaluateQuery(tgt, effDefault, safeRead, scanPF, "SELECT COUNT(*) FROM orders")
+	if evDefault.Decision != types.DecisionRequireApproval || evDefault.RequireReason {
+		t.Fatalf("expected require_approval under default strict, got %+v", evDefault)
+	}
+
+	// Target override scan_read_mode=reason_only lets scan reads run immediately when --reason is supplied.
+	effReasonOnly := policy.ResolveEffectivePolicy(global, strictEnv, sys, tgt, []types.PolicyRuleSet{{
+		ID:           "pol_scan_reason",
+		Name:         "orders-scan-reason",
+		ScopeType:    "target",
+		ScopeID:      tgt.ID,
+		ScanReadMode: types.ScanReadReasonOnly,
+	}})
+	if effReasonOnly.ScanReadMode != types.ScanReadReasonOnly {
+		t.Fatalf("expected scan_read_mode=reason_only, got %q", effReasonOnly.ScanReadMode)
+	}
+	evReasonOnly := policy.EvaluateQuery(tgt, effReasonOnly, safeRead, scanPF, "SELECT COUNT(*) FROM orders")
+	if evReasonOnly.Decision != types.DecisionAllow || !evReasonOnly.RequireReason {
+		t.Fatalf("expected DecisionAllow with RequireReason=true under reason_only, got %+v", evReasonOnly)
+	}
+
+	// Non-scan-only high-cost risk (e.g. RiskHighCostRead or matched custom pattern) still requires approval.
+	evHighCost := policy.EvaluateQuery(tgt, effReasonOnly, types.Classification{RiskLevel: types.RiskHighCostRead, IsReadOnly: true, StatementCount: 1}, scanPF, "SELECT /*+ FULL(o) */ * FROM orders o")
+	if evHighCost.Decision != types.DecisionRequireApproval {
+		t.Fatalf("expected RiskHighCostRead to still require approval, got %+v", evHighCost)
+	}
+
+	// Target override scan_read_mode=allow permits scan reads directly without approval or --reason.
+	effAllow := policy.ResolveEffectivePolicy(global, strictEnv, sys, tgt, []types.PolicyRuleSet{{
+		ID:           "pol_scan_allow",
+		Name:         "orders-scan-allow",
+		ScopeType:    "target",
+		ScopeID:      tgt.ID,
+		ScanReadMode: types.ScanReadAllow,
+	}})
+	evAllow := policy.EvaluateQuery(tgt, effAllow, safeRead, scanPF, "SELECT COUNT(*) FROM orders")
+	if evAllow.Decision != types.DecisionAllow || evAllow.RequireReason {
+		t.Fatalf("expected direct DecisionAllow under scan_read_mode=allow, got %+v", evAllow)
+	}
+}

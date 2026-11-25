@@ -241,9 +241,10 @@ Typical agent workflow:
 				rwName = detail.RWCredential.Name
 			}
 			_, _ = fmt.Fprintf(ic.Stdout,
-				"Ref:       %s (alias: %s)\nStatus:    %s\nEnv:       %s (%s)\nEngine:    %s\nEndpoint:  %s\nDatabase:  %s\nNetwork:   %s\nCreds:     ro=%s, rw=%s\nTimeout:   %ds (%s)\nMaxRows:   %d (%s)\nMaxBytes:  %d (%s)\nExplain:   max_rows=%d (%s)\nMultiStmt: %v\n",
+				"Ref:       %s (alias: %s)\nStatus:    %s\nEnv:       %s (%s)\nWritable:  %v\nScanRead:  %s\nEngine:    %s\nEndpoint:  %s\nDatabase:  %s\nNetwork:   %s\nCreds:     ro=%s, rw=%s\nTimeout:   %ds (%s)\nMaxRows:   %d (%s)\nMaxBytes:  %d (%s)\nExplain:   max_rows=%d (%s)\nMultiStmt: %v\n",
 				detail.Target.Ref, detail.Target.Alias, detail.Target.Status,
 				detail.Target.EnvironmentCode, detail.EffectivePolicy.SafetyTier,
+				SummarizeWritable(detail), detail.EffectivePolicy.ScanReadMode,
 				eng, endpoint, detail.Target.DatabaseName, netLabel, roName, rwName,
 				detail.EffectivePolicy.ExecTimeoutSec, detail.EffectivePolicy.Sources["exec_timeout_sec"],
 				detail.EffectivePolicy.MaxRows, detail.EffectivePolicy.Sources["max_rows"],
@@ -1505,9 +1506,18 @@ func renderExecOutcomeWithOpts(ic IOContext, resp types.ExecResponse, opts execR
 
 		switch {
 		case resp.ErrorCode == types.ErrCodeReasonRequired:
-			hint = `Pass --reason "<concise business reason>" explaining why this operation is needed for human reviewers.`
+			if resp.Evaluation.RequireReason && resp.Evaluation.Decision == types.DecisionAllow {
+				hint = `Scan-read policy on this target requires --reason (scan_read_mode=reason_only). Pass --reason "<business reason>" to run without browser approval.`
+			} else {
+				hint = `Pass --reason "<concise business reason>" explaining why this operation is needed for human reviewers.`
+			}
 			if resp.TargetRef != "" {
 				next = append(next, fmt.Sprintf("%s exec --db %s --reason \"<reason>\" --sql \"...\" --json", ic.BinPath, resp.TargetRef))
+			}
+		case resp.ErrorCode == types.ErrCodePolicyDenied && sliceContains(resp.Evaluation.TriggerReasons, "read_only_target"):
+			hint = "Target is configured with read-only credentials only. Re-register with --access-level read_write or attach a read-write credential via `db set --rw-cred`."
+			if resp.TargetRef != "" {
+				next = append(next, fmt.Sprintf("%s db set %s --rw-cred <cred> --json", ic.BinPath, resp.TargetRef))
 			}
 		case resp.Status == types.OpTimedOut && !resp.Classification.IsReadOnly:
 			hint = "Write/mutating query timed out; verify state via read-only query before retrying."
@@ -1520,12 +1530,17 @@ func renderExecOutcomeWithOpts(ic IOContext, resp types.ExecResponse, opts execR
 					label = top.RuleName
 				}
 				hint = fmt.Sprintf("High-risk pattern matched (%s). Run op wait or confirm in browser.", label)
+			} else if resp.Classification.RiskLevel == types.RiskSafeRead && sliceContains(resp.Evaluation.TriggerReasons, "preflight_full_scan") {
+				hint = "Safe read triggered approval because EXPLAIN detected a full table scan. Confirm in browser or configure `--scan-read-mode reason_only` on this target."
 			}
 			if resp.OperationID != "" {
 				next = append(next,
 					fmt.Sprintf("%s op wait %s --timeout 60s --json", ic.BinPath, resp.OperationID),
 					fmt.Sprintf("%s op status %s --json", ic.BinPath, resp.OperationID),
 				)
+			}
+			if resp.TargetRef != "" && resp.Classification.RiskLevel == types.RiskSafeRead && sliceContains(resp.Evaluation.TriggerReasons, "preflight_full_scan") {
+				next = append(next, fmt.Sprintf("%s db set %s --scan-read-mode reason_only --json", ic.BinPath, resp.TargetRef))
 			}
 		case resp.ErrorCode == types.ErrCodeDriverError:
 			drvHint, drvNext := buildDriverErrorGuidance(ic.BinPath, resp)
@@ -1909,7 +1924,9 @@ func writeRPCErr(ic IOContext, err error) int {
 		}
 		var next []string
 		hint := "Pick an exact target ref or alias from context."
-		if len(le.Candidates) > 0 {
+		if le.Hint != "" {
+			hint = le.Hint
+		} else if len(le.Candidates) > 0 {
 			cands := make([]map[string]string, 0, len(le.Candidates))
 			for _, c := range le.Candidates {
 				eng := ""
@@ -1948,12 +1965,33 @@ func writeRPCErr(ic IOContext, err error) int {
 		} else {
 			hint = "Inspect error message and verify target state or query."
 		}
+		if len(le.NextCommands) > 0 {
+			for _, cmdStr := range le.NextCommands {
+				if strings.HasPrefix(cmdStr, "agent-dbctl ") {
+					cmdStr = ic.BinPath + cmdStr[len("agent-dbctl"):]
+				}
+				next = append(next, cmdStr)
+			}
+		}
 		if len(ctxMap) == 0 {
 			ctxMap = nil
 		}
 		return ic.WriteError(le.Code, false, le.Message, hint, ctxMap, next, types.Meta{})
 	}
 	return ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
+}
+
+func SummarizeWritable(d types.TargetDetail) bool {
+	return daemon.SummarizeTarget(d).Writable
+}
+
+func sliceContains(items []string, target string) bool {
+	for _, it := range items {
+		if it == target {
+			return true
+		}
+	}
+	return false
 }
 
 func inspectFilePermissions(paths config.Paths) (dirMode string, dbMode string, ok bool) {

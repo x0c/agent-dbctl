@@ -290,6 +290,10 @@ const EN_MESSAGES = {
   'policies.field.inheritGlobal': 'Inherit global',
   'policies.field.approveHighCost': 'Approve High-Cost Read',
   'policies.field.approveWrites': 'Approve Writes',
+  'policies.field.scanReadMode': 'Full-Scan Safe Read',
+  'policies.scanRead.requireApproval': 'Require approval',
+  'policies.scanRead.reasonOnly': 'Allow with --reason (no approval)',
+  'policies.scanRead.allow': 'Allow directly',
   'policies.field.providerOverride': 'Approval Provider Override',
   'policies.field.inheritParent': 'Inherit parent / global',
 
@@ -715,6 +719,10 @@ const ZH_MESSAGES: Record<TranslationKey, string> = {
   'policies.field.inheritGlobal': '继承全局设置',
   'policies.field.approveHighCost': '高耗读需审批',
   'policies.field.approveWrites': '写操作需审批',
+  'policies.field.scanReadMode': '全表扫描只读策略',
+  'policies.scanRead.requireApproval': '需要人工审批',
+  'policies.scanRead.reasonOnly': '仅需填写 --reason（免审批）',
+  'policies.scanRead.allow': '直接放行',
   'policies.field.providerOverride': '审批通道覆盖',
   'policies.field.inheritParent': '继承上级 / 全局设置',
 

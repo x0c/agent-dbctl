@@ -715,4 +715,41 @@ INSERT INTO systems(id, slug, name, created_at_utc, updated_at_utc) VALUES ('sys
 	if len(syss) != 1 || len(syss[0].GitRemotes) != 0 {
 		t.Fatalf("expected explicit empty git_remotes to clear binding, got %+v", syss)
 	}
+
+	// Policy ScanReadMode persists across UpsertPolicy, ListPolicies, and Topology export/apply.
+	polSaved, err := st.UpsertPolicy(ctx, "admin", types.PolicyRuleSet{
+		Name:         "prod-scan-reason",
+		ScopeType:    "env",
+		ScopeID:      "prod",
+		ScanReadMode: types.ScanReadReasonOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertPolicy scan_read_mode: %v", err)
+	}
+	if polSaved.ScanReadMode != types.ScanReadReasonOnly {
+		t.Fatalf("expected saved ScanReadMode=reason_only, got %q", polSaved.ScanReadMode)
+	}
+	exported, err := st.ExportTopology(ctx)
+	if err != nil {
+		t.Fatalf("ExportTopology: %v", err)
+	}
+	var found bool
+	for _, p := range exported.Policies {
+		if p.ID == polSaved.ID {
+			found = true
+			if p.ScanReadMode != types.ScanReadReasonOnly {
+				t.Fatalf("expected exported ScanReadMode=reason_only, got %q", p.ScanReadMode)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected saved policy %q in ExportTopology", polSaved.ID)
+	}
+	planRes, err := st.PlanTopologyImport(ctx, exported)
+	if err != nil {
+		t.Fatalf("PlanTopologyImport: %v", err)
+	}
+	if planRes.Summary.Policies.Unchanged == 0 {
+		t.Fatalf("expected exported scan_read_mode policy to match unchanged in PlanTopologyImport, got %+v", planRes.Summary.Policies)
+	}
 }

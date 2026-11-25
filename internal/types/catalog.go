@@ -173,6 +173,7 @@ type TargetSummary struct {
 	Database        string       `json:"database,omitempty"`
 	Status          TargetStatus `json:"status"`
 	Writable        bool         `json:"writable"`
+	ScanReadMode    ScanReadMode `json:"scan_read_mode,omitempty"`
 	MaxRows         int          `json:"max_rows"`
 	ExecTimeoutSec  int          `json:"exec_timeout_sec"`
 	WorkspaceMatch  bool         `json:"workspace_match,omitempty"`

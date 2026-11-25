@@ -47,27 +47,29 @@ func registerDBWriteCommands(
 		systemName  string
 		workspaces  []string
 		gitRemotes  []string
-		noWorkspace bool
-		env         string
-		instance    string
-		role        string
-		network     string
-		user        string
-		credName    string
-		credKind    string
-		accessLevel string
-		roCred      string
-		rwCred      string
-		envVarName  string
-		execCommand string
-		secretEnv   string
-		secretFile  string
-		secretStdin bool
-		status      string
-		description string
-		test        bool
-		dryRun      bool
-		openSecret  bool
+		noWorkspace  bool
+		env          string
+		safetyTier   string
+		instance     string
+		role         string
+		network      string
+		user         string
+		credName     string
+		credKind     string
+		accessLevel  string
+		roCred       string
+		rwCred       string
+		envVarName   string
+		execCommand  string
+		secretEnv    string
+		secretFile   string
+		secretStdin  bool
+		status       string
+		scanReadMode string
+		description  string
+		test         bool
+		dryRun       bool
+		openSecret   bool
 	}
 	dbAddCmd := &cobra.Command{
 		Use:   "add",
@@ -114,6 +116,7 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 				GitRemotes:            addOpts.gitRemotes,
 				NoWorkspace:           addOpts.noWorkspace,
 				Env:                   addOpts.env,
+				SafetyTier:            types.SafetyTier(addOpts.safetyTier),
 				Instance:              addOpts.instance,
 				Role:                  types.InstanceRole(addOpts.role),
 				Network:               addOpts.network,
@@ -128,6 +131,7 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 				SecretValue:           secVal,
 				SecretProvided:        secProvided,
 				Status:                types.TargetStatus(addOpts.status),
+				ScanReadMode:          types.ScanReadMode(addOpts.scanReadMode),
 				Description:           addOpts.description,
 				DryRun:                addOpts.dryRun,
 				Test:                  addOpts.test,
@@ -152,7 +156,12 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 				setExitCode(ic.WriteSuccess(res, types.Meta{}))
 				return nil
 			}
-			_, _ = fmt.Fprintf(ic.Stdout, "Target: %s (%s, env=%s, engine=%s)\n", res.Target.Ref, res.Status, res.Target.Env, res.Target.Engine)
+			_, _ = fmt.Fprintf(ic.Stdout, "Target: %s (%s, env=%s, tier=%s, engine=%s, writable=%v, scan_read=%s)\n",
+				res.Target.Ref, res.Status, res.Target.Env, res.Target.SafetyTier, res.Target.Engine, res.Target.Writable, res.Target.ScanReadMode)
+			if !res.Target.Writable && res.Target.SafetyTier != types.SafetyTierStrict && res.Target.Ref != "" {
+				_, _ = fmt.Fprintf(ic.Stdout, "Note: Read-only access (access_level=%s). For write operations, use `--access-level read_write` or `db set %s --rw-cred <cred>`.\n",
+					res.AccessLevel, res.Target.Ref)
+			}
 			if len(res.MissingSecrets) > 0 {
 				for _, ms := range res.MissingSecrets {
 					_, _ = fmt.Fprintf(ic.Stdout, "Missing secret for credential %q (%s): %s\n", ms.Name, ms.ID, ms.SetupURL)
@@ -187,6 +196,7 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 	dbAddCmd.Flags().StringArrayVar(&addOpts.gitRemotes, "git-remote", nil, "Git remote URL or host/org/repo to bind to the system (repeatable)")
 	dbAddCmd.Flags().BoolVar(&addOpts.noWorkspace, "no-workspace", false, "Do not bind current working directory or Git remotes to system")
 	dbAddCmd.Flags().StringVar(&addOpts.env, "env", "dev", "Environment code (default: dev)")
+	dbAddCmd.Flags().StringVar(&addOpts.safetyTier, "safety-tier", "", "Safety tier (yolo|guarded|strict) to create --env inline if it does not exist yet")
 	dbAddCmd.Flags().StringVar(&addOpts.instance, "instance", "", "Existing or custom Instance name/ID")
 	dbAddCmd.Flags().StringVar(&addOpts.role, "role", "", "Instance role (primary|replica|standalone)")
 	dbAddCmd.Flags().StringVar(&addOpts.network, "network", "", "Existing NetworkProfile name or ID")
@@ -202,6 +212,7 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 	dbAddCmd.Flags().StringVar(&addOpts.secretFile, "secret-file", "", "File path holding the password/secret")
 	dbAddCmd.Flags().BoolVar(&addOpts.secretStdin, "secret-stdin", false, "Read password/secret from stdin")
 	dbAddCmd.Flags().StringVar(&addOpts.status, "status", "", "Target status (active|maintenance|disabled)")
+	dbAddCmd.Flags().StringVar(&addOpts.scanReadMode, "scan-read-mode", "", "Full-scan safe-read handling (allow|reason_only|require_approval)")
 	dbAddCmd.Flags().StringVar(&addOpts.description, "description", "", "Target description")
 	dbAddCmd.Flags().BoolVar(&addOpts.test, "test", false, "Run live Ping test after configuring target")
 	dbAddCmd.Flags().BoolVar(&addOpts.dryRun, "dry-run", false, "Preview planned catalog/credential changes without writing")
@@ -209,20 +220,21 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 	annotateCommand(dbAddCmd, RiskWriteLocal, "agent-dbctl db add --dsn postgres://reader@localhost:5432/app --env dev --open-secret --json\nagent-dbctl db add --engine sqlite --host ./app.db --env dev --test --json")
 
 	var setOpts struct {
-		ref         string
-		alias       string
-		system      string
-		env         string
-		instance    string
-		database    string
-		roCred      string
-		rwCred      string
-		policy      string
-		status      string
-		description string
-		clearRWCred bool
-		clearPolicy bool
-		dryRun      bool
+		ref          string
+		alias        string
+		system       string
+		env          string
+		instance     string
+		database     string
+		roCred       string
+		rwCred       string
+		policy       string
+		scanReadMode string
+		status       string
+		description  string
+		clearRWCred  bool
+		clearPolicy  bool
+		dryRun       bool
 	}
 	dbSetCmd := &cobra.Command{
 		Use:   "set <ref-or-alias>",
@@ -283,11 +295,15 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 			if cmd.Flags().Changed("description") {
 				tgt.Description = setOpts.description
 			}
-			var res daemon.AdminMutationResult[types.Target]
-			if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/targets", map[string]any{
+			payload := map[string]any{
 				"target":  tgt,
 				"dry_run": setOpts.dryRun,
-			}, &res); err != nil {
+			}
+			if cmd.Flags().Changed("scan-read-mode") {
+				payload["scan_read_mode"] = setOpts.scanReadMode
+			}
+			var res daemon.AdminMutationResult[types.Target]
+			if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/targets", payload, &res); err != nil {
 				setExitCode(writeRPCErr(ic, err))
 				return nil
 			}
@@ -308,6 +324,7 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 	dbSetCmd.Flags().StringVar(&setOpts.roCred, "ro-cred", "", "Read-only credential name or ID")
 	dbSetCmd.Flags().StringVar(&setOpts.rwCred, "rw-cred", "", "Read-write credential name or ID")
 	dbSetCmd.Flags().StringVar(&setOpts.policy, "policy", "", "Target policy override name or ID")
+	dbSetCmd.Flags().StringVar(&setOpts.scanReadMode, "scan-read-mode", "", "Full-scan safe-read handling (allow|reason_only|require_approval)")
 	dbSetCmd.Flags().StringVar(&setOpts.status, "status", "", "Status (active|maintenance|disabled)")
 	dbSetCmd.Flags().StringVar(&setOpts.description, "description", "", "Description")
 	dbSetCmd.Flags().BoolVar(&setOpts.clearRWCred, "clear-rw-cred", false, "Detach read-write credential")

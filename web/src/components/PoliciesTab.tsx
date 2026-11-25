@@ -203,12 +203,19 @@ export function PoliciesTab({
       id: 'limits',
       header: t('policies.col.limits'),
       cell: ({ row }) => (
-        <span className="font-mono text-xs text-muted-foreground">
-          {t('policies.limitsSummary', {
-            timeout: row.original.exec_timeout_sec ?? t('policies.inherit'),
-            rows: row.original.max_rows ?? t('policies.inherit'),
-          })}
-        </span>
+        <div className="flex flex-wrap items-center gap-1.5 font-mono text-xs text-muted-foreground">
+          <span>
+            {t('policies.limitsSummary', {
+              timeout: row.original.exec_timeout_sec ?? t('policies.inherit'),
+              rows: row.original.max_rows ?? t('policies.inherit'),
+            })}
+          </span>
+          {row.original.scan_read_mode && (
+            <Badge variant="outline" className="text-[11px]">
+              scan={row.original.scan_read_mode}
+            </Badge>
+          )}
+        </div>
       ),
     },
     {
@@ -560,6 +567,27 @@ export function PoliciesTab({
             />
           </label>
         </div>
+        <FormField label={t('policies.field.scanReadMode')}>
+          <Select
+            value={polForm.scan_read_mode || '__inherit'}
+            onValueChange={(v) =>
+              setPolForm((p) => ({
+                ...p,
+                scan_read_mode: v === '__inherit' ? '' : (v as PolicyRuleSet['scan_read_mode']),
+              }))
+            }
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__inherit">{t('policies.field.inheritParent')}</SelectItem>
+              <SelectItem value="require_approval">{t('policies.scanRead.requireApproval')}</SelectItem>
+              <SelectItem value="reason_only">{t('policies.scanRead.reasonOnly')}</SelectItem>
+              <SelectItem value="allow">{t('policies.scanRead.allow')}</SelectItem>
+            </SelectContent>
+          </Select>
+        </FormField>
         <FormField label={t('policies.field.providerOverride')}>
           <Select
             value={polForm.approval_provider || '__inherit'}

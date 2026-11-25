@@ -35,6 +35,11 @@ func ValidateRuleSet(p types.PolicyRuleSet) error {
 	if p.ExplainMaxRows != nil && *p.ExplainMaxRows < 0 {
 		return fmt.Errorf("explain_max_rows cannot be negative")
 	}
+	switch p.ScanReadMode {
+	case "", types.ScanReadAllow, types.ScanReadReasonOnly, types.ScanReadRequireApproval:
+	default:
+		return fmt.Errorf("invalid scan_read_mode %q: must be allow, reason_only, or require_approval", p.ScanReadMode)
+	}
 	return nil
 }
 
