@@ -211,6 +211,9 @@ func Execute(version, commit string) int {
 				detail.EffectivePolicy.MaxBytes, detail.EffectivePolicy.Sources["max_bytes"],
 				detail.EffectivePolicy.ExplainMaxRows, detail.EffectivePolicy.Sources["explain_max_rows"],
 				detail.EffectivePolicy.AllowMultiStatement)
+			if len(detail.EffectivePolicy.PatternRules) > 0 {
+				_, _ = fmt.Fprintf(ic.Stdout, "Patterns:  %d active rule(s)\n", len(detail.EffectivePolicy.PatternRules))
+			}
 			return nil
 		},
 	}
@@ -1088,6 +1091,14 @@ func renderExecOutcome(ic IOContext, resp types.ExecResponse, outPath string, fo
 			hint = "Write/mutating query timed out; verify state via read-only query before retrying."
 		} else if resp.Status == types.OpWaitingApproval {
 			hint = "Human confirmation requested. Poll op status or review in browser."
+			if len(resp.Evaluation.MatchedRules) > 0 {
+				top := resp.Evaluation.MatchedRules[0]
+				label := top.ConfirmTitle
+				if label == "" {
+					label = top.RuleName
+				}
+				hint = fmt.Sprintf("High-risk pattern matched (%s). Poll op status or confirm in browser.", label)
+			}
 		}
 		ctxMap := map[string]any{
 			"operation_id":     resp.OperationID,
@@ -1098,6 +1109,7 @@ func renderExecOutcome(ic IOContext, resp types.ExecResponse, outPath string, fo
 			"expires_at_utc":   resp.ApprovalExpires,
 			"reviewer_note":    resp.ReviewerNote,
 			"trigger_reasons":  resp.Evaluation.TriggerReasons,
+			"matched_rules":    resp.Evaluation.MatchedRules,
 			"classification":   resp.Classification,
 			"preflight":        resp.Preflight,
 		}

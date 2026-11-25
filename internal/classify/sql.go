@@ -2,11 +2,114 @@ package classify
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode"
 
 	"github.com/x0c/agent-dbctl/internal/types"
 )
+
+var sqlAdminFunctions = map[string]bool{
+	"pg_read_file":          true,
+	"pg_read_binary_file":   true,
+	"pg_ls_dir":             true,
+	"pg_ls_logdir":          true,
+	"pg_ls_waldir":          true,
+	"pg_ls_tmpdir":          true,
+	"pg_stat_file":          true,
+	"lo_import":             true,
+	"lo_export":             true,
+	"lo_from_bytea":         true,
+	"lo_put":                true,
+	"lo_unlink":             true,
+	"dblink":                true,
+	"dblink_connect":        true,
+	"dblink_connect_u":      true,
+	"dblink_exec":           true,
+	"dblink_send_query":     true,
+	"load_file":             true,
+	"load_extension":        true,
+	"pg_terminate_backend":  true,
+	"pg_cancel_backend":     true,
+	"pg_reload_conf":        true,
+	"pg_rotate_logfile":     true,
+	"set_config":            true,
+	"pg_switch_wal":         true,
+	"pg_create_restore_point": true,
+	"pg_backup_start":       true,
+	"pg_backup_stop":        true,
+}
+
+var sqlWriteFunctions = map[string]bool{
+	"nextval":                    true,
+	"setval":                     true,
+	"pg_advisory_lock":           true,
+	"pg_advisory_lock_shared":    true,
+	"pg_try_advisory_lock":       true,
+	"pg_try_advisory_lock_shared": true,
+	"pg_advisory_xact_lock":      true,
+	"pg_advisory_xact_lock_shared": true,
+	"pg_advisory_unlock":         true,
+	"pg_advisory_unlock_all":     true,
+	"get_lock":                   true,
+	"release_lock":               true,
+	"release_all_locks":          true,
+}
+
+var sqlHighCostFunctions = map[string]bool{
+	"pg_sleep":        true,
+	"pg_sleep_for":    true,
+	"pg_sleep_until":  true,
+	"sleep":           true,
+	"benchmark":       true,
+	"randomblob":      true,
+	"zeroblob":        true,
+	"generate_series": true,
+	"xmlparse":        true,
+}
+
+var sqliteSafeParenPragmas = map[string]bool{
+	"table_info":       true,
+	"table_xinfo":      true,
+	"index_list":       true,
+	"index_info":       true,
+	"index_xinfo":      true,
+	"foreign_key_list": true,
+}
+
+var sqliteHighCostPragmas = map[string]bool{
+	"integrity_check":   true,
+	"quick_check":       true,
+	"foreign_key_check": true,
+	"freelist_count":    true,
+}
+
+var sqliteMutateBarePragmas = map[string]bool{
+	"wal_checkpoint":     true,
+	"shrink_memory":      true,
+	"optimize":           true,
+	"incremental_vacuum": true,
+}
+
+var sqlNonFunctionKeywords = map[string]bool{
+	"SELECT": true, "FROM": true, "WHERE": true, "AND": true, "OR": true, "NOT": true,
+	"IN": true, "EXISTS": true, "ANY": true, "ALL": true, "SOME": true, "VALUES": true,
+	"SET": true, "AS": true, "ON": true, "USING": true, "JOIN": true, "CASE": true,
+	"WHEN": true, "THEN": true, "ELSE": true, "OVER": true, "FILTER": true, "WITHIN": true,
+	"GROUP": true, "PARTITION": true, "ORDER": true, "BY": true, "HAVING": true,
+	"LIMIT": true, "OFFSET": true, "INTO": true, "TABLE": true, "EXPLAIN": true,
+	"UNION": true, "INTERSECT": true, "EXCEPT": true, "CAST": true, "CHECK": true,
+	"UNIQUE": true, "PRIMARY": true, "FOREIGN": true, "KEY": true, "REFERENCES": true,
+	"RETURNING": true, "LATERAL": true, "ONLY": true, "WITH": true, "RECURSIVE": true,
+}
+
+var sqlExplainModifiers = map[string]bool{
+	"ANALYZE": true, "ANALYSE": true, "VERBOSE": true, "COSTS": true, "SETTINGS": true,
+	"BUFFERS": true, "WAL": true, "TIMING": true, "SUMMARY": true, "MEMORY": true,
+	"SERIALIZE": true, "GENERIC_PLAN": true, "FORMAT": true, "JSON": true, "TEXT": true,
+	"XML": true, "YAML": true, "EXTENDED": true, "PARTITIONS": true, "TREE": true,
+	"QUERY": true, "PLAN": true, "ON": true, "OFF": true, "TRUE": true, "FALSE": true,
+}
 
 // Classify evaluates raw statements/commands for an engine and returns fail-closed risk classification.
 func Classify(engine, raw string) types.Classification {
@@ -18,6 +121,18 @@ func Classify(engine, raw string) types.Classification {
 		return classifyRedis(engine, raw)
 	default:
 		return classifySQL(engine, raw)
+	}
+}
+
+// EngineFamily returns the EngineFamily matching an engine name.
+func EngineFamily(engine string) types.EngineFamily {
+	switch normalizeEngine(engine) {
+	case "mongodb":
+		return types.FamilyDocument
+	case "redis":
+		return types.FamilyKV
+	default:
+		return types.FamilySQL
 	}
 }
 
@@ -106,9 +221,13 @@ func classifySQL(engine, raw string) types.Classification {
 }
 
 func classifySingleSQL(stmt string) types.StatementSummary {
-	tokens := tokenizeSQLKeywordsAndStructure(stmt)
+	rawTokens := tokenizeSQLWithPunctuation(stmt)
 	snippet := truncateSnippet(stmt, 120)
-	if len(tokens) == 0 {
+	return classifySQLTokens(rawTokens, snippet)
+}
+
+func classifySQLTokens(rawTokens []string, snippet string) types.StatementSummary {
+	if len(rawTokens) == 0 {
 		return types.StatementSummary{
 			StatementType: "UNKNOWN",
 			RiskLevel:     types.RiskUnknown,
@@ -117,21 +236,35 @@ func classifySingleSQL(stmt string) types.StatementSummary {
 		}
 	}
 
-	upper := make([]string, len(tokens))
-	for i, t := range tokens {
+	upper := make([]string, len(rawTokens))
+	for i, t := range rawTokens {
 		upper[i] = strings.ToUpper(t)
 	}
-	first := upper[0]
+	// Keyword-only view (without "," or ".") for sequence checks like FOR UPDATE / CROSS JOIN.
+	kwUpper := filterPunctuation(upper)
+	if len(kwUpper) == 0 {
+		return types.StatementSummary{
+			StatementType: "UNKNOWN",
+			RiskLevel:     types.RiskUnknown,
+			Flags:         []string{"empty_statement"},
+			Snippet:       snippet,
+		}
+	}
+	first := kwUpper[0]
 
 	var flags []string
-	if containsSequence(upper, "FOR", "UPDATE") || containsSequence(upper, "FOR", "SHARE") ||
-		containsSequence(upper, "FOR", "NO", "KEY", "UPDATE") || containsSequence(upper, "LOCK", "IN", "SHARE", "MODE") {
+	if containsSequence(kwUpper, "FOR", "UPDATE") ||
+		containsSequence(kwUpper, "FOR", "SHARE") ||
+		containsSequence(kwUpper, "FOR", "NO", "KEY", "UPDATE") ||
+		containsSequence(kwUpper, "FOR", "KEY", "SHARE") ||
+		containsSequence(kwUpper, "LOCK", "IN", "SHARE", "MODE") {
 		flags = append(flags, "locking_read")
 	}
-	if containsToken(upper, "INTO") && (first == "SELECT" || first == "WITH") &&
-		(containsSequence(upper, "INTO", "OUTFILE") || containsSequence(upper, "INTO", "DUMPFILE") || !containsToken(upper, "INSERT")) {
+
+	if containsToken(kwUpper, "INTO") && (first == "SELECT" || first == "WITH") &&
+		(containsSequence(kwUpper, "INTO", "OUTFILE") || containsSequence(kwUpper, "INTO", "DUMPFILE") || !containsToken(kwUpper, "INSERT")) {
 		// SELECT ... INTO creates a table or writes a file in PG/MySQL.
-		if containsSequence(upper, "INTO", "OUTFILE") || containsSequence(upper, "INTO", "DUMPFILE") || selectIntoTable(upper) {
+		if containsSequence(kwUpper, "INTO", "OUTFILE") || containsSequence(kwUpper, "INTO", "DUMPFILE") || selectIntoTable(kwUpper) {
 			flags = append(flags, "select_into")
 			return types.StatementSummary{
 				StatementType: "SELECT_INTO",
@@ -144,34 +277,57 @@ func classifySingleSQL(stmt string) types.StatementSummary {
 
 	switch first {
 	case "EXPLAIN":
-		if containsToken(upper[1:], "ANALYZE") || containsToken(upper[1:], "ANALYSE") {
+		isAnalyze, innerRaw := parseExplainInner(rawTokens)
+		if len(innerRaw) == 0 {
 			return types.StatementSummary{
-				StatementType: "EXPLAIN_ANALYZE",
-				RiskLevel:     types.RiskHighCostRead,
-				Flags:         append(flags, "explain_analyze"),
+				StatementType: "UNKNOWN_EXPLAIN",
+				RiskLevel:     types.RiskUnknown,
+				Flags:         append(flags, "explain_empty"),
 				Snippet:       snippet,
 			}
 		}
-		// Ensure EXPLAIN doesn't wrap a DML unless explicitly flagged.
-		inner := findInnerVerbAfterExplain(upper[1:])
-		if inner == "INSERT" || inner == "UPDATE" || inner == "DELETE" || inner == "MERGE" {
+		innerSum := classifySQLTokens(innerRaw, snippet)
+		mergedFlags := append(flags, innerSum.Flags...)
+		if isAnalyze {
+			mergedFlags = append(mergedFlags, "explain_analyze")
+			// EXPLAIN ANALYZE actually executes the wrapped statement. Preserve mutating/admin/unknown risk!
+			if riskRank(innerSum.RiskLevel) >= riskRank(types.RiskWrite) {
+				return types.StatementSummary{
+					StatementType: "EXPLAIN_ANALYZE_" + innerSum.StatementType,
+					RiskLevel:     innerSum.RiskLevel,
+					Flags:         mergedFlags,
+					Snippet:       snippet,
+				}
+			}
 			return types.StatementSummary{
-				StatementType: "EXPLAIN_" + inner,
+				StatementType: "EXPLAIN_ANALYZE",
 				RiskLevel:     types.RiskHighCostRead,
-				Flags:         append(flags, "explain_dml"),
+				Flags:         mergedFlags,
+				Snippet:       snippet,
+			}
+		}
+		if riskRank(innerSum.RiskLevel) >= riskRank(types.RiskWrite) {
+			return types.StatementSummary{
+				StatementType: "EXPLAIN_" + innerSum.StatementType,
+				RiskLevel:     types.RiskHighCostRead,
+				Flags:         append(mergedFlags, "explain_dml"),
 				Snippet:       snippet,
 			}
 		}
 		return types.StatementSummary{
 			StatementType: "EXPLAIN",
 			RiskLevel:     types.RiskSafeRead,
-			Flags:         flags,
+			Flags:         mergedFlags,
 			Snippet:       snippet,
 		}
 
 	case "WITH":
+		isRecursive := containsToken(kwUpper, "RECURSIVE")
+		if isRecursive {
+			flags = append(flags, "recursive_cte")
+		}
 		// Detect data-modifying CTEs (e.g. WITH del AS (DELETE FROM t RETURNING *) SELECT * FROM del).
-		for _, kw := range upper[1:] {
+		for _, kw := range kwUpper[1:] {
 			switch kw {
 			case "INSERT", "UPDATE", "DELETE", "MERGE":
 				return types.StatementSummary{
@@ -189,10 +345,10 @@ func classifySingleSQL(stmt string) types.StatementSummary {
 				}
 			}
 		}
-		return analyzeSelectQuery("WITH_SELECT", upper, flags, snippet)
+		return analyzeSelectQuery("WITH_SELECT", rawTokens, upper, kwUpper, flags, snippet)
 
 	case "SELECT", "VALUES", "TABLE":
-		return analyzeSelectQuery(first, upper, flags, snippet)
+		return analyzeSelectQuery(first, rawTokens, upper, kwUpper, flags, snippet)
 
 	case "SHOW", "DESCRIBE", "DESC":
 		return types.StatementSummary{
@@ -203,20 +359,7 @@ func classifySingleSQL(stmt string) types.StatementSummary {
 		}
 
 	case "PRAGMA":
-		if containsToken(upper, "=") {
-			return types.StatementSummary{
-				StatementType: "PRAGMA_WRITE",
-				RiskLevel:     types.RiskAdmin,
-				Flags:         append(flags, "pragma_mutate"),
-				Snippet:       snippet,
-			}
-		}
-		return types.StatementSummary{
-			StatementType: "PRAGMA_READ",
-			RiskLevel:     types.RiskSafeRead,
-			Flags:         flags,
-			Snippet:       snippet,
-		}
+		return classifyPragma(rawTokens, kwUpper, flags, snippet)
 
 	case "INSERT", "REPLACE":
 		return types.StatementSummary{
@@ -227,7 +370,7 @@ func classifySingleSQL(stmt string) types.StatementSummary {
 		}
 
 	case "UPDATE", "DELETE", "MERGE":
-		if !containsToken(upper, "WHERE") && first != "MERGE" {
+		if !containsToken(kwUpper, "WHERE") && first != "MERGE" {
 			flags = append(flags, "missing_where")
 		}
 		return types.StatementSummary{
@@ -246,7 +389,7 @@ func classifySingleSQL(stmt string) types.StatementSummary {
 		}
 
 	case "GRANT", "REVOKE", "COPY", "LOAD", "CALL", "EXEC", "EXECUTE", "VACUUM", "ANALYZE", "REINDEX", "CLUSTER", "KILL", "FLUSH", "LOCK", "UNLOCK", "SET", "USE", "ATTACH", "DETACH":
-		if first == "COPY" && containsToken(upper, "PROGRAM") {
+		if first == "COPY" && containsToken(kwUpper, "PROGRAM") {
 			flags = append(flags, "copy_program_rce")
 		}
 		return types.StatementSummary{
@@ -266,7 +409,97 @@ func classifySingleSQL(stmt string) types.StatementSummary {
 	}
 }
 
-func analyzeSelectQuery(stmtType string, upper []string, flags []string, snippet string) types.StatementSummary {
+func classifyPragma(rawTokens, kwUpper, flags []string, snippet string) types.StatementSummary {
+	pragmaName := extractPragmaName(rawTokens)
+	hasEq := containsToken(kwUpper, "=")
+	hasParen := containsToken(kwUpper, "(")
+
+	if hasEq {
+		return types.StatementSummary{
+			StatementType: "PRAGMA_WRITE",
+			RiskLevel:     types.RiskAdmin,
+			Flags:         append(flags, "pragma_mutate"),
+			Snippet:       snippet,
+		}
+	}
+	if hasParen {
+		if sqliteSafeParenPragmas[pragmaName] {
+			return types.StatementSummary{
+				StatementType: "PRAGMA_READ",
+				RiskLevel:     types.RiskSafeRead,
+				Flags:         flags,
+				Snippet:       snippet,
+			}
+		}
+		if sqliteHighCostPragmas[pragmaName] {
+			return types.StatementSummary{
+				StatementType: "PRAGMA_HIGH_COST",
+				RiskLevel:     types.RiskHighCostRead,
+				Flags:         append(flags, "pragma_high_cost"),
+				Snippet:       snippet,
+			}
+		}
+		return types.StatementSummary{
+			StatementType: "PRAGMA_WRITE",
+			RiskLevel:     types.RiskAdmin,
+			Flags:         append(flags, "pragma_mutate"),
+			Snippet:       snippet,
+		}
+	}
+	if sqliteMutateBarePragmas[pragmaName] {
+		return types.StatementSummary{
+			StatementType: "PRAGMA_WRITE",
+			RiskLevel:     types.RiskAdmin,
+			Flags:         append(flags, "pragma_mutate"),
+			Snippet:       snippet,
+		}
+	}
+	if sqliteHighCostPragmas[pragmaName] {
+		return types.StatementSummary{
+			StatementType: "PRAGMA_HIGH_COST",
+			RiskLevel:     types.RiskHighCostRead,
+			Flags:         append(flags, "pragma_high_cost"),
+			Snippet:       snippet,
+		}
+	}
+	return types.StatementSummary{
+		StatementType: "PRAGMA_READ",
+		RiskLevel:     types.RiskSafeRead,
+		Flags:         flags,
+		Snippet:       snippet,
+	}
+}
+
+func analyzeSelectQuery(stmtType string, rawTokens, upper, kwUpper, flags []string, snippet string) types.StatementSummary {
+	fns := extractSQLFunctions(rawTokens)
+	fnRisk := types.RiskSafeRead
+	for _, fn := range fns {
+		if sqlAdminFunctions[fn] {
+			flags = append(flags, "dangerous_admin_function")
+			if riskRank(types.RiskAdmin) > riskRank(fnRisk) {
+				fnRisk = types.RiskAdmin
+			}
+		} else if sqlWriteFunctions[fn] {
+			flags = append(flags, "side_effect_function")
+			if riskRank(types.RiskWrite) > riskRank(fnRisk) {
+				fnRisk = types.RiskWrite
+			}
+		} else if sqlHighCostFunctions[fn] {
+			flags = append(flags, "high_cost_function")
+			if riskRank(types.RiskHighCostRead) > riskRank(fnRisk) {
+				fnRisk = types.RiskHighCostRead
+			}
+		}
+	}
+	if fnRisk != types.RiskSafeRead {
+		return types.StatementSummary{
+			StatementType: stmtType,
+			RiskLevel:     fnRisk,
+			Flags:         flags,
+			Snippet:       snippet,
+		}
+	}
+
 	if containsToken(flags, "locking_read") {
 		return types.StatementSummary{
 			StatementType: stmtType,
@@ -275,26 +508,52 @@ func analyzeSelectQuery(stmtType string, upper []string, flags []string, snippet
 			Snippet:       snippet,
 		}
 	}
-	hasFrom := containsToken(upper, "FROM")
-	hasWhere := containsToken(upper, "WHERE")
-	hasLimit := containsToken(upper, "LIMIT") || containsSequence(upper, "FETCH", "FIRST") || containsSequence(upper, "FETCH", "NEXT") || containsToken(upper, "TOP")
-	hasCrossJoin := containsSequence(upper, "CROSS", "JOIN")
+
+	hasFrom := containsToken(kwUpper, "FROM") || stmtType == "TABLE"
+	hasWhere := containsToken(kwUpper, "WHERE")
+	hasLimit := containsToken(kwUpper, "LIMIT") || containsSequence(kwUpper, "FETCH", "FIRST") || containsSequence(kwUpper, "FETCH", "NEXT") || containsToken(kwUpper, "TOP")
+	hasCrossJoin := containsSequence(kwUpper, "CROSS", "JOIN")
+	hasCommaJoin := hasImplicitCommaJoin(upper)
+	isRecursive := containsToken(flags, "recursive_cte")
 
 	if hasCrossJoin {
 		flags = append(flags, "cross_join")
 	}
-	// Queries with FROM and neither WHERE nor LIMIT risk scanning entire tables.
-	if hasFrom && !hasWhere && !hasLimit && !isScalarAggregateOnly(upper) {
-		flags = append(flags, "missing_where", "missing_limit")
-	} else if hasFrom && !hasLimit && !isSinglePointOrAggregate(upper) {
-		flags = append(flags, "missing_limit")
+	if hasCommaJoin {
+		flags = append(flags, "implicit_cross_join")
 	}
-	if hasFrom && hasSelectStar(upper) && !hasWhere {
-		flags = append(flags, "select_star_no_where")
+	if containsToken(kwUpper, "SQL_CALC_FOUND_ROWS") {
+		flags = append(flags, "sql_calc_found_rows")
+	}
+	if hasOrderByRandom(upper) {
+		flags = append(flags, "order_by_random")
+	}
+	if hasDeepOffset(upper) {
+		flags = append(flags, "deep_offset")
+	}
+
+	if stmtType == "TABLE" && !hasLimit {
+		flags = append(flags, "missing_where", "missing_limit", "table_full_scan")
+	} else {
+		// Recursive CTEs can amplify into millions of rows even under scalar aggregates.
+		scalarAgg := !isRecursive && isScalarAggregateOnly(kwUpper)
+		if hasFrom && !hasWhere && !hasLimit && !scalarAgg {
+			flags = append(flags, "missing_where", "missing_limit")
+		} else if hasFrom && !hasLimit && !scalarAgg {
+			flags = append(flags, "missing_limit")
+		}
+		if hasFrom && hasSelectStar(upper) && !hasWhere {
+			flags = append(flags, "select_star_no_where")
+		}
 	}
 
 	risk := types.RiskSafeRead
-	if hasFrom && (containsToken(flags, "missing_where") || containsToken(flags, "cross_join") || containsToken(flags, "select_star_no_where")) {
+	if isRecursive ||
+		containsToken(flags, "order_by_random") ||
+		containsToken(flags, "sql_calc_found_rows") ||
+		containsToken(flags, "deep_offset") ||
+		containsToken(flags, "implicit_cross_join") ||
+		(hasFrom && (containsToken(flags, "missing_where") || containsToken(flags, "cross_join") || containsToken(flags, "select_star_no_where") || containsToken(flags, "table_full_scan"))) {
 		risk = types.RiskHighCostRead
 	}
 	return types.StatementSummary{
@@ -303,6 +562,280 @@ func analyzeSelectQuery(stmtType string, upper []string, flags []string, snippet
 		Flags:         flags,
 		Snippet:       snippet,
 	}
+}
+
+func parseExplainInner(rawTokens []string) (bool, []string) {
+	if len(rawTokens) <= 1 {
+		return false, nil
+	}
+	isAnalyze := false
+	i := 1
+	n := len(rawTokens)
+	if i < n && rawTokens[i] == "(" {
+		depth := 0
+		for i < n {
+			u := strings.ToUpper(rawTokens[i])
+			if u == "(" {
+				depth++
+			} else if u == ")" {
+				depth--
+				if depth <= 0 {
+					i++
+					break
+				}
+			} else if u == "ANALYZE" || u == "ANALYSE" {
+				nextOff := false
+				if i+1 < n {
+					nextU := strings.ToUpper(rawTokens[i+1])
+					if nextU == "FALSE" || nextU == "OFF" || nextU == "0" {
+						nextOff = true
+					}
+				}
+				if !nextOff {
+					isAnalyze = true
+				}
+			}
+			i++
+		}
+	}
+	for i < n {
+		u := strings.ToUpper(rawTokens[i])
+		if u == "ANALYZE" || u == "ANALYSE" {
+			isAnalyze = true
+			i++
+			continue
+		}
+		if sqlExplainModifiers[u] {
+			i++
+			continue
+		}
+		break
+	}
+	if i >= n {
+		return isAnalyze, nil
+	}
+	return isAnalyze, rawTokens[i:]
+}
+
+func filterPunctuation(tokens []string) []string {
+	out := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		if t == "," || t == "." || t == ";" {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+func hasImplicitCommaJoin(upper []string) bool {
+	inFrom := map[int]bool{}
+	depth := 0
+	for i := 0; i < len(upper); i++ {
+		tok := upper[i]
+		switch tok {
+		case "(":
+			depth++
+		case ")":
+			delete(inFrom, depth)
+			if depth > 0 {
+				depth--
+			}
+		case "FROM":
+			inFrom[depth] = true
+		case "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "FETCH", "OFFSET", "UNION", "INTERSECT", "EXCEPT", "WINDOW", "FOR", "LOCK", "INTO", "RETURNING", "SET", ";":
+			inFrom[depth] = false
+		case ",":
+			if inFrom[depth] && i+1 < len(upper) {
+				next := upper[i+1]
+				if next != ")" && next != ";" && next != "LATERAL" || (next == "LATERAL" && i+2 < len(upper)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func hasOrderByRandom(upper []string) bool {
+	for i := 0; i+1 < len(upper); i++ {
+		if upper[i] == "ORDER" && upper[i+1] == "BY" {
+			depth := 0
+			for j := i + 2; j < len(upper); j++ {
+				t := upper[j]
+				if t == "(" {
+					depth++
+				} else if t == ")" {
+					if depth == 0 {
+						break
+					}
+					depth--
+				} else if depth == 0 && (t == "LIMIT" || t == "OFFSET" || t == "FETCH" || t == "FOR" || t == "UNION" || t == "INTERSECT" || t == "EXCEPT" || t == ";") {
+					break
+				}
+				if (t == "RAND" || t == "RANDOM") && j+1 < len(upper) && upper[j+1] == "(" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func hasDeepOffset(upper []string) bool {
+	for i := 0; i < len(upper); i++ {
+		if upper[i] == "OFFSET" && i+1 < len(upper) {
+			if n, err := strconv.ParseInt(upper[i+1], 10, 64); err == nil && n >= 10000 {
+				return true
+			}
+		}
+		if upper[i] == "LIMIT" && i+3 < len(upper) && upper[i+2] == "," {
+			if n, err := strconv.ParseInt(upper[i+1], 10, 64); err == nil && n >= 10000 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func extractSQLFunctions(rawTokens []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(name string) {
+		if name != "" && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	for i := 1; i < len(rawTokens); i++ {
+		if rawTokens[i] != "(" {
+			continue
+		}
+		prev := rawTokens[i-1]
+		if prev == "(" || prev == ")" || prev == "," || prev == "." || prev == "*" || prev == "=" || prev == ";" {
+			continue
+		}
+		u := strings.ToUpper(prev)
+		if sqlNonFunctionKeywords[u] {
+			continue
+		}
+		fn := strings.ToLower(stripIdentifierQuotes(prev))
+		if fn == "" || fn == "'str'" {
+			continue
+		}
+		if i >= 3 && rawTokens[i-2] == "." {
+			schema := strings.ToLower(stripIdentifierQuotes(rawTokens[i-3]))
+			if schema != "" {
+				add(schema + "." + fn)
+			}
+		}
+		add(fn)
+	}
+	return out
+}
+
+func extractPragmaName(rawTokens []string) string {
+	if len(rawTokens) < 2 {
+		return ""
+	}
+	if len(rawTokens) >= 4 && rawTokens[2] == "." {
+		return strings.ToLower(stripIdentifierQuotes(rawTokens[3]))
+	}
+	return strings.ToLower(stripIdentifierQuotes(rawTokens[1]))
+}
+
+func extractSQLTables(rawTokens []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(tbl string) {
+		if tbl != "" && !seen[tbl] {
+			seen[tbl] = true
+			out = append(out, tbl)
+		}
+	}
+	inFrom := map[int]bool{}
+	depth := 0
+	for i := 0; i < len(rawTokens); i++ {
+		tok := rawTokens[i]
+		u := strings.ToUpper(tok)
+		switch u {
+		case "(":
+			depth++
+			continue
+		case ")":
+			delete(inFrom, depth)
+			if depth > 0 {
+				depth--
+			}
+			continue
+		case "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "FETCH", "OFFSET", "UNION", "INTERSECT", "EXCEPT", "WINDOW", "FOR", "LOCK", "INTO", "RETURNING", "SET", ";":
+			inFrom[depth] = false
+			continue
+		}
+
+		expectTable := false
+		switch u {
+		case "FROM":
+			inFrom[depth] = true
+			expectTable = true
+		case "JOIN", "UPDATE", "TABLE", "TRUNCATE":
+			expectTable = true
+		case "INTO":
+			// INSERT INTO tbl / COPY ... INTO / SELECT ... INTO tbl
+			expectTable = true
+		case ",":
+			if inFrom[depth] {
+				expectTable = true
+			}
+		}
+		if !expectTable {
+			continue
+		}
+		j := i + 1
+		for j < len(rawTokens) {
+			nu := strings.ToUpper(rawTokens[j])
+			if nu == "ONLY" || nu == "LATERAL" {
+				j++
+				continue
+			}
+			break
+		}
+		if j >= len(rawTokens) {
+			continue
+		}
+		next := rawTokens[j]
+		if next == "(" || next == "," || next == ";" || next == ")" || next == "'str'" || next == "*" {
+			continue
+		}
+		nextU := strings.ToUpper(next)
+		if nextU == "VALUES" || nextU == "SELECT" || nextU == "WITH" || nextU == "PROGRAM" || nextU == "STDIN" || nextU == "STDOUT" || nextU == "OUTFILE" || nextU == "DUMPFILE" {
+			continue
+		}
+		name := strings.ToLower(stripIdentifierQuotes(next))
+		if j+2 < len(rawTokens) && rawTokens[j+1] == "." {
+			part2 := strings.ToLower(stripIdentifierQuotes(rawTokens[j+2]))
+			if part2 != "" && part2 != "*" {
+				add(name + "." + part2)
+				add(part2)
+				i = j + 2
+				continue
+			}
+		}
+		add(name)
+		i = j
+	}
+	return out
+}
+
+func stripIdentifierQuotes(s string) string {
+	if len(s) >= 2 {
+		if (s[0] == '"' && s[len(s)-1] == '"') ||
+			(s[0] == '`' && s[len(s)-1] == '`') ||
+			(s[0] == '[' && s[len(s)-1] == ']') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
 }
 
 func isScalarAggregateOnly(upper []string) bool {
@@ -319,10 +852,6 @@ func isScalarAggregateOnly(upper []string) bool {
 		}
 	}
 	return false
-}
-
-func isSinglePointOrAggregate(upper []string) bool {
-	return isScalarAggregateOnly(upper)
 }
 
 func hasSelectStar(upper []string) bool {
@@ -347,18 +876,6 @@ func selectIntoTable(upper []string) bool {
 		}
 	}
 	return false
-}
-
-func findInnerVerbAfterExplain(rest []string) string {
-	for _, tok := range rest {
-		switch tok {
-		case "ANALYZE", "ANALYSE", "VERBOSE", "COSTS", "SETTINGS", "BUFFERS", "WAL", "TIMING", "SUMMARY", "FORMAT", "JSON", "TEXT", "XML", "YAML", "EXTENDED", "PARTITIONS", "TREE":
-			continue
-		default:
-			return tok
-		}
-	}
-	return ""
 }
 
 // splitSQLStatements splits multi-statement SQL while honoring quotes, PG dollar quotes, and comments.
@@ -554,17 +1071,17 @@ func parseDollarTag(rest string) (string, bool) {
 	return "", false
 }
 
-func tokenizeSQLKeywordsAndStructure(stmt string) []string {
+func tokenizeSQLWithPunctuation(stmt string) []string {
 	var tokens []string
 	i := 0
 	n := len(stmt)
 	for i < n {
 		ch := stmt[i]
-		if unicode.IsSpace(rune(ch)) || ch == ',' || ch == ';' {
+		if unicode.IsSpace(rune(ch)) {
 			i++
 			continue
 		}
-		if ch == '(' || ch == ')' || ch == '*' || ch == '=' {
+		if ch == ',' || ch == ';' || ch == '.' || ch == '(' || ch == ')' || ch == '*' || ch == '=' {
 			tokens = append(tokens, string(ch))
 			i++
 			continue
@@ -620,7 +1137,7 @@ func tokenizeSQLKeywordsAndStructure(stmt string) []string {
 		start := i
 		for i < n {
 			c := stmt[i]
-			if unicode.IsSpace(rune(c)) || c == ',' || c == ';' || c == '(' || c == ')' || c == '*' || c == '=' || c == '\'' || c == '"' || c == '`' {
+			if unicode.IsSpace(rune(c)) || c == ',' || c == ';' || c == '.' || c == '(' || c == ')' || c == '*' || c == '=' || c == '\'' || c == '"' || c == '`' {
 				break
 			}
 			i++

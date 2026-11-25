@@ -156,6 +156,7 @@ func (p *WebhookProvider) Submit(ctx context.Context, req SubmissionRequest) (*S
 		"reason":           req.Operation.Reason,
 		"risk_level":       req.Operation.RiskLevel,
 		"trigger_reasons":  req.Operation.TriggerReasons,
+		"matched_rules":    req.Operation.MatchedRules,
 		"query_redacted":   queryRedacted,
 		"preflight":        req.Operation.Preflight,
 		"expires_at_utc":   req.ExpiresAtUTC,

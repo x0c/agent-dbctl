@@ -290,3 +290,108 @@ func TestApprovalExpiryTicketStartupRecoveryAndAuditFilters(t *testing.T) {
 		t.Fatalf("expected intact audit hash chain after recovery, got %+v err=%v", verify, err)
 	}
 }
+
+func TestRiskPatternMigrationCRUDAndTopologyRoundtrip(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "v1-upgrade.db")
+
+	// Seed a v1-shape database lacking matched_rules_json and risk_pattern_rules.
+	rawDB, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	v1Schema := `
+CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_utc TEXT NOT NULL);
+CREATE TABLE operations (
+	id TEXT PRIMARY KEY, target_id TEXT NOT NULL, target_ref TEXT NOT NULL,
+	system_id TEXT NOT NULL, system_slug TEXT NOT NULL, environment_code TEXT NOT NULL, engine TEXT NOT NULL,
+	actor TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', workspace_cwd TEXT NOT NULL DEFAULT '',
+	query_text TEXT NOT NULL, query_redacted TEXT NOT NULL, risk_level TEXT NOT NULL,
+	decision TEXT NOT NULL, trigger_reasons_json TEXT NOT NULL DEFAULT '[]',
+	classification_json TEXT NOT NULL DEFAULT '{}', preflight_json TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL, credential_mode TEXT NOT NULL, approval_id TEXT NOT NULL DEFAULT '',
+	fetched_rows INTEGER NOT NULL DEFAULT 0, returned_rows INTEGER NOT NULL DEFAULT 0,
+	affected_rows INTEGER, truncated INTEGER NOT NULL DEFAULT 0, cutoff_reason TEXT NOT NULL DEFAULT '',
+	latency_ms INTEGER NOT NULL DEFAULT 0, error_code TEXT NOT NULL DEFAULT '',
+	error_message TEXT NOT NULL DEFAULT '', retryable INTEGER NOT NULL DEFAULT 0,
+	created_at_utc TEXT NOT NULL, updated_at_utc TEXT NOT NULL, completed_at_utc TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE approvals (
+	id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, provider TEXT NOT NULL,
+	external_ticket_id TEXT NOT NULL DEFAULT '', external_ticket_url TEXT NOT NULL DEFAULT '',
+	token_hash TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, target_ref TEXT NOT NULL,
+	system_slug TEXT NOT NULL, environment_code TEXT NOT NULL, engine TEXT NOT NULL,
+	actor TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', workspace_cwd TEXT NOT NULL DEFAULT '',
+	query_text TEXT NOT NULL, risk_level TEXT NOT NULL, trigger_reasons_json TEXT NOT NULL DEFAULT '[]',
+	preflight_json TEXT NOT NULL DEFAULT '', reviewer TEXT NOT NULL DEFAULT '',
+	reviewer_note TEXT NOT NULL DEFAULT '', created_at_utc TEXT NOT NULL,
+	expires_at_utc TEXT NOT NULL, resolved_at_utc TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO schema_migrations(version, applied_at_utc) VALUES (1, '2026-01-01T00:00:00Z');
+`
+	if _, err := rawDB.ExecContext(ctx, v1Schema); err != nil {
+		_ = rawDB.Close()
+		t.Fatalf("seed v1 schema: %v", err)
+	}
+	_ = rawDB.Close()
+
+	// Re-open with store.Open to exercise automatic v1 -> v2 migration.
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen v1 db with migration: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	// Install a builtin pack + upsert custom rule + export/import topology.
+	installed, err := st.InstallBuiltinRulePack(ctx, "web-admin", "sqlite-pragma-blob", "global", "global")
+	if err != nil || len(installed) != 2 {
+		t.Fatalf("install pack: count=%d err=%v", len(installed), err)
+	}
+
+	custom, err := st.UpsertRiskPatternRule(ctx, "web-admin", types.RiskPatternRule{
+		Name:           "orders-table-confirm",
+		ScopeType:      "env",
+		ScopeID:        "dev",
+		Enabled:        true,
+		Engines:        []string{"sqlite"},
+		Action:         types.PatternActionRequireApproval,
+		ConfirmTitle:   "Confirm orders table access",
+		ConfirmMessage: "Sensitive table orders requires human confirmation.",
+		Condition: types.PatternCondition{
+			Type:   types.MatcherTableRef,
+			Values: []string{"orders"},
+		},
+		Priority: 50,
+	})
+	if err != nil || custom.ID == "" {
+		t.Fatalf("upsert custom rule: %+v err=%v", custom, err)
+	}
+
+	bundle, err := st.ExportTopology(ctx)
+	if err != nil || len(bundle.RiskPatternRules) != 3 {
+		t.Fatalf("expected 3 rules in exported topology, got %d err=%v", len(bundle.RiskPatternRules), err)
+	}
+
+	// Re-import into fresh DB and confirm round-trip.
+	db2 := filepath.Join(t.TempDir(), "reimport.db")
+	st2, err := store.Open(ctx, db2)
+	if err != nil {
+		t.Fatalf("open st2: %v", err)
+	}
+	defer func() { _ = st2.Close() }()
+	if err := st2.ImportTopology(ctx, "web-admin", bundle); err != nil {
+		t.Fatalf("import topology: %v", err)
+	}
+	rules2, err := st2.ListRiskPatternRules(ctx)
+	if err != nil || len(rules2) != 3 {
+		t.Fatalf("expected 3 rules after import, got %d err=%v", len(rules2), err)
+	}
+
+	if err := st.DeleteRiskPatternRule(ctx, "web-admin", custom.ID); err != nil {
+		t.Fatalf("delete rule: %v", err)
+	}
+	verify, err := st.VerifyAuditChain(ctx)
+	if err != nil || !verify.Valid {
+		t.Fatalf("expected valid audit hash chain after pattern mutations, got %+v err=%v", verify, err)
+	}
+}

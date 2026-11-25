@@ -950,6 +950,9 @@ func (s *Store) ExportTopology(ctx context.Context) (types.TopologyBundle, error
 	if b.Policies, err = s.ListPolicies(ctx); err != nil {
 		return b, err
 	}
+	if b.RiskPatternRules, err = s.ListRiskPatternRules(ctx); err != nil {
+		return b, err
+	}
 	return b, nil
 }
 
@@ -995,6 +998,11 @@ func (s *Store) ImportTopology(ctx context.Context, actor string, b types.Topolo
 				return err
 			}
 		}
+		for _, pat := range b.RiskPatternRules {
+			if _, err := s.upsertRiskPatternRuleTx(ctx, tx, actor, pat, now); err != nil {
+				return err
+			}
+		}
 		return s.appendAuditTx(ctx, tx, actor, "topology.import", "catalog", "", map[string]any{
 			"schema_version":      b.SchemaVersion,
 			"environments":        len(b.Environments),
@@ -1004,6 +1012,7 @@ func (s *Store) ImportTopology(ctx context.Context, actor string, b types.Topolo
 			"instances":           len(b.Instances),
 			"targets":             len(b.Targets),
 			"policies":            len(b.Policies),
+			"risk_pattern_rules":  len(b.RiskPatternRules),
 		}, now)
 	})
 }

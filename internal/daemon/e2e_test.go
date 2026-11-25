@@ -372,3 +372,153 @@ func TestTier3ExternalGRPCPluginAndChecksumGuard(t *testing.T) {
 		t.Fatalf("expected tampered plugin to fail verification, got %+v err=%v", itemsBad, err)
 	}
 }
+
+func TestCustomRiskPatternApprovalDenyAndSandboxAPI(t *testing.T) {
+	srv, _ := setupIsolatedServer(t)
+	svc := srv.Service()
+	ctx := context.Background()
+
+	devDB := filepath.Join(t.TempDir(), "pat-dev.sqlite")
+	sys, err := svc.Store().UpsertSystem(ctx, "test", types.System{Slug: "ledger", Name: "Ledger"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst, err := svc.Store().UpsertInstance(ctx, "test", types.Instance{Name: "pat-sqlite", Engine: "sqlite", Host: devDB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, err := svc.Store().UpsertTarget(ctx, "test", types.Target{
+		Ref:             "ledger/dev/main",
+		Alias:           "dev-ledger",
+		OwnerSystemID:   sys.ID,
+		EnvironmentCode: "dev",
+		InstanceID:      inst.ID,
+		DatabaseName:    devDB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed table in dev/yolo before installing table-scoped confirmation rule.
+	if _, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: tgt.Ref,
+		Query:            "CREATE TABLE secret_ledger(id INTEGER PRIMARY KEY, amount INTEGER); INSERT INTO secret_ledger VALUES (1, 999);",
+		Wait:             true,
+	}); err != nil {
+		t.Fatalf("seed sqlite table: %v", err)
+	}
+
+	handler := daemon.NewWebHandler(svc)
+	// Install builtin sqlite-pragma-blob pack via HTTP API.
+	packBody := bytes.NewBufferString(`{"scope_type":"global","scope_id":"global"}`)
+	packReq := httptest.NewRequest(http.MethodPost, "/api/v1/risk-patterns/packs/sqlite-pragma-blob/install", packBody)
+	packRec := httptest.NewRecorder()
+	handler.ServeHTTP(packRec, packReq)
+	if packRec.Code != http.StatusOK {
+		t.Fatalf("install pack HTTP %d: %s", packRec.Code, packRec.Body.String())
+	}
+
+	// Add custom require_approval rule on secret_ledger AND custom deny rule on zeroblob(999999999).
+	rulePayload, _ := json.Marshal(types.RiskPatternRule{
+		Name:           "confirm-secret-ledger",
+		ScopeType:      "target",
+		ScopeID:        tgt.ID,
+		Enabled:        true,
+		Engines:        []string{"sqlite"},
+		Action:         types.PatternActionRequireApproval,
+		ConfirmTitle:   "Sensitive Ledger Access",
+		ConfirmMessage: "Reading secret_ledger requires secondary confirmation even in dev.",
+		Condition:      types.PatternCondition{Type: types.MatcherTableRef, Values: []string{"secret_ledger"}},
+		Priority:       100,
+	})
+	saveReq := httptest.NewRequest(http.MethodPost, "/api/v1/risk-patterns", bytes.NewReader(rulePayload))
+	saveRec := httptest.NewRecorder()
+	handler.ServeHTTP(saveRec, saveReq)
+	if saveRec.Code != http.StatusOK {
+		t.Fatalf("save pattern HTTP %d: %s", saveRec.Code, saveRec.Body.String())
+	}
+
+	// Sandbox test endpoint with inline draft deny rule.
+	testPayload, _ := json.Marshal(types.PatternTestRequest{
+		TargetID: tgt.Ref,
+		Query:    "SELECT id, amount FROM secret_ledger WHERE id = 1 LIMIT 1",
+	})
+	testReq := httptest.NewRequest(http.MethodPost, "/api/v1/risk-patterns/test", bytes.NewReader(testPayload))
+	testRec := httptest.NewRecorder()
+	handler.ServeHTTP(testRec, testReq)
+	if testRec.Code != http.StatusOK {
+		t.Fatalf("test pattern HTTP %d: %s", testRec.Code, testRec.Body.String())
+	}
+	var testRes types.PatternTestResult
+	if err := json.Unmarshal(testRec.Body.Bytes(), &testRes); err != nil {
+		t.Fatal(err)
+	}
+	if testRes.Evaluation.Decision != types.DecisionRequireApproval || len(testRes.MatchedRules) != 1 || testRes.MatchedRules[0].MatchedFragment != "secret_ledger" {
+		t.Fatalf("unexpected sandbox test result: %+v", testRes)
+	}
+
+	// Real execution on dev/yolo target must pause for human approval with matched_rules attached.
+	asyncResp, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: tgt.Alias,
+		Query:            "SELECT id, amount FROM secret_ledger WHERE id = 1 LIMIT 1",
+		Reason:           "Inspect ledger row",
+		Wait:             false,
+	})
+	if err != nil {
+		t.Fatalf("execute async: %v", err)
+	}
+	if asyncResp.Status != types.OpWaitingApproval || len(asyncResp.Evaluation.MatchedRules) != 1 {
+		t.Fatalf("expected waiting_approval with 1 matched rule, got %+v", asyncResp)
+	}
+	app, _, err := svc.Store().GetApproval(ctx, asyncResp.ApprovalID)
+	if err != nil || len(app.MatchedRules) != 1 || app.MatchedRules[0].ConfirmTitle != "Sensitive Ledger Access" {
+		t.Fatalf("expected persisted approval MatchedRules, got %+v err=%v", app, err)
+	}
+
+	// Approve via Web API header -> query runs and returns row!
+	aprReq := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/"+asyncResp.ApprovalID+"/approve", bytes.NewBufferString(`{"reviewer":"owner","note":"confirmed"}`))
+	aprReq.Header.Set("X-Agent-DBCTL-UI", "1")
+	aprRec := httptest.NewRecorder()
+	handler.ServeHTTP(aprRec, aprReq)
+	if aprRec.Code != http.StatusOK {
+		t.Fatalf("approve HTTP %d: %s", aprRec.Code, aprRec.Body.String())
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var finalResp types.ExecResponse
+	for time.Now().Before(deadline) {
+		finalResp, err = svc.GetOperationStatus(ctx, asyncResp.OperationID)
+		if err == nil && finalResp.Status == types.OpSucceeded {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if finalResp.Status != types.OpSucceeded || finalResp.Result == nil || len(finalResp.Result.Rows) != 1 {
+		t.Fatalf("expected succeeded execution after confirmation, got %+v", finalResp)
+	}
+
+	// Custom deny rule blocks immediately without approval ticket.
+	_, err = svc.Store().UpsertRiskPatternRule(ctx, "web-admin", types.RiskPatternRule{
+		Name:           "deny-big-blob",
+		ScopeType:      "global",
+		ScopeID:        "global",
+		Enabled:        true,
+		Engines:        []string{"sqlite"},
+		Action:         types.PatternActionDeny,
+		ConfirmTitle:   "Large Blob Blocked",
+		ConfirmMessage: "randomblob exceeds policy.",
+		Condition:      types.PatternCondition{Type: types.MatcherFunctionCall, Values: []string{"randomblob"}},
+		Priority:       100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	denyResp, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: tgt.Alias,
+		Query:            "SELECT randomblob(1000000)",
+		Wait:             false,
+	})
+	if err != nil || denyResp.Status != types.OpDenied || denyResp.ErrorCode != types.ErrCodePolicyDenied {
+		t.Fatalf("expected custom pattern deny, got %+v err=%v", denyResp, err)
+	}
+}

@@ -243,6 +243,7 @@ CREATE TABLE IF NOT EXISTS operations (
 	risk_level TEXT NOT NULL,
 	decision TEXT NOT NULL,
 	trigger_reasons_json TEXT NOT NULL DEFAULT '[]',
+	matched_rules_json TEXT NOT NULL DEFAULT '[]',
 	classification_json TEXT NOT NULL DEFAULT '{}',
 	preflight_json TEXT NOT NULL DEFAULT '',
 	status TEXT NOT NULL,
@@ -280,6 +281,7 @@ CREATE TABLE IF NOT EXISTS approvals (
 	query_text TEXT NOT NULL,
 	risk_level TEXT NOT NULL,
 	trigger_reasons_json TEXT NOT NULL DEFAULT '[]',
+	matched_rules_json TEXT NOT NULL DEFAULT '[]',
 	preflight_json TEXT NOT NULL DEFAULT '',
 	reviewer TEXT NOT NULL DEFAULT '',
 	reviewer_note TEXT NOT NULL DEFAULT '',
@@ -313,21 +315,80 @@ BEGIN
 	SELECT RAISE(ABORT, 'audit_logs is append-only');
 END;
 
+CREATE TABLE IF NOT EXISTS risk_pattern_rules (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	description TEXT NOT NULL DEFAULT '',
+	scope_type TEXT NOT NULL,
+	scope_id TEXT NOT NULL,
+	enabled INTEGER NOT NULL DEFAULT 1,
+	builtin_pack TEXT NOT NULL DEFAULT '',
+	engines_json TEXT NOT NULL DEFAULT '[]',
+	families_json TEXT NOT NULL DEFAULT '[]',
+	action TEXT NOT NULL,
+	confirm_title TEXT NOT NULL DEFAULT '',
+	confirm_message TEXT NOT NULL DEFAULT '',
+	approval_provider TEXT NOT NULL DEFAULT '',
+	condition_json TEXT NOT NULL DEFAULT '{}',
+	priority INTEGER NOT NULL DEFAULT 0,
+	created_at_utc TEXT NOT NULL,
+	updated_at_utc TEXT NOT NULL,
+	UNIQUE(scope_type, scope_id, name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_operations_created ON operations(created_at_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, created_at_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_approvals_operation ON approvals(operation_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(seq DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_risk_patterns_scope ON risk_pattern_rules(scope_type, scope_id);
 `
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("apply sqlite schema: %w", err)
 	}
+	if err := s.ensureColumnLocked(ctx, "operations", "matched_rules_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumnLocked(ctx, "approvals", "matched_rules_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
 	now := nowUTC()
-	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (1, ?)`, now); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (1, ?), (2, ?)`, now, now); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureColumnLocked(ctx context.Context, table, column, colDef string) error {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return fmt.Errorf("scan %s column: %w", table, err)
+		}
+		if strings.EqualFold(name, column) {
+			found = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !found {
+		if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, colDef)); err != nil {
+			return fmt.Errorf("add %s.%s column (%s): %w", table, column, colDef, err)
+		}
 	}
 	return nil
 }

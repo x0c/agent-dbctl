@@ -121,6 +121,7 @@ export interface EffectivePolicy {
   max_bytes: number
   explain_max_rows: number
   approval_provider: string
+  pattern_rules?: RiskPatternRule[]
   sources: Record<string, string>
 }
 
@@ -184,6 +185,116 @@ export interface PreflightReport {
   warnings?: string[]
 }
 
+export type PatternAction = 'elevate_high_cost' | 'require_approval' | 'deny'
+
+export type PatternMatcherType =
+  | 'function_call'
+  | 'table_ref'
+  | 'pragma_name'
+  | 'command_arg'
+  | 'json_path'
+  | 'regex'
+  | 'risk_flag'
+  | 'preflight_metric'
+
+export interface PatternCondition {
+  all?: PatternCondition[]
+  any?: PatternCondition[]
+  not?: PatternCondition | null
+  type?: PatternMatcherType
+  values?: string[]
+  pattern?: string
+  target?: string
+  case_sensitive?: boolean
+  command?: string
+  subcommand?: string
+  arg_keyword?: string
+  arg_equals?: string
+  arg_greater_than?: number | null
+  json_path?: string
+  equals?: string
+  metric?: string
+  operator?: string
+  threshold?: number | null
+  bool_value?: boolean | null
+}
+
+export interface RiskPatternRule {
+  id: string
+  name: string
+  description?: string
+  scope_type: 'global' | 'env' | 'system' | 'target'
+  scope_id: string
+  enabled: boolean
+  builtin_pack?: string
+  engines?: string[]
+  families?: string[]
+  action: PatternAction
+  confirm_title?: string
+  confirm_message?: string
+  approval_provider?: string
+  condition: PatternCondition
+  priority: number
+  created_at_utc?: string
+  updated_at_utc?: string
+}
+
+export interface MatchedRule {
+  rule_id: string
+  rule_name: string
+  scope: string
+  action: PatternAction
+  matched_fragment?: string
+  confirm_title?: string
+  confirm_message?: string
+  approval_provider?: string
+}
+
+export interface BuiltinRulePack {
+  id: string
+  name: string
+  description: string
+  engines: string[]
+  rules: RiskPatternRule[]
+}
+
+export interface PatternTestRequest {
+  target_id?: string
+  engine?: string
+  safety_tier?: 'yolo' | 'guarded' | 'strict'
+  query: string
+  draft_rule?: RiskPatternRule | null
+  simulated_preflight?: Partial<PreflightReport> | null
+}
+
+export interface PatternTestResult {
+  classification: {
+    engine: string
+    family: string
+    risk_level: string
+    is_read_only: boolean
+    statement_count: number
+    risk_flags?: string[]
+    summary: string
+  }
+  evaluation: {
+    decision: string
+    trigger_reasons?: string[]
+    matched_rules?: MatchedRule[]
+    deny_code?: string
+    deny_message?: string
+  }
+  matched_rules?: MatchedRule[]
+  draft_matched?: MatchedRule | null
+  normalized_query: string
+  extracted: {
+    functions?: string[]
+    tables?: string[]
+    pragmas?: string[]
+    mongo_operators?: string[]
+  }
+}
+
 export interface ApprovalRecord {
   id: string
   operation_id: string
@@ -201,6 +312,7 @@ export interface ApprovalRecord {
   query_text: string
   risk_level: string
   trigger_reasons?: string[]
+  matched_rules?: MatchedRule[]
   preflight?: PreflightReport
   reviewer?: string
   reviewer_note?: string
@@ -225,6 +337,7 @@ export interface OperationRecord {
   risk_level: string
   decision: string
   trigger_reasons?: string[]
+  matched_rules?: MatchedRule[]
   preflight?: PreflightReport
   status: string
   credential_mode: string
@@ -397,6 +510,23 @@ export const api = {
   getGlobalSecurity: () => request<GlobalSecurityConfig>('/api/v1/security/global'),
   saveGlobalSecurity: (cfg: GlobalSecurityConfig) =>
     request<GlobalSecurityConfig>('/api/v1/security/global', { method: 'PUT', body: JSON.stringify(cfg) }),
+
+  listRiskPatterns: () =>
+    request<{ items: RiskPatternRule[]; builtin_packs: BuiltinRulePack[] }>('/api/v1/risk-patterns'),
+  saveRiskPattern: (rule: Partial<RiskPatternRule>) =>
+    request<RiskPatternRule>('/api/v1/risk-patterns', { method: 'POST', body: JSON.stringify(rule) }),
+  deleteRiskPattern: (id: string) =>
+    request<{ deleted: boolean }>(`/api/v1/risk-patterns/${id}`, { method: 'DELETE' }),
+  installRulePack: (packId: string, body: { scope_type: string; scope_id: string }) =>
+    request<{ items: RiskPatternRule[] }>(`/api/v1/risk-patterns/packs/${packId}/install`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  testRiskPattern: (req: PatternTestRequest) =>
+    request<PatternTestResult>('/api/v1/risk-patterns/test', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
 
   listApprovals: (status?: string) =>
     request<{ items: ApprovalRecord[] }>(`/api/v1/approvals${status ? `?status=${encodeURIComponent(status)}` : ''}`),

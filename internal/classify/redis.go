@@ -19,7 +19,7 @@ var redisSafeReadCmds = map[string]bool{
 	"HGET": true, "HMGET": true, "HEXISTS": true, "HLEN": true, "HSTRLEN": true, "HRANDFIELD": true,
 	"PFCOUNT": true, "XLEN": true,
 	"SCAN": true, "HSCAN": true, "SSCAN": true, "ZSCAN": true,
-	"COMMAND": true, "CLIENT": true, "MEMORY": true,
+	"COMMAND": true,
 }
 
 var redisHighCostReadCmds = map[string]bool{
@@ -34,11 +34,13 @@ var redisWriteCmds = map[string]bool{
 	"SET": true, "SETEX": true, "PSETEX": true, "SETNX": true, "MSET": true, "MSETNX": true, "GETSET": true, "GETDEL": true, "GETEX": true,
 	"INCR": true, "INCRBY": true, "INCRBYFLOAT": true, "DECR": true, "DECRBY": true, "APPEND": true, "SETRANGE": true, "SETBIT": true,
 	"DEL": true, "UNLINK": true, "EXPIRE": true, "PEXPIRE": true, "EXPIREAT": true, "PEXPIREAT": true, "PERSIST": true,
-	"RENAME": true, "RENAMENX": true, "COPY": true, "MOVE": true, "TOUCH": true,
+	"RENAME": true, "RENAMENX": true, "COPY": true, "MOVE": true, "TOUCH": true, "BITOP": true,
 	"HSET": true, "HSETNX": true, "HMSET": true, "HDEL": true, "HINCRBY": true, "HINCRBYFLOAT": true,
-	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true, "LSET": true, "LREM": true, "LTRIM": true, "LMOVE": true, "RPOPLPUSH": true,
+	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true, "BLPOP": true, "BRPOP": true, "BLMOVE": true,
+	"LSET": true, "LREM": true, "LTRIM": true, "LMOVE": true, "RPOPLPUSH": true,
 	"SADD": true, "SREM": true, "SPOP": true, "SMOVE": true, "SINTERSTORE": true, "SUNIONSTORE": true, "SDIFFSTORE": true,
-	"ZADD": true, "ZREM": true, "ZINCRBY": true, "ZPOPMIN": true, "ZPOPMAX": true, "ZREMRANGEBYRANK": true, "ZREMRANGEBYSCORE": true,
+	"ZADD": true, "ZREM": true, "ZINCRBY": true, "ZPOPMIN": true, "ZPOPMAX": true, "BZPOPMIN": true, "BZPOPMAX": true,
+	"ZREMRANGEBYRANK": true, "ZREMRANGEBYSCORE": true,
 	"XADD": true, "XDEL": true, "XTRIM": true, "XACK": true, "XGROUP": true, "PFADD": true, "PFMERGE": true, "PUBLISH": true,
 }
 
@@ -125,23 +127,107 @@ func classifySingleRedis(args []string) types.StatementSummary {
 	cmd := strings.ToUpper(args[0])
 	snippet := truncateSnippet(strings.Join(args, " "), 120)
 
-	// Subcommand overrides.
-	if cmd == "CONFIG" && len(args) > 1 && strings.EqualFold(args[1], "GET") {
-		return types.StatementSummary{StatementType: "CONFIG_GET", RiskLevel: types.RiskSafeRead, Snippet: snippet}
-	}
-	if cmd == "CLIENT" && len(args) > 1 && strings.EqualFold(args[1], "KILL") {
-		return types.StatementSummary{StatementType: "CLIENT_KILL", RiskLevel: types.RiskAdmin, Snippet: snippet}
-	}
-	if cmd == "LRANGE" || cmd == "ZRANGE" || cmd == "ZREVRANGE" {
-		if isBoundedRange(args) {
+	// Explicit subcommand handling (fail-closed on privileged/DoS subcommands).
+	switch cmd {
+	case "CONFIG":
+		if len(args) > 1 && strings.EqualFold(args[1], "GET") {
+			return types.StatementSummary{StatementType: "CONFIG_GET", RiskLevel: types.RiskSafeRead, Snippet: snippet}
+		}
+	case "CLIENT":
+		if len(args) < 2 {
+			return types.StatementSummary{StatementType: "UNKNOWN_CLIENT", RiskLevel: types.RiskUnknown, Flags: []string{"unrecognized_redis_command"}, Snippet: snippet}
+		}
+		sub := strings.ToUpper(args[1])
+		switch sub {
+		case "ID", "GETNAME", "INFO":
+			return types.StatementSummary{StatementType: "CLIENT_" + sub, RiskLevel: types.RiskSafeRead, Snippet: snippet}
+		case "LIST":
+			return types.StatementSummary{StatementType: "CLIENT_LIST", RiskLevel: types.RiskHighCostRead, Flags: []string{"redis_high_cost_read"}, Snippet: snippet}
+		default:
+			// PAUSE, UNPAUSE, KILL, TRACKING, SETNAME, etc.
+			return types.StatementSummary{StatementType: "CLIENT_" + sub, RiskLevel: types.RiskAdmin, Flags: []string{"redis_client_admin"}, Snippet: snippet}
+		}
+	case "MEMORY":
+		if len(args) < 2 {
+			return types.StatementSummary{StatementType: "UNKNOWN_MEMORY", RiskLevel: types.RiskUnknown, Flags: []string{"unrecognized_redis_command"}, Snippet: snippet}
+		}
+		sub := strings.ToUpper(args[1])
+		switch sub {
+		case "STATS", "MALLOC-STATS", "DOCTOR":
+			return types.StatementSummary{StatementType: "MEMORY_" + sub, RiskLevel: types.RiskSafeRead, Snippet: snippet}
+		case "USAGE":
+			if samples, ok := findRedisIntArg(args[2:], "SAMPLES"); ok && samples <= 0 {
+				return types.StatementSummary{StatementType: "MEMORY_USAGE", RiskLevel: types.RiskHighCostRead, Flags: []string{"memory_usage_full_scan"}, Snippet: snippet}
+			}
+			return types.StatementSummary{StatementType: "MEMORY_USAGE", RiskLevel: types.RiskSafeRead, Snippet: snippet}
+		default:
+			return types.StatementSummary{StatementType: "MEMORY_" + sub, RiskLevel: types.RiskAdmin, Flags: []string{"redis_memory_admin"}, Snippet: snippet}
+		}
+	case "SCAN", "HSCAN", "SSCAN", "ZSCAN":
+		if count, ok := findRedisIntArg(args[1:], "COUNT"); ok && (count > 10000 || count <= 0) {
+			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskHighCostRead, Flags: []string{"scan_large_count"}, Snippet: snippet}
+		} else if !ok && hasRedisKeyword(args[1:], "COUNT") {
+			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskHighCostRead, Flags: []string{"scan_large_count"}, Snippet: snippet}
+		}
+		return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskSafeRead, Snippet: snippet}
+	case "LRANGE", "ZRANGE", "ZREVRANGE":
+		if hasRedisKeyword(args[1:], "STORE") {
+			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskWrite, Flags: []string{"redis_store_write"}, Snippet: snippet}
+		}
+		if (hasRedisKeyword(args[1:], "BYSCORE") || hasRedisKeyword(args[1:], "BYLEX")) && isBoundedRedisLimit(args[1:]) {
 			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskSafeRead, Snippet: snippet}
 		}
-		return types.StatementSummary{
-			StatementType: cmd,
-			RiskLevel:     types.RiskHighCostRead,
-			Flags:         []string{"unbounded_range_read"},
-			Snippet:       snippet,
+		if !hasRedisKeyword(args[1:], "BYSCORE") && !hasRedisKeyword(args[1:], "BYLEX") && isBoundedRange(args) {
+			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskSafeRead, Snippet: snippet}
 		}
+		return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskHighCostRead, Flags: []string{"unbounded_range_read"}, Snippet: snippet}
+	case "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZREVRANGEBYLEX":
+		if isBoundedRedisLimit(args[1:]) {
+			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskSafeRead, Snippet: snippet}
+		}
+		return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskHighCostRead, Flags: []string{"unbounded_range_read"}, Snippet: snippet}
+	case "GEORADIUS", "GEORADIUSBYMEMBER":
+		if hasRedisKeyword(args[1:], "STORE") || hasRedisKeyword(args[1:], "STOREDIST") {
+			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskWrite, Flags: []string{"redis_store_write"}, Snippet: snippet}
+		}
+		if count, ok := findRedisIntArg(args[1:], "COUNT"); ok && count > 0 && count <= 500 {
+			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskSafeRead, Snippet: snippet}
+		}
+		return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskHighCostRead, Flags: []string{"unbounded_range_read"}, Snippet: snippet}
+	case "GEORADIUS_RO", "GEORADIUSBYMEMBER_RO", "GEOSEARCH":
+		if count, ok := findRedisIntArg(args[1:], "COUNT"); ok && count > 0 && count <= 500 {
+			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskSafeRead, Snippet: snippet}
+		}
+		return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskHighCostRead, Flags: []string{"unbounded_range_read"}, Snippet: snippet}
+	case "SRANDMEMBER", "HRANDFIELD":
+		if len(args) >= 3 {
+			cnt, err := strconv.Atoi(args[2])
+			if err != nil || cnt > 500 || cnt < -500 {
+				return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskHighCostRead, Flags: []string{"unbounded_range_read"}, Snippet: snippet}
+			}
+		}
+		return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskSafeRead, Snippet: snippet}
+	case "MGET", "EXISTS":
+		if len(args)-1 > 100 {
+			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskHighCostRead, Flags: []string{"redis_large_fanout"}, Snippet: snippet}
+		}
+		return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskSafeRead, Snippet: snippet}
+	case "HMGET", "SMISMEMBER", "ZMSCORE":
+		if len(args)-2 > 100 {
+			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskHighCostRead, Flags: []string{"redis_large_fanout"}, Snippet: snippet}
+		}
+		return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskSafeRead, Snippet: snippet}
+	case "SORT":
+		if hasRedisKeyword(args[1:], "STORE") {
+			return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskWrite, Flags: []string{"redis_store_write"}, Snippet: snippet}
+		}
+		return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskHighCostRead, Flags: []string{"redis_high_cost_read"}, Snippet: snippet}
+	case "XREAD":
+		flags := []string{"redis_high_cost_read"}
+		if hasRedisKeyword(args[1:], "BLOCK") {
+			flags = append(flags, "blocking_command")
+		}
+		return types.StatementSummary{StatementType: cmd, RiskLevel: types.RiskHighCostRead, Flags: flags, Snippet: snippet}
 	}
 
 	switch {
@@ -166,6 +252,38 @@ func classifySingleRedis(args []string) types.StatementSummary {
 			Snippet:       snippet,
 		}
 	}
+}
+
+func hasRedisKeyword(args []string, kw string) bool {
+	for _, a := range args {
+		if strings.EqualFold(a, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func findRedisIntArg(args []string, kw string) (int, bool) {
+	for i := 0; i < len(args)-1; i++ {
+		if strings.EqualFold(args[i], kw) {
+			n, err := strconv.Atoi(args[i+1])
+			if err == nil {
+				return n, true
+			}
+			return -1, false
+		}
+	}
+	return 0, false
+}
+
+func isBoundedRedisLimit(args []string) bool {
+	for i := 0; i < len(args)-2; i++ {
+		if strings.EqualFold(args[i], "LIMIT") {
+			count, err := strconv.Atoi(args[i+2])
+			return err == nil && count > 0 && count <= 500
+		}
+	}
+	return false
 }
 
 func isBoundedRange(args []string) bool {

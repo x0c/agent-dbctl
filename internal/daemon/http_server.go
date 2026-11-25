@@ -13,6 +13,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/x0c/agent-dbctl/internal/policy"
 	"github.com/x0c/agent-dbctl/internal/store"
 	"github.com/x0c/agent-dbctl/internal/types"
 	"github.com/x0c/agent-dbctl/internal/webui"
@@ -416,6 +417,69 @@ func NewWebHandler(svc *Service) http.Handler {
 		}
 		svc.broadcast(Event{Type: "security_updated", Data: saved})
 		writeJSONResp(w, http.StatusOK, saved)
+	})
+
+	// Custom High-Risk Pattern Rules & Dry-Run Sandbox
+	mux.HandleFunc("GET /api/v1/risk-patterns", func(w http.ResponseWriter, r *http.Request) {
+		items, err := svc.Store().ListRiskPatternRules(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"items":         items,
+			"builtin_packs": policy.BuiltinRulePacks(),
+		})
+	})
+	mux.HandleFunc("POST /api/v1/risk-patterns", func(w http.ResponseWriter, r *http.Request) {
+		var body types.RiskPatternRule
+		if err := decodeJSONBody(r, &body); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		saved, err := svc.Store().UpsertRiskPatternRule(r.Context(), "web-admin", body)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		svc.broadcast(Event{Type: "patterns_updated", Data: saved})
+		writeJSONResp(w, http.StatusOK, saved)
+	})
+	mux.HandleFunc("DELETE /api/v1/risk-patterns/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if err := svc.Store().DeleteRiskPatternRule(r.Context(), "web-admin", id); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		svc.broadcast(Event{Type: "patterns_updated", Data: map[string]string{"id": id}})
+		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
+	})
+	mux.HandleFunc("POST /api/v1/risk-patterns/packs/{id}/install", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ScopeType string `json:"scope_type"`
+			ScopeID   string `json:"scope_id"`
+		}
+		_ = decodeJSONBody(r, &body)
+		installed, err := svc.Store().InstallBuiltinRulePack(r.Context(), "web-admin", r.PathValue("id"), body.ScopeType, body.ScopeID)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		svc.broadcast(Event{Type: "patterns_updated", Data: map[string]any{"pack_id": r.PathValue("id"), "count": len(installed)}})
+		writeJSONResp(w, http.StatusOK, map[string]any{"items": installed})
+	})
+	mux.HandleFunc("POST /api/v1/risk-patterns/test", func(w http.ResponseWriter, r *http.Request) {
+		var body types.PatternTestRequest
+		if err := decodeJSONBody(r, &body); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		res, err := svc.TestRiskPattern(r.Context(), body)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, res)
 	})
 
 	// Approvals

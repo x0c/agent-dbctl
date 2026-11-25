@@ -2,6 +2,7 @@ package policy
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/x0c/agent-dbctl/internal/types"
 )
@@ -182,6 +183,18 @@ func Evaluate(
 	cls types.Classification,
 	preflight *types.PreflightReport,
 ) types.PolicyEvaluation {
+	return EvaluateQuery(tgt, eff, cls, preflight, "")
+}
+
+// EvaluateQuery decides allow vs require_approval vs deny using both static classification,
+// EXPLAIN preflight metrics, and configured custom high-risk pattern rules.
+func EvaluateQuery(
+	tgt types.Target,
+	eff types.EffectivePolicy,
+	cls types.Classification,
+	preflight *types.PreflightReport,
+	rawQuery string,
+) types.PolicyEvaluation {
 	eval := types.PolicyEvaluation{
 		Decision:        types.DecisionAllow,
 		CredentialMode:  types.AccessReadWrite,
@@ -202,6 +215,11 @@ func Evaluate(
 		eval.DenyMessage = fmt.Sprintf("Target %q is currently %s", tgt.Ref, tgt.Status)
 		eval.TriggerReasons = append(eval.TriggerReasons, "target_"+string(tgt.Status))
 		return eval
+	}
+
+	if len(eff.PatternRules) > 0 && rawQuery != "" {
+		matched, _ := MatchPatternRules(eff.PatternRules, cls, preflight, rawQuery)
+		eval.MatchedRules = matched
 	}
 
 	if eff.ProdReadOnlyFreeze && eff.SafetyTier == types.SafetyTierStrict && !cls.IsReadOnly {
@@ -253,9 +271,53 @@ func Evaluate(
 		}
 	}
 
+	var patternDeny *types.MatchedRule
+	var patternApprovalProvider string
+	for i := range eval.MatchedRules {
+		mr := &eval.MatchedRules[i]
+		switch mr.Action {
+		case types.PatternActionDeny:
+			if patternDeny == nil {
+				patternDeny = mr
+			}
+			reasons = append(reasons, "pattern_deny:"+mr.RuleName)
+		case types.PatternActionRequireApproval:
+			reasons = append(reasons, "pattern_rule:"+mr.RuleName)
+			if patternApprovalProvider == "" && strings.TrimSpace(mr.ApprovalProvider) != "" {
+				patternApprovalProvider = strings.TrimSpace(mr.ApprovalProvider)
+			}
+		case types.PatternActionElevateHighCost:
+			if eff.RequireApprovalOnHighCostRead {
+				reasons = append(reasons, "pattern_high_cost:"+mr.RuleName)
+			}
+		}
+	}
+
+	if patternDeny != nil {
+		eval.Decision = types.DecisionDeny
+		eval.DenyCode = types.ErrCodePolicyDenied
+		title := strings.TrimSpace(patternDeny.ConfirmTitle)
+		msg := strings.TrimSpace(patternDeny.ConfirmMessage)
+		switch {
+		case title != "" && msg != "":
+			eval.DenyMessage = title + ": " + msg
+		case msg != "":
+			eval.DenyMessage = msg
+		case title != "":
+			eval.DenyMessage = title
+		default:
+			eval.DenyMessage = fmt.Sprintf("Blocked by custom risk pattern rule %q", patternDeny.RuleName)
+		}
+		eval.TriggerReasons = deduplicateStrings(reasons)
+		return eval
+	}
+
 	if len(reasons) > 0 {
 		eval.Decision = types.DecisionRequireApproval
 		eval.TriggerReasons = deduplicateStrings(reasons)
+		if patternApprovalProvider != "" {
+			eval.EffectivePolicy.ApprovalProvider = patternApprovalProvider
+		}
 	}
 	return eval
 }

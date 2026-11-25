@@ -154,6 +154,7 @@ type Operation struct {
 	RiskLevel       RiskLevel         `json:"risk_level"`
 	Decision        Decision          `json:"decision"`
 	TriggerReasons  []string          `json:"trigger_reasons,omitempty"`
+	MatchedRules    []MatchedRule     `json:"matched_rules,omitempty"`
 	Classification  Classification    `json:"classification"`
 	Preflight       *PreflightReport  `json:"preflight,omitempty"`
 	Status          OperationStatus   `json:"status"`
@@ -202,6 +203,7 @@ type ApprovalRequest struct {
 	QueryText         string           `json:"query_text"`
 	RiskLevel         RiskLevel        `json:"risk_level"`
 	TriggerReasons    []string         `json:"trigger_reasons,omitempty"`
+	MatchedRules      []MatchedRule    `json:"matched_rules,omitempty"`
 	Preflight         *PreflightReport `json:"preflight,omitempty"`
 	Reviewer          string           `json:"reviewer,omitempty"`
 	ReviewerNote      string           `json:"reviewer_note,omitempty"`

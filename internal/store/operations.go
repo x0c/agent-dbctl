@@ -47,6 +47,7 @@ func (s *Store) CreateOperation(ctx context.Context, op types.Operation) (types.
 	}
 	op.UpdatedAtUTC = now
 	trigJSON, _ := json.Marshal(op.TriggerReasons)
+	matchedJSON, _ := json.Marshal(op.MatchedRules)
 	clsJSON, _ := json.Marshal(op.Classification)
 	var preflightJSON string
 	if op.Preflight != nil {
@@ -59,21 +60,21 @@ func (s *Store) CreateOperation(ctx context.Context, op types.Operation) (types.
 			INSERT INTO operations(
 				id, target_id, target_ref, system_id, system_slug, environment_code, engine,
 				actor, reason, workspace_cwd, query_text, query_redacted,
-				risk_level, decision, trigger_reasons_json, classification_json, preflight_json,
+				risk_level, decision, trigger_reasons_json, matched_rules_json, classification_json, preflight_json,
 				status, credential_mode, approval_id, fetched_rows, returned_rows, affected_rows,
 				truncated, cutoff_reason, latency_ms, error_code, error_message, retryable,
 				created_at_utc, updated_at_utc, completed_at_utc
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			op.ID, op.TargetID, op.TargetRef, op.SystemID, op.SystemSlug, op.EnvironmentCode, op.Engine,
 			op.Actor, op.Reason, op.WorkspaceCWD, op.QueryText, op.QueryRedacted,
-			string(op.RiskLevel), string(op.Decision), string(trigJSON), string(clsJSON), preflightJSON,
+			string(op.RiskLevel), string(op.Decision), string(trigJSON), string(matchedJSON), string(clsJSON), preflightJSON,
 			string(op.Status), string(op.CredentialMode), op.ApprovalID, op.FetchedRows, op.ReturnedRows, nullableInt64(op.AffectedRows),
 			boolToInt(op.Truncated), op.CutoffReason, op.LatencyMs, op.ErrorCode, op.ErrorMessage, boolToInt(op.Retryable),
 			op.CreatedAtUTC, op.UpdatedAtUTC, op.CompletedAtUTC)
 		if err != nil {
 			return err
 		}
-		return s.appendAuditTx(ctx, tx, op.Actor, "operation.submit", op.TargetID, op.ID, map[string]any{
+		auditPayload := map[string]any{
 			"target_ref": op.TargetRef,
 			"env":        op.EnvironmentCode,
 			"engine":     op.Engine,
@@ -82,7 +83,11 @@ func (s *Store) CreateOperation(ctx context.Context, op types.Operation) (types.
 			"status":     op.Status,
 			"reason":     op.Reason,
 			"query":      op.QueryRedacted,
-		}, now)
+		}
+		if len(op.MatchedRules) > 0 {
+			auditPayload["matched_rules"] = op.MatchedRules
+		}
+		return s.appendAuditTx(ctx, tx, op.Actor, "operation.submit", op.TargetID, op.ID, auditPayload, now)
 	})
 	return op, err
 }
@@ -133,14 +138,7 @@ func (s *Store) updateOperationTx(ctx context.Context, tx *sql.Tx, actor, auditA
 
 // GetOperation returns an operation by ID.
 func (s *Store) GetOperation(ctx context.Context, id string) (types.Operation, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT id, target_id, target_ref, system_id, system_slug, environment_code, engine,
-			actor, reason, workspace_cwd, query_text, query_redacted,
-			risk_level, decision, trigger_reasons_json, classification_json, preflight_json,
-			status, credential_mode, approval_id, fetched_rows, returned_rows, affected_rows,
-			truncated, cutoff_reason, latency_ms, error_code, error_message, retryable,
-			created_at_utc, updated_at_utc, completed_at_utc
-		FROM operations WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, opSelectByIDQuery, id)
 	return scanOperation(row)
 }
 
@@ -174,7 +172,7 @@ func (s *Store) ListOperations(ctx context.Context, targetRef, envCode, systemSl
 	}
 	q := `SELECT id, target_id, target_ref, system_id, system_slug, environment_code, engine,
 		actor, reason, workspace_cwd, query_text, query_redacted,
-		risk_level, decision, trigger_reasons_json, classification_json, preflight_json,
+		risk_level, decision, trigger_reasons_json, matched_rules_json, classification_json, preflight_json,
 		status, credential_mode, approval_id, fetched_rows, returned_rows, affected_rows,
 		truncated, cutoff_reason, latency_ms, error_code, error_message, retryable,
 		created_at_utc, updated_at_utc, completed_at_utc
@@ -212,6 +210,7 @@ func (s *Store) CreateApproval(ctx context.Context, actor string, app types.Appr
 		app.CreatedAtUTC = now
 	}
 	trigJSON, _ := json.Marshal(app.TriggerReasons)
+	matchedJSON, _ := json.Marshal(app.MatchedRules)
 	var preflightJSON string
 	if app.Preflight != nil {
 		b, _ := json.Marshal(app.Preflight)
@@ -222,22 +221,26 @@ func (s *Store) CreateApproval(ctx context.Context, actor string, app types.Appr
 			INSERT INTO approvals(
 				id, operation_id, provider, external_ticket_id, external_ticket_url, token_hash,
 				status, target_ref, system_slug, environment_code, engine, actor, reason, workspace_cwd,
-				query_text, risk_level, trigger_reasons_json, preflight_json,
+				query_text, risk_level, trigger_reasons_json, matched_rules_json, preflight_json,
 				reviewer, reviewer_note, created_at_utc, expires_at_utc, resolved_at_utc
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			app.ID, app.OperationID, app.Provider, app.ExternalTicketID, app.ExternalTicketURL, tokenHash,
 			string(app.Status), app.TargetRef, app.SystemSlug, app.EnvironmentCode, app.Engine, app.Actor, app.Reason, app.WorkspaceCWD,
-			app.QueryText, string(app.RiskLevel), string(trigJSON), preflightJSON,
+			app.QueryText, string(app.RiskLevel), string(trigJSON), string(matchedJSON), preflightJSON,
 			app.Reviewer, app.ReviewerNote, app.CreatedAtUTC, app.ExpiresAtUTC, app.ResolvedAtUTC)
 		if err != nil {
 			return err
 		}
-		return s.appendAuditTx(ctx, tx, actor, "approval.create", app.TargetRef, app.OperationID, map[string]any{
+		auditPayload := map[string]any{
 			"approval_id": app.ID,
 			"provider":    app.Provider,
 			"env":         app.EnvironmentCode,
 			"risk_level":  app.RiskLevel,
-		}, now)
+		}
+		if len(app.MatchedRules) > 0 {
+			auditPayload["matched_rules"] = app.MatchedRules
+		}
+		return s.appendAuditTx(ctx, tx, actor, "approval.create", app.TargetRef, app.OperationID, auditPayload, now)
 	})
 	return app, err
 }
@@ -264,7 +267,7 @@ func (s *Store) GetApproval(ctx context.Context, id string) (types.ApprovalReque
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, operation_id, provider, external_ticket_id, external_ticket_url, token_hash,
 			status, target_ref, system_slug, environment_code, engine, actor, reason, workspace_cwd,
-			query_text, risk_level, trigger_reasons_json, preflight_json,
+			query_text, risk_level, trigger_reasons_json, matched_rules_json, preflight_json,
 			reviewer, reviewer_note, created_at_utc, expires_at_utc, resolved_at_utc
 		FROM approvals WHERE id = ?`, id)
 	return scanApproval(row)
@@ -277,7 +280,7 @@ func (s *Store) ListApprovals(ctx context.Context, status string, limit int) ([]
 	}
 	q := `SELECT id, operation_id, provider, external_ticket_id, external_ticket_url, token_hash,
 		status, target_ref, system_slug, environment_code, engine, actor, reason, workspace_cwd,
-		query_text, risk_level, trigger_reasons_json, preflight_json,
+		query_text, risk_level, trigger_reasons_json, matched_rules_json, preflight_json,
 		reviewer, reviewer_note, created_at_utc, expires_at_utc, resolved_at_utc
 	FROM approvals`
 	var args []any
@@ -317,7 +320,7 @@ func (s *Store) ResolveApproval(ctx context.Context, id string, nextStatus types
 		row := tx.QueryRowContext(ctx, `
 			SELECT id, operation_id, provider, external_ticket_id, external_ticket_url, token_hash,
 				status, target_ref, system_slug, environment_code, engine, actor, reason, workspace_cwd,
-				query_text, risk_level, trigger_reasons_json, preflight_json,
+				query_text, risk_level, trigger_reasons_json, matched_rules_json, preflight_json,
 				reviewer, reviewer_note, created_at_utc, expires_at_utc, resolved_at_utc
 			FROM approvals WHERE id = ?`, id)
 		cur, _, err := scanApproval(row)
@@ -395,7 +398,7 @@ func (s *Store) RecoverOnStartup(ctx context.Context, actor string) (RecoveryRep
 		runningOps, err := queryOperationsTx(ctx, tx, `
 			SELECT id, target_id, target_ref, system_id, system_slug, environment_code, engine,
 				actor, reason, workspace_cwd, query_text, query_redacted,
-				risk_level, decision, trigger_reasons_json, classification_json, preflight_json,
+				risk_level, decision, trigger_reasons_json, matched_rules_json, classification_json, preflight_json,
 				status, credential_mode, approval_id, fetched_rows, returned_rows, affected_rows,
 				truncated, cutoff_reason, latency_ms, error_code, error_message, retryable,
 				created_at_utc, updated_at_utc, completed_at_utc
@@ -426,7 +429,7 @@ func (s *Store) RecoverOnStartup(ctx context.Context, actor string) (RecoveryRep
 		pendingApps, err := queryApprovalsTx(ctx, tx, `
 			SELECT id, operation_id, provider, external_ticket_id, external_ticket_url, token_hash,
 				status, target_ref, system_slug, environment_code, engine, actor, reason, workspace_cwd,
-				query_text, risk_level, trigger_reasons_json, preflight_json,
+				query_text, risk_level, trigger_reasons_json, matched_rules_json, preflight_json,
 				reviewer, reviewer_note, created_at_utc, expires_at_utc, resolved_at_utc
 			FROM approvals WHERE status = 'pending' ORDER BY created_at_utc ASC`)
 		if err != nil {
@@ -477,7 +480,7 @@ func (s *Store) RecoverOnStartup(ctx context.Context, actor string) (RecoveryRep
 		waitingOps, err := queryOperationsTx(ctx, tx, `
 			SELECT id, target_id, target_ref, system_id, system_slug, environment_code, engine,
 				actor, reason, workspace_cwd, query_text, query_redacted,
-				risk_level, decision, trigger_reasons_json, classification_json, preflight_json,
+				risk_level, decision, trigger_reasons_json, matched_rules_json, classification_json, preflight_json,
 				status, credential_mode, approval_id, fetched_rows, returned_rows, affected_rows,
 				truncated, cutoff_reason, latency_ms, error_code, error_message, retryable,
 				created_at_utc, updated_at_utc, completed_at_utc
@@ -493,7 +496,7 @@ func (s *Store) RecoverOnStartup(ctx context.Context, actor string) (RecoveryRep
 				appRow := tx.QueryRowContext(ctx, `
 					SELECT id, operation_id, provider, external_ticket_id, external_ticket_url, token_hash,
 						status, target_ref, system_slug, environment_code, engine, actor, reason, workspace_cwd,
-						query_text, risk_level, trigger_reasons_json, preflight_json,
+						query_text, risk_level, trigger_reasons_json, matched_rules_json, preflight_json,
 						reviewer, reviewer_note, created_at_utc, expires_at_utc, resolved_at_utc
 					FROM approvals WHERE id = ?`, op.ApprovalID)
 				if app, _, appErr := scanApproval(appRow); appErr == nil {
@@ -549,7 +552,7 @@ func (s *Store) RecoverOnStartup(ctx context.Context, actor string) (RecoveryRep
 const opSelectByIDQuery = `
 	SELECT id, target_id, target_ref, system_id, system_slug, environment_code, engine,
 		actor, reason, workspace_cwd, query_text, query_redacted,
-		risk_level, decision, trigger_reasons_json, classification_json, preflight_json,
+		risk_level, decision, trigger_reasons_json, matched_rules_json, classification_json, preflight_json,
 		status, credential_mode, approval_id, fetched_rows, returned_rows, affected_rows,
 		truncated, cutoff_reason, latency_ms, error_code, error_message, retryable,
 		created_at_utc, updated_at_utc, completed_at_utc
@@ -725,13 +728,13 @@ type rowScanner interface {
 
 func scanOperation(r rowScanner) (types.Operation, error) {
 	var op types.Operation
-	var trigJSON, clsJSON, preflightJSON string
+	var trigJSON, matchedJSON, clsJSON, preflightJSON string
 	var affected sql.NullInt64
 	var truncated, retryable int
 	err := r.Scan(
 		&op.ID, &op.TargetID, &op.TargetRef, &op.SystemID, &op.SystemSlug, &op.EnvironmentCode, &op.Engine,
 		&op.Actor, &op.Reason, &op.WorkspaceCWD, &op.QueryText, &op.QueryRedacted,
-		&op.RiskLevel, &op.Decision, &trigJSON, &clsJSON, &preflightJSON,
+		&op.RiskLevel, &op.Decision, &trigJSON, &matchedJSON, &clsJSON, &preflightJSON,
 		&op.Status, &op.CredentialMode, &op.ApprovalID, &op.FetchedRows, &op.ReturnedRows, &affected,
 		&truncated, &op.CutoffReason, &op.LatencyMs, &op.ErrorCode, &op.ErrorMessage, &retryable,
 		&op.CreatedAtUTC, &op.UpdatedAtUTC, &op.CompletedAtUTC)
@@ -748,6 +751,7 @@ func scanOperation(r rowScanner) (types.Operation, error) {
 	op.Truncated = truncated == 1
 	op.Retryable = retryable == 1
 	_ = json.Unmarshal([]byte(trigJSON), &op.TriggerReasons)
+	_ = json.Unmarshal([]byte(matchedJSON), &op.MatchedRules)
 	_ = json.Unmarshal([]byte(clsJSON), &op.Classification)
 	if preflightJSON != "" {
 		var pf types.PreflightReport
@@ -760,11 +764,11 @@ func scanOperation(r rowScanner) (types.Operation, error) {
 
 func scanApproval(r rowScanner) (types.ApprovalRequest, string, error) {
 	var app types.ApprovalRequest
-	var tokenHash, trigJSON, preflightJSON string
+	var tokenHash, trigJSON, matchedJSON, preflightJSON string
 	err := r.Scan(
 		&app.ID, &app.OperationID, &app.Provider, &app.ExternalTicketID, &app.ExternalTicketURL, &tokenHash,
 		&app.Status, &app.TargetRef, &app.SystemSlug, &app.EnvironmentCode, &app.Engine, &app.Actor, &app.Reason, &app.WorkspaceCWD,
-		&app.QueryText, &app.RiskLevel, &trigJSON, &preflightJSON,
+		&app.QueryText, &app.RiskLevel, &trigJSON, &matchedJSON, &preflightJSON,
 		&app.Reviewer, &app.ReviewerNote, &app.CreatedAtUTC, &app.ExpiresAtUTC, &app.ResolvedAtUTC)
 	if errors.Is(err, sql.ErrNoRows) {
 		return app, "", ErrNotFound
@@ -773,6 +777,7 @@ func scanApproval(r rowScanner) (types.ApprovalRequest, string, error) {
 		return app, "", err
 	}
 	_ = json.Unmarshal([]byte(trigJSON), &app.TriggerReasons)
+	_ = json.Unmarshal([]byte(matchedJSON), &app.MatchedRules)
 	if preflightJSON != "" {
 		var pf types.PreflightReport
 		if err := json.Unmarshal([]byte(preflightJSON), &pf); err == nil {

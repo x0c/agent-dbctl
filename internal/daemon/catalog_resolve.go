@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/x0c/agent-dbctl/internal/classify"
 	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/policy"
 	"github.com/x0c/agent-dbctl/internal/types"
@@ -65,6 +66,10 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string) (
 		return nil, err
 	}
 	policies, err := s.store.ListPolicies(ctx)
+	if err != nil {
+		return nil, err
+	}
+	patternRules, err := s.store.ListRiskPatternRules(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -140,6 +145,14 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string) (
 			}
 		}
 		d.EffectivePolicy = policy.ResolveEffectivePolicy(global, envPtr, ownerPtr, t, policies)
+		if d.Instance != nil {
+			eng := d.Instance.Engine
+			fam := classify.EngineFamily(eng)
+			if drv, ok := s.drivers.Get(eng); ok {
+				fam = drv.Metadata().Family
+			}
+			d.EffectivePolicy.PatternRules = policy.ResolveEffectivePatternRules(envPtr, ownerPtr, t, eng, fam, patternRules)
+		}
 		out = append(out, d)
 	}
 

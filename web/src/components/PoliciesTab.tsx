@@ -17,10 +17,14 @@ import {
   SelectTrigger,
   SelectValue,
   Switch,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
   toast,
 } from '@x0c/ui'
 import { Plus, RefreshCw, Save } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import {
   api,
   type DisplayCatalog,
@@ -30,6 +34,7 @@ import {
   type SystemRecord,
   type TargetDetail,
 } from '../api'
+import { RiskPatternsPanel } from './RiskPatternsPanel'
 
 export function PoliciesTab({
   catalog,
@@ -47,6 +52,7 @@ export function PoliciesTab({
   const [savingGlobal, setSavingGlobal] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  const [subTab, setSubTab] = useState<'guardrails' | 'patterns'>('guardrails')
   const [dialogOpen, setDialogOpen] = useState(false)
   const [savingPol, setSavingPol] = useState(false)
   const [polErr, setPolErr] = useState<string | null>(null)
@@ -100,7 +106,8 @@ export function PoliciesTab({
     }
   }
 
-  const savePolicy = async () => {
+  const savePolicy = async (e?: FormEvent<HTMLFormElement>) => {
+    e?.preventDefault()
     setSavingPol(true)
     setPolErr(null)
     try {
@@ -203,96 +210,109 @@ export function PoliciesTab({
 
       {error && <Notice tone="error">{error}</Notice>}
 
-      {globalCfg && (
-        <Panel
-          title="Global Security Guardrails (Hard Ceilings)"
-          action={
-            <LoadingButton size="sm" pending={savingGlobal} onClick={() => void saveGlobal()}>
-              <Save className="size-3.5" />
-              Save Guardrails
-            </LoadingButton>
-          }
-        >
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            <FormField label="Execution Timeout (sec)">
-              <Input
-                type="number"
-                value={globalCfg.exec_timeout_sec}
-                onChange={(e) => setGlobalCfg((p) => p && { ...p, exec_timeout_sec: Number(e.target.value) })}
-              />
-            </FormField>
-            <FormField label="Approval Timeout (sec)">
-              <Input
-                type="number"
-                value={globalCfg.approval_timeout_sec}
-                onChange={(e) => setGlobalCfg((p) => p && { ...p, approval_timeout_sec: Number(e.target.value) })}
-              />
-            </FormField>
-            <FormField label="Max Returned Rows">
-              <Input
-                type="number"
-                value={globalCfg.max_rows}
-                onChange={(e) => setGlobalCfg((p) => p && { ...p, max_rows: Number(e.target.value) })}
-              />
-            </FormField>
-            <FormField label="Max Returned Bytes">
-              <Input
-                type="number"
-                value={globalCfg.max_bytes}
-                onChange={(e) => setGlobalCfg((p) => p && { ...p, max_bytes: Number(e.target.value) })}
-              />
-            </FormField>
-            <FormField label="EXPLAIN Estimated Row Threshold">
-              <Input
-                type="number"
-                value={globalCfg.explain_max_rows}
-                onChange={(e) => setGlobalCfg((p) => p && { ...p, explain_max_rows: Number(e.target.value) })}
-              />
-            </FormField>
-            <FormField label="Default Approval Provider">
-              <Select
-                value={globalCfg.default_approval_provider}
-                onValueChange={(v) => setGlobalCfg((p) => p && { ...p, default_approval_provider: v })}
-              >
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {catalog.approval_providers.map((ap) => (
-                    <SelectItem key={ap.code} value={ap.code}>{ap.code}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </FormField>
-          </div>
+      <Tabs value={subTab} onValueChange={(v) => setSubTab(v as typeof subTab)}>
+        <TabsList>
+          <TabsTrigger value="guardrails">Guardrails &amp; Overrides</TabsTrigger>
+          <TabsTrigger value="patterns">High-Risk Patterns</TabsTrigger>
+        </TabsList>
 
-          <div className="mt-4 grid gap-3 border-t border-border pt-4 sm:grid-cols-3">
-            <label className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm">
-              <span>Prod Read-Only Freeze</span>
-              <Switch
-                checked={globalCfg.prod_read_only_freeze}
-                onCheckedChange={(c) => setGlobalCfg((p) => p && { ...p, prod_read_only_freeze: c })}
-              />
-            </label>
-            <label className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm">
-              <span>Block Multi-Statement in Prod</span>
-              <Switch
-                checked={globalCfg.block_multi_statement_in_prod}
-                onCheckedChange={(c) => setGlobalCfg((p) => p && { ...p, block_multi_statement_in_prod: c })}
-              />
-            </label>
-            <label className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm">
-              <span>Redact Literals in Audit</span>
-              <Switch
-                checked={globalCfg.redact_audit_literals}
-                onCheckedChange={(c) => setGlobalCfg((p) => p && { ...p, redact_audit_literals: c })}
-              />
-            </label>
-          </div>
-        </Panel>
-      )}
+        <TabsContent value="guardrails" className="space-y-5 pt-2">
+          {globalCfg && (
+            <Panel
+              title="Global Security Guardrails (Hard Ceilings)"
+              action={
+                <LoadingButton size="sm" pending={savingGlobal} onClick={() => void saveGlobal()}>
+                  <Save className="size-3.5" />
+                  Save Guardrails
+                </LoadingButton>
+              }
+            >
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <FormField label="Execution Timeout (sec)">
+                  <Input
+                    type="number"
+                    value={globalCfg.exec_timeout_sec}
+                    onChange={(e) => setGlobalCfg((p) => p && { ...p, exec_timeout_sec: Number(e.target.value) })}
+                  />
+                </FormField>
+                <FormField label="Approval Timeout (sec)">
+                  <Input
+                    type="number"
+                    value={globalCfg.approval_timeout_sec}
+                    onChange={(e) => setGlobalCfg((p) => p && { ...p, approval_timeout_sec: Number(e.target.value) })}
+                  />
+                </FormField>
+                <FormField label="Max Returned Rows">
+                  <Input
+                    type="number"
+                    value={globalCfg.max_rows}
+                    onChange={(e) => setGlobalCfg((p) => p && { ...p, max_rows: Number(e.target.value) })}
+                  />
+                </FormField>
+                <FormField label="Max Returned Bytes">
+                  <Input
+                    type="number"
+                    value={globalCfg.max_bytes}
+                    onChange={(e) => setGlobalCfg((p) => p && { ...p, max_bytes: Number(e.target.value) })}
+                  />
+                </FormField>
+                <FormField label="EXPLAIN Estimated Row Threshold">
+                  <Input
+                    type="number"
+                    value={globalCfg.explain_max_rows}
+                    onChange={(e) => setGlobalCfg((p) => p && { ...p, explain_max_rows: Number(e.target.value) })}
+                  />
+                </FormField>
+                <FormField label="Default Approval Provider">
+                  <Select
+                    value={globalCfg.default_approval_provider}
+                    onValueChange={(v) => setGlobalCfg((p) => p && { ...p, default_approval_provider: v })}
+                  >
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {catalog.approval_providers.map((ap) => (
+                        <SelectItem key={ap.code} value={ap.code}>{ap.code}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </FormField>
+              </div>
 
-      <Panel title="Scoped Policy Overrides (Env → System → Target)" flush>
-        <DataTable columns={columns} data={policies} emptyLabel="No scoped policy overrides configured (using environment defaults)." />
-      </Panel>
+              <div className="mt-4 grid gap-3 border-t border-border pt-4 sm:grid-cols-3">
+                <label className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm">
+                  <span>Prod Read-Only Freeze</span>
+                  <Switch
+                    checked={globalCfg.prod_read_only_freeze}
+                    onCheckedChange={(c) => setGlobalCfg((p) => p && { ...p, prod_read_only_freeze: c })}
+                  />
+                </label>
+                <label className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm">
+                  <span>Block Multi-Statement in Prod</span>
+                  <Switch
+                    checked={globalCfg.block_multi_statement_in_prod}
+                    onCheckedChange={(c) => setGlobalCfg((p) => p && { ...p, block_multi_statement_in_prod: c })}
+                  />
+                </label>
+                <label className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm">
+                  <span>Redact Literals in Audit</span>
+                  <Switch
+                    checked={globalCfg.redact_audit_literals}
+                    onCheckedChange={(c) => setGlobalCfg((p) => p && { ...p, redact_audit_literals: c })}
+                  />
+                </label>
+              </div>
+            </Panel>
+          )}
+
+          <Panel title="Scoped Policy Overrides (Env → System → Target)" flush>
+            <DataTable columns={columns} data={policies} emptyLabel="No scoped policy overrides configured (using environment defaults)." />
+          </Panel>
+        </TabsContent>
+
+        <TabsContent value="patterns" className="pt-2">
+          <RiskPatternsPanel envs={envs} systems={systems} targets={targets} />
+        </TabsContent>
+      </Tabs>
 
       <FormDialog
         open={dialogOpen}

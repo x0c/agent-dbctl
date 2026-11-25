@@ -259,6 +259,39 @@ export function ApprovalsTab({
                 </div>
               )}
 
+              {(selected.matched_rules ?? []).length > 0 && (
+                <div className="space-y-2 rounded-md border border-amber-300 bg-amber-50/70 p-3 text-xs">
+                  <div className="flex items-center gap-1.5 font-semibold text-amber-950">
+                    <ShieldAlert className="size-4 text-amber-700" />
+                    <span>High-Risk Pattern Confirmation</span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {selected.matched_rules!.map((mr) => (
+                      <div
+                        key={`${mr.rule_id}-${mr.rule_name}`}
+                        className="rounded border border-amber-200 bg-white/80 px-2.5 py-2"
+                      >
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-semibold text-amber-950">{mr.confirm_title || mr.rule_name}</span>
+                          <Badge variant="outline" className="font-mono text-[10px]">
+                            {mr.scope}
+                          </Badge>
+                          <Badge variant="outline" className="border-amber-300 font-mono text-[10px] text-amber-900">
+                            {mr.action}
+                          </Badge>
+                          {mr.matched_fragment && (
+                            <code className="rounded bg-amber-100/80 px-1.5 py-0.5 font-mono text-[11px] text-amber-950">
+                              {mr.matched_fragment}
+                            </code>
+                          )}
+                        </div>
+                        {mr.confirm_message && <div className="mt-1 text-amber-900">{mr.confirm_message}</div>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div>
                 <div className="mb-1.5 flex items-center justify-between">
                   <span className="text-xs font-medium text-muted-foreground">Verbatim Query / Command</span>

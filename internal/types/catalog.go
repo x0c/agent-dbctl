@@ -170,4 +170,5 @@ type TopologyBundle struct {
 	Instances          []Instance          `json:"instances" yaml:"instances"`
 	Targets            []Target            `json:"targets" yaml:"targets"`
 	Policies           []PolicyRuleSet     `json:"policies" yaml:"policies"`
+	RiskPatternRules   []RiskPatternRule   `json:"risk_pattern_rules,omitempty" yaml:"risk_pattern_rules,omitempty"`
 }

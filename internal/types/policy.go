@@ -75,6 +75,7 @@ type EffectivePolicy struct {
 	MaxBytes                      int64             `json:"max_bytes"`
 	ExplainMaxRows                int64             `json:"explain_max_rows"`
 	ApprovalProvider              string            `json:"approval_provider"`
+	PatternRules                  []RiskPatternRule `json:"pattern_rules,omitempty"`
 	Sources                       map[string]string `json:"sources"`
 }
 
@@ -82,6 +83,7 @@ type EffectivePolicy struct {
 type PolicyEvaluation struct {
 	Decision         Decision        `json:"decision"`
 	TriggerReasons   []string        `json:"trigger_reasons,omitempty"`
+	MatchedRules     []MatchedRule   `json:"matched_rules,omitempty"`
 	CredentialMode   AccessLevel     `json:"credential_mode"`
 	PreferReplica    bool            `json:"prefer_replica"`
 	EffectivePolicy  EffectivePolicy `json:"effective_policy"`

@@ -148,6 +148,7 @@ func (m *Manager) Submit(ctx context.Context, providerName string, op types.Oper
 		QueryText:       op.QueryText,
 		RiskLevel:       op.RiskLevel,
 		TriggerReasons:  op.TriggerReasons,
+		MatchedRules:    op.MatchedRules,
 		Preflight:       op.Preflight,
 		CreatedAtUTC:    now.Format(time.RFC3339Nano),
 		ExpiresAtUTC:    expiresAt.Format(time.RFC3339Nano),

@@ -504,7 +504,7 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 
 	// 1. Offline Dry-Run: strictly zero DB dial, zero approval, zero business mutation.
 	if req.DryRun {
-		eval := policy.Evaluate(detail.Target, eff, cls, nil)
+		eval := policy.EvaluateQuery(detail.Target, eff, cls, nil, req.Query)
 		return buildExecResponseSkeleton(detail, cls, nil, eval, types.OpPending), nil
 	}
 
@@ -520,7 +520,8 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 	}
 	defer closePreflightConn()
 
-	if req.Preflight || (eff.SafetyTier != types.SafetyTierYOLO && cls.IsReadOnly && cls.RiskLevel == types.RiskSafeRead) {
+	needAutoPreflight := cls.IsReadOnly && ((eff.SafetyTier != types.SafetyTierYOLO && cls.RiskLevel == types.RiskSafeRead) || policy.HasPreflightPatternRule(eff.PatternRules))
+	if req.Preflight || needAutoPreflight {
 		pfCtx, cancel := context.WithTimeout(ctx, time.Duration(minPositive(req.TimeoutSec, eff.ExecTimeoutSec))*time.Second)
 		conn, openErr := s.openDriverConn(pfCtx, detail, types.AccessReadOnly, true)
 		if openErr == nil {
@@ -541,7 +542,7 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 		cancel()
 	}
 
-	eval := policy.Evaluate(detail.Target, eff, cls, pf)
+	eval := policy.EvaluateQuery(detail.Target, eff, cls, pf, req.Query)
 	if req.Preflight {
 		return buildExecResponseSkeleton(detail, cls, pf, eval, types.OpPending), nil
 	}
@@ -579,6 +580,7 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 		RiskLevel:       cls.RiskLevel,
 		Decision:        eval.Decision,
 		TriggerReasons:  eval.TriggerReasons,
+		MatchedRules:    eval.MatchedRules,
 		Classification:  cls,
 		Preflight:       pf,
 		Status:          types.OpPending,
@@ -604,7 +606,11 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 	// Approval branch.
 	if eval.Decision == types.DecisionRequireApproval {
 		waitCh := s.registerOpWaiter(op.ID)
-		app, appURL, subErr := s.approvals.Submit(ctx, eff.ApprovalProvider, op, detail, eff.ApprovalTimeoutSec)
+		providerName := eval.EffectivePolicy.ApprovalProvider
+		if providerName == "" {
+			providerName = eff.ApprovalProvider
+		}
+		app, appURL, subErr := s.approvals.Submit(ctx, providerName, op, detail, eff.ApprovalTimeoutSec)
 		if subErr != nil {
 			s.clearOpWaiter(op.ID)
 			op.Status = types.OpFailed
@@ -632,6 +638,12 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 			resp.ApprovalExpires = app.ExpiresAtUTC
 			resp.ErrorCode = types.ErrCodeWaitingApproval
 			resp.ErrorMessage = fmt.Sprintf("Execution requires human approval (%s).", strings.Join(eval.TriggerReasons, ", "))
+			if len(eval.MatchedRules) > 0 {
+				top := eval.MatchedRules[0]
+				if top.ConfirmTitle != "" {
+					resp.ErrorMessage = fmt.Sprintf("High-risk pattern matched [%s]: %s", top.ConfirmTitle, top.ConfirmMessage)
+				}
+			}
 			return resp, nil
 		}
 
@@ -801,6 +813,7 @@ func (s *Service) GetOperationStatus(ctx context.Context, opID string) (types.Ex
 	eval := types.PolicyEvaluation{
 		Decision:       op.Decision,
 		TriggerReasons: op.TriggerReasons,
+		MatchedRules:   op.MatchedRules,
 		CredentialMode: op.CredentialMode,
 	}
 	resp := s.responseFromOperation(op, eval)
@@ -932,6 +945,106 @@ func buildExecResponseSkeleton(detail types.TargetDetail, cls types.Classificati
 		ErrorCode:       eval.DenyCode,
 		ErrorMessage:    eval.DenyMessage,
 	}
+}
+
+// TestRiskPattern evaluates a query offline against active target/engine policy and optional draft pattern rule.
+func (s *Service) TestRiskPattern(ctx context.Context, req types.PatternTestRequest) (types.PatternTestResult, error) {
+	if strings.TrimSpace(req.Query) == "" {
+		return types.PatternTestResult{}, fmt.Errorf("query is required")
+	}
+	if req.DraftRule != nil {
+		draft := *req.DraftRule
+		if draft.ScopeType == "" {
+			draft.ScopeType = "global"
+			draft.ScopeID = "global"
+		}
+		if err := policy.ValidateRiskPatternRule(draft); err != nil {
+			return types.PatternTestResult{}, fmt.Errorf("invalid draft_rule: %w", err)
+		}
+	}
+
+	var tgt types.Target
+	var eff types.EffectivePolicy
+	engine := strings.TrimSpace(req.Engine)
+	if strings.TrimSpace(req.TargetID) != "" {
+		detail, err := s.ResolveTarget(ctx, req.TargetID, "")
+		if err != nil {
+			return types.PatternTestResult{}, err
+		}
+		tgt = detail.Target
+		eff = detail.EffectivePolicy
+		if detail.Instance != nil {
+			engine = detail.Instance.Engine
+		}
+	} else {
+		if engine == "" {
+			engine = "postgres"
+		}
+		tier := req.SafetyTier
+		if tier == "" {
+			tier = types.SafetyTierGuarded
+		}
+		globalCfg, err := s.store.GetGlobalSecurityConfig(ctx)
+		if err != nil {
+			globalCfg = types.GlobalSecurityConfig{
+				ExecTimeoutSec:          15,
+				ApprovalTimeoutSec:      120,
+				MaxRows:                 200,
+				MaxBytes:                262144,
+				ExplainMaxRows:          100000,
+				DefaultApprovalProvider: "local-web",
+			}
+		}
+		env := &types.Environment{Code: string(tier), SafetyTier: tier}
+		tgt = types.Target{Ref: "sandbox/test", EnvironmentCode: env.Code, Status: types.TargetActive}
+		eff = policy.ResolveEffectivePolicy(globalCfg, env, nil, tgt, nil)
+		allRules, err := s.store.ListRiskPatternRules(ctx)
+		if err == nil {
+			eff.PatternRules = policy.ResolveEffectivePatternRules(env, nil, tgt, engine, classify.EngineFamily(engine), allRules)
+		}
+	}
+
+	var cls types.Classification
+	if drv, ok := s.drivers.Get(engine); ok {
+		var err error
+		cls, err = drv.Classify(ctx, req.Query)
+		if err != nil {
+			cls = classify.Classify(engine, req.Query)
+		}
+	} else {
+		cls = classify.Classify(engine, req.Query)
+	}
+
+	var draftMatched *types.MatchedRule
+	if req.DraftRule != nil {
+		draft := *req.DraftRule
+		if draft.ID == "" {
+			draft.ID = "pat_draft"
+		}
+		draft.Enabled = true
+		dm, _ := policy.MatchPatternRules([]types.RiskPatternRule{draft}, cls, req.SimulatedPreflight, req.Query)
+		if len(dm) > 0 {
+			dmCopy := dm[0]
+			draftMatched = &dmCopy
+		}
+		eff.PatternRules = append([]types.RiskPatternRule{draft}, eff.PatternRules...)
+	}
+
+	eval := policy.EvaluateQuery(tgt, eff, cls, req.SimulatedPreflight, req.Query)
+	_, qctx := policy.MatchPatternRules(nil, cls, req.SimulatedPreflight, req.Query)
+	return types.PatternTestResult{
+		Classification:  cls,
+		Evaluation:      eval,
+		MatchedRules:    eval.MatchedRules,
+		DraftMatched:    draftMatched,
+		NormalizedQuery: qctx.NormalizedNoLit,
+		Extracted: types.PatternTestExtracted{
+			Functions:      qctx.Functions,
+			Tables:         qctx.Tables,
+			Pragmas:        qctx.Pragmas,
+			MongoOperators: qctx.MongoOperators,
+		},
+	}, nil
 }
 
 // WriteJSON helper ensures compact consistent serialization.

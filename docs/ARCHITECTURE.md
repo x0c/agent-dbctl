@@ -61,7 +61,7 @@ Enterprise environments involve multiple business systems, shared jump hosts, pr
 
 ### Sanitized Topology Portability
 
-`GET/POST /api/v1/topology` exports and imports `System`, `Environment`, `NetworkProfile`, `CredentialProfile` metadata (without secrets), `Instance`, `Target`, and `Policy` definitions as YAML or JSON so teams can share catalog topology via Git while keeping credentials local or vault-backed.
+`GET/POST /api/v1/topology` exports and imports `System`, `Environment`, `NetworkProfile`, `CredentialProfile` metadata (without secrets), `Instance`, `Target`, `Policy`, and `RiskPatternRule` definitions as YAML or JSON so teams can share catalog topology and custom high-risk detection rules via Git while keeping credentials local or vault-backed.
 
 ---
 
@@ -92,20 +92,25 @@ Enterprise environments involve multiple business systems, shared jump hosts, pr
    - *Gap*: `Instance.Engine` routes at coarse engine granularity (`postgres`, `mysql`, `sqlite`, `mongodb`, `redis`) without persisting the negotiated server dialect/version (`mariadb`, `tidb`, `cockroachdb`, `redshift`, `valkey`, `redis-cluster`).
    - *Target design*: Capture and expose negotiated `dialect`, `server_version`, and capability flags during `Ping`/`DiscoverInstance` so preflight, policy, and the Web Console adapt deterministically without per-call probing.
 
-### Risk Classification & Preflight
+### Risk Classification, Normalized Context & Preflight
 
-- **Multi-statement safety**: Multi-statement SQL scripts are split respecting quotes, dollar-quotes, and comments; overall classification takes the maximum severity across all statements.
+- **Multi-statement safety**: Multi-statement SQL scripts are split respecting quotes, dollar-quotes, comments, and MySQL conditional comments; overall classification takes the maximum severity across all statements.
 - **Fail-closed unknown syntax**: Unrecognized syntax is classified as `unknown` (`high_risk`), which still runs under `dev` (`yolo`) if allowed, but forces human approval under `guarded`/`strict` environments.
-- **High-cost read detection**:
-  - SQL: missing `LIMIT` / `WHERE`, `SELECT *` without `WHERE`, `FOR UPDATE` / `LOCK IN SHARE MODE`, `EXPLAIN ANALYZE`, `CROSS JOIN`, `SELECT INTO`, multi-statement queries.
-  - MongoDB: empty filter `{}` without limit, `aggregate` without `$limit`, `$where`, write stages `$out`/`$merge`.
-  - Redis: `KEYS`, `HGETALL`, `HKEYS`, `HVALS`, `SMEMBERS`, unbounded `LRANGE`/`ZRANGE`, `MONITOR`, `DUMP`, `SINTER`/`SUNION`/`SDIFF` (`high_cost_read`), plus writes/admin (`SET`, `DEL`, `FLUSHDB`, `FLUSHALL`, `EVAL`, etc.).
-- **Preflight (`EXPLAIN` without `ANALYZE`)**: In `guarded`/`strict` environments, safe reads undergo `EXPLAIN` preflight before execution; full scans (`Seq Scan`, `ALL`, `COLLSCAN`, SQLite `SCAN`) or estimated rows exceeding `explain_max_rows` escalate to `require_approval`, attaching the plan summary to the approval card. See [READ_RISK_AUDIT.md](READ_RISK_AUDIT.md) for empirically verified high-risk read patterns and current classifier/preflight gaps.
+- **Hardened high-cost & dangerous read detection**:
+  - **SQL**: missing `LIMIT` / `WHERE`, `SELECT *` without `WHERE`, `TABLE <tbl>` shorthand without `LIMIT`, `CROSS JOIN` & implicit comma joins (`FROM a, b`), `WITH RECURSIVE`, `ORDER BY RAND()/RANDOM()`, `SQL_CALC_FOUND_ROWS`, deep `OFFSET >= 10000`, locking reads (`FOR UPDATE`/`FOR SHARE`/`FOR NO KEY UPDATE`/`FOR KEY SHARE`/`LOCK IN SHARE MODE`), `EXPLAIN` & `EXPLAIN ANALYZE` inner-DML propagation (preserving `IsReadOnly = false` when analyzing DML/admin so `prod_read_only_freeze` still blocks it), SQLite parenthesized `PRAGMA fn(...)` allowlisting (`table_info`, `table_xinfo`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list` safe-read; mutating pragmas like `query_only(0)`/`wal_checkpoint` elevated to `admin`), and dangerous scalar/side-effect calls even without `FROM` (`pg_read_file`/`lo_export`/`dblink`/`load_extension` as `admin`, `nextval`/`setval`/`pg_advisory_lock`/`get_lock` as `write`, `pg_sleep`/`sleep`/`benchmark`/`randomblob`/`zeroblob`/`generate_series`/`xmlparse` as `high_cost_read`).
+  - **MongoDB**: recursive operator scanning (`$where`, `$function`, `$accumulator`, `$lookup`/`$graphLookup`, `allowDiskUse`, `noCursorTimeout`, unanchored `$regex`), write stages (`$out`/`$merge`), and `explain` verbosity/inner-query checks (`executionStats`/`allPlansExecution`).
+  - **Redis / Valkey**: subcommand allowlisting for `CLIENT` (`ID`/`GETNAME`/`INFO` safe; `LIST` high-cost; `PAUSE`/`KILL`/others admin) and `MEMORY` (`STATS`/`MALLOC-STATS`/`DOCTOR` safe; `USAGE ... SAMPLES 0` high-cost; `PURGE`/others admin), bounded `SCAN`/`ZRANGEBYSCORE`/`GEOSEARCH` count checks, and blocking list/stream commands.
+- **Normalized `QueryContext` extraction**: `classify.ExtractQueryContext` exposes comment-stripped/literal-redacted text, parsed SQL tokens/functions/tables/pragmas, parsed Redis command vectors, and parsed MongoDB JSON documents/operators for downstream pattern evaluation.
+- **Preflight (`EXPLAIN` without `ANALYZE`)**: In `guarded`/`strict` environments (or when an active `preflight_metric` pattern rule applies), safe reads undergo `EXPLAIN` preflight before execution; full scans (`Seq Scan`, `ALL`, `COLLSCAN`, SQLite `SCAN`) or estimated rows exceeding `explain_max_rows` escalate to `require_approval`, attaching the plan summary to the approval card. See [READ_RISK_AUDIT.md](READ_RISK_AUDIT.md) for empirically verified high-risk read patterns.
 
-### Four-Level Monotonic Policy Inheritance
+### Four-Level Monotonic Policy Inheritance & Custom High-Risk Patterns
 
 Effective policy resolves in order: `GlobalSecurityConfig` -> `Environment` -> `System` -> `Target`.
 Lower levels can **tighten** restrictions (shorter timeout, lower row/byte cap, stricter approval requirement) but never exceed global hard upper bounds or override `prod_read_only_freeze`.
+
+- **Configurable High-Risk Pattern Rules (`RiskPatternRule`)**: Layered atop the built-in classifier across `global -> env -> system -> target` scopes, filtered by target engine/family. Lower scopes can add rules or tighten actions (`elevate_high_cost -> require_approval -> deny`) and enrich confirmation copy/provider overrides, but cannot disable or weaken an enabled ancestor rule. Rules persist in SQLite (`risk_pattern_rules`) with same-transaction hash-chain audit logging and `/api/v1/topology` portability; CLI remains configuration-read-only.
+- **Multi-Modal Composable Matchers**: Rules compose `all` / `any` / `not` conditions over 8 matcher types: `function_call`, `table_ref`, `pragma_name`, `command_arg`, `json_path`, `regex` (Go RE2 with AST node & length limits, defaulting to comment-stripped normalized queries), `risk_flag`, and `preflight_metric`.
+- **Secondary Confirmation & Dry-Run Sandbox**: Matched `require_approval` rules force human approval even in `dev` (`yolo`) targets, surfacing structured `MatchedRule` details (`confirm_title`, `confirm_message`, `matched_fragment`, scope, action) in CLI JSON/hints, Web UI approval cards, webhooks, and `audit_logs`. The Web Console includes 5 official preset rule packs (`pg-side-effect`, `sqlite-pragma-blob`, `redis-single-thread`, `mongo-js-explain`, `mysql-dos-guard`) and an offline dry-run test sandbox (`POST /api/v1/risk-patterns/test`).
 
 ---
 
