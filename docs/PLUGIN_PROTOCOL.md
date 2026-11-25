@@ -78,9 +78,15 @@ type Provider interface {
 ### Built-in Provider: `local-web`
 
 - Generates a cryptographically random one-time `approval_token` (stored hashed as SHA-256 in SQLite).
-- Returns `approval_url = http://127.0.0.1:<port>/approvals/<approval_id>?token=<approval_token>`.
+- Returns `approval_url = http://127.0.0.1:<port>/approvals/<approval_id>?token=<approval_token>`; `SanitizeTicketURL` strips `?token=` before persisting `external_ticket_url` in SQLite.
 - Opens the system default browser unless `AGENT_DBCTL_NO_BROWSER=1`.
-- Approval/rejection endpoints enforce same-origin checks plus `approval_token` or active local console session token validation, and write the decision + audit hash-chain row in a single SQLite transaction.
+- `ResolveApproval` enforces wall-clock expiry atomically (`ErrApprovalExpired`). Approval/rejection endpoints enforce same-origin checks plus `approval_token` or the current SPA `X-Agent-DBCTL-UI: 1` header (upgrade to a daemon-issued cryptographic UI session token tracked in [ARCHITECTURE.md](ARCHITECTURE.md) §6), and write the decision + audit hash-chain row in a single SQLite transaction.
+
+### Built-in Provider: `webhook`
+
+- Configured via `AGENT_DBCTL_WEBHOOK_URL` (`https://` required for remote hosts; `http://` restricted to loopback hosts), optional `AGENT_DBCTL_WEBHOOK_SECRET`, and `AGENT_DBCTL_WEBHOOK_TIMEOUT` (default `5s`, capped at `30s`).
+- Signs JSON POST payloads with HMAC-SHA256 over `<unix_ts>.<raw_json_body>` using `X-Agent-DBCTL-Timestamp` and `X-Agent-DBCTL-Signature: sha256=<hex>` headers when `AGENT_DBCTL_WEBHOOK_SECRET` is set.
+- Posts redacted `approval.requested` (with token-free `review_url`) and `approval.cancelled` JSON events, and accepts optional `{"ticket_id", "ticket_url"}` fields from 2xx responses.
 
 ### Enterprise Extensions
 

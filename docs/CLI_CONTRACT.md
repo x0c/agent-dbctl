@@ -61,7 +61,7 @@ Operating system exit codes are constrained to integers `0..125` (codes `>= 126`
 | `4` | Policy / Approval Rejection | `policy_denied`, `approval_rejected`, `prod_frozen` |
 | `5` | Conflict / Ambiguity | `ambiguous_target`, `daemon_version_mismatch`, `output_exists` |
 | `6` | Timeout | `query_timeout`, `approval_timeout` |
-| `7` | Async Pending Approval | `waiting_approval` (returned only when `--wait=false` submits an approval request) |
+| `7` | Async Pending Approval | `waiting_approval` (returned when `--wait=false` submits an approval request, or when `op wait --timeout` elapses while still `waiting_approval`) |
 
 ## 3. Command Hierarchy
 
@@ -113,6 +113,10 @@ agent-dbctl skill print
 3. **Honest Coverage & Intact Truncation**: `exec` always returns `fetched_rows`, `returned_rows`, `truncated`, and `cutoff_reason` (`""` | `"max_rows"` | `"max_bytes"`). Truncation happens strictly on whole row/document boundaries.
 4. **Atomic `--out` File Delivery**: Writes to a temporary file (`0600`) in the destination directory and atomically renames; refuses symlinks and overwrites unless `--force` is given.
 5. **Single-Source `describe`**: `agent-dbctl describe` generates directly from the live Cobra command & flag definitions, exposing each command's `risk` (`read` | `write_local` | `execute_remote`), flags, types, defaults, and examples.
+6. **Synchronous Cancel & Wait**: `op cancel` waits for the operation to settle before returning; `op wait` blocks until terminal status or `--timeout` (exit `7` if still `waiting_approval`, exit `6` if still `running`/`pending`) and supports `--out` alongside `op status --out`.
+7. **Audit Inspection & Offline Fallback**: `audit list` and `audit export --format jsonl|csv` query the running daemon (`/rpc/v1/audit`) and fall back to read-only SQLite access when the daemon is stopped, returning `total_matched`, `returned`, and `truncated`.
+8. **Live Diagnostics & Connectivity Failures**: `doctor --live` verifies config/DB permissions (`0700`/`0600`), webhook readiness, plugin digests, and live target connectivity; `db test` returns `ok: false` (exit `1`) when all probed targets are unreachable.
+9. **Multi-Word `describe` & Exit Codes**: `describe [command...]` accepts multi-word subcommand paths (e.g. `describe db list`) and includes the `exit_codes` catalog alongside live Cobra flags and risk metadata.
 
 ## 5. Environment Variables
 
