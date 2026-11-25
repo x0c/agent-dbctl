@@ -107,7 +107,7 @@ docker compose --profile tls up -d --build
 开发机 CLI 接入远端服务端：
 
 ```sh
-agent-dbctl context add prod https://dbctl.example.com --use
+agent-dbctl context add prod --endpoint https://dbctl.example.com --use
 agent-dbctl login --token-stdin
 ```
 

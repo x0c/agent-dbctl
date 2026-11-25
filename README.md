@@ -107,7 +107,7 @@ docker compose --profile tls up -d --build
 Connect your workstation CLI to the remote server:
 
 ```sh
-agent-dbctl context add prod https://dbctl.example.com --use
+agent-dbctl context add prod --endpoint https://dbctl.example.com --use
 agent-dbctl login --token-stdin
 ```
 
