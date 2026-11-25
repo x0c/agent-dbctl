@@ -70,7 +70,7 @@ agent-dbctl db list [--system <slug>] [--env <code,...>] [--engine <eng>] [--tag
 agent-dbctl db show <ref_or_alias>
 agent-dbctl db test [<ref_or_alias> | --all] [--system <slug>] [--env <code,...>]
 
-agent-dbctl exec --db <ref_or_alias> [--sql <stmt> | --file <path> | --stdin]
+agent-dbctl exec --db <ref_or_alias> [--sql <stmt> | --file <path> | --stdin | <stmt>]
                  [--reason <text>] [--dry-run | --preflight]
                  [--max-rows <n>] [--max-bytes <n>] [--timeout <dur>]
                  [--out <path> [--force]] [--wait=true|false]

@@ -303,8 +303,9 @@ func Execute(version, commit string) int {
 		wait     bool
 	}
 	execCmd := &cobra.Command{
-		Use:   "exec",
+		Use:   "exec [query]",
 		Short: "Execute verbatim SQL, MongoDB, or Redis commands through environment guardrails",
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
 			if strings.TrimSpace(execOpts.db) == "" {
@@ -320,9 +321,18 @@ func Execute(version, commit string) int {
 				return nil
 			}
 
-			query, err := readQueryInput(execOpts.sql, execOpts.file, execOpts.stdin, ic.StdinIsTTY)
+			inlineQuery := execOpts.sql
+			if len(args) == 1 {
+				if execOpts.sql != "" || execOpts.file != "" || execOpts.stdin {
+					exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, "Specify query via --sql, --file, --stdin, or a single positional argument, not multiple.", "", nil, nil, types.Meta{})
+					return nil
+				}
+				inlineQuery = args[0]
+			}
+
+			query, err := readQueryInput(inlineQuery, execOpts.file, execOpts.stdin, ic.StdinIsTTY)
 			if err != nil {
-				exitCode = ic.WriteError(types.ErrCodeInvalidInput, false, err.Error(), "Pass --sql, --file, or pipe query to stdin.", nil, nil, types.Meta{})
+				exitCode = ic.WriteError(types.ErrCodeInvalidInput, false, err.Error(), "Pass --sql, --file, positional query, or pipe query to stdin.", nil, nil, types.Meta{})
 				return nil
 			}
 
@@ -1167,9 +1177,64 @@ func renderExecOutcome(ic IOContext, resp types.ExecResponse, outPath string, fo
 		return types.ExitSuccess
 	}
 
-	b, _ := json.MarshalIndent(resp, "", "  ")
-	_, _ = fmt.Fprintln(ic.Stdout, string(b))
+	if resp.Result != nil {
+		if strings.TrimSpace(resp.Result.RawText) != "" {
+			_, _ = fmt.Fprintln(ic.Stdout, resp.Result.RawText)
+		} else {
+			_, _ = fmt.Fprintf(ic.Stdout, "OK (%d row(s), %dms)\n", resp.Result.ReturnedRows, resp.Result.LatencyMs)
+		}
+		return types.ExitSuccess
+	}
+
+	renderExecSummary(ic.Stdout, resp, meta)
 	return types.ExitSuccess
+}
+
+func renderExecSummary(w io.Writer, resp types.ExecResponse, meta types.Meta) {
+	_, _ = fmt.Fprintf(w, "Target:    %s (%s, %s)\n", resp.TargetRef, resp.EnvironmentCode, resp.Engine)
+	switch {
+	case meta.DryRun:
+		_, _ = fmt.Fprintln(w, "Mode:      dry-run")
+	case meta.Preflight:
+		_, _ = fmt.Fprintln(w, "Mode:      preflight")
+	default:
+		_, _ = fmt.Fprintf(w, "Status:    %s\n", resp.Status)
+	}
+	_, _ = fmt.Fprintf(w, "Risk:      %s (read_only=%v)\n", resp.Classification.RiskLevel, resp.Classification.IsReadOnly)
+	if len(resp.Classification.RiskFlags) > 0 {
+		_, _ = fmt.Fprintf(w, "Flags:     %s\n", strings.Join(resp.Classification.RiskFlags, ", "))
+	}
+	_, _ = fmt.Fprintf(w, "Decision:  %s (credential=%s)\n", resp.Evaluation.Decision, resp.CredentialMode)
+	if len(resp.Evaluation.TriggerReasons) > 0 {
+		_, _ = fmt.Fprintf(w, "Reasons:   %s\n", strings.Join(resp.Evaluation.TriggerReasons, ", "))
+	}
+	if len(resp.Evaluation.MatchedRules) > 0 {
+		_, _ = fmt.Fprintln(w, "Patterns:")
+		for _, mr := range resp.Evaluation.MatchedRules {
+			title := mr.RuleName
+			if mr.ConfirmTitle != "" {
+				title = fmt.Sprintf("%s (%s)", mr.RuleName, mr.ConfirmTitle)
+			}
+			if mr.MatchedFragment != "" {
+				_, _ = fmt.Fprintf(w, "  - %s [%s, %s]: %s\n", title, mr.Action, mr.Scope, mr.MatchedFragment)
+			} else {
+				_, _ = fmt.Fprintf(w, "  - %s [%s, %s]\n", title, mr.Action, mr.Scope)
+			}
+		}
+	}
+	if resp.Preflight != nil {
+		_, _ = fmt.Fprintf(w, "Preflight: supported=%v full_scan=%v est_rows=%d\n",
+			resp.Preflight.Supported, resp.Preflight.FullScan, resp.Preflight.EstimatedRows)
+		if strings.TrimSpace(resp.Preflight.PlanSummary) != "" {
+			_, _ = fmt.Fprintf(w, "Plan:      %s\n", strings.TrimSpace(resp.Preflight.PlanSummary))
+		}
+		if len(resp.Preflight.Warnings) > 0 {
+			_, _ = fmt.Fprintf(w, "Warnings:  %s\n", strings.Join(resp.Preflight.Warnings, "; "))
+		}
+	}
+	if resp.Evaluation.DenyMessage != "" {
+		_, _ = fmt.Fprintf(w, "Deny:      %s\n", resp.Evaluation.DenyMessage)
+	}
 }
 
 func readQueryInput(inline, filePath string, useStdin, stdinTTY bool) (string, error) {
