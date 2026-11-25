@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -256,10 +258,11 @@ func Execute(version, commit string) int {
 			}
 			partial := len(res.Results) > 1 && reachableCount > 0 && reachableCount < len(res.Results)
 			if ic.JSONMode {
-				exitCode = ic.WriteSuccess(map[string]any{"results": res.Results}, types.Meta{Partial: partial})
 				if reachableCount == 0 && len(res.Results) > 0 {
-					exitCode = types.ExitFailure
+					exitCode = ic.WriteError(types.ErrCodeDriverError, true, "All tested database targets are unreachable.", "Inspect per-target errors in context and verify network/credentials.", map[string]any{"results": res.Results}, []string{ic.BinPath + " doctor --live --json"}, types.Meta{Partial: partial})
+					return nil
 				}
+				exitCode = ic.WriteSuccess(map[string]any{"results": res.Results}, types.Meta{Partial: partial})
 				return nil
 			}
 			rows := make([][]string, 0, len(res.Results))
@@ -386,6 +389,8 @@ func Execute(version, commit string) int {
 
 	// ---- op ----
 	opCmd := &cobra.Command{Use: "op", Short: "Inspect or cancel execution operations"}
+	var opStatusOut string
+	var opStatusForce bool
 	opStatusCmd := &cobra.Command{
 		Use:   "status <operation_id>",
 		Short: "Check status and retrieve result of an operation",
@@ -398,17 +403,20 @@ func Execute(version, commit string) int {
 				return nil
 			}
 			var resp types.ExecResponse
-			if err := client.DoJSON(cmd.Context(), http.MethodGet, "/rpc/v1/ops/"+args[0], nil, &resp); err != nil {
+			if err := client.DoJSON(cmd.Context(), http.MethodGet, "/rpc/v1/ops/"+url.PathEscape(args[0]), nil, &resp); err != nil {
 				exitCode = writeRPCErr(ic, err)
 				return nil
 			}
-			exitCode = renderExecOutcome(ic, resp, "", false, types.Meta{})
+			exitCode = renderExecOutcome(ic, resp, opStatusOut, opStatusForce, types.Meta{})
 			return nil
 		},
 	}
+	opStatusCmd.Flags().StringVar(&opStatusOut, "out", "", "Write result JSON atomically to file path")
+	opStatusCmd.Flags().BoolVar(&opStatusForce, "force", false, "Overwrite existing --out file")
 	annotateCommand(opStatusCmd, RiskRead, "agent-dbctl op status op_012345 --json")
 
-	var opListTarget, opListStatus string
+	var opListTarget, opListEnv, opListSystem, opListStatus string
+	var opListLimit int
 	opListCmd := &cobra.Command{
 		Use:   "list",
 		Short: "List recent operations",
@@ -419,16 +427,42 @@ func Execute(version, commit string) int {
 				exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
+			limit := opListLimit
+			if limit <= 0 {
+				limit = 50
+			} else if limit > 500 {
+				limit = 500
+			}
+			q := url.Values{}
+			if opListTarget != "" {
+				q.Set("target", opListTarget)
+			}
+			if opListEnv != "" {
+				q.Set("env", opListEnv)
+			}
+			if opListSystem != "" {
+				q.Set("system", opListSystem)
+			}
+			if opListStatus != "" {
+				q.Set("status", opListStatus)
+			}
+			q.Set("limit", fmt.Sprintf("%d", limit))
+
 			var res struct {
 				Items []types.Operation `json:"items"`
 			}
-			path := fmt.Sprintf("/rpc/v1/ops?target=%s&status=%s", opListTarget, opListStatus)
+			path := "/rpc/v1/ops?" + q.Encode()
 			if err := client.DoJSON(cmd.Context(), http.MethodGet, path, nil, &res); err != nil {
 				exitCode = writeRPCErr(ic, err)
 				return nil
 			}
 			if ic.JSONMode {
-				exitCode = ic.WriteSuccess(map[string]any{"items": res.Items, "count": len(res.Items)}, types.Meta{})
+				exitCode = ic.WriteSuccess(map[string]any{
+					"items":     res.Items,
+					"count":     len(res.Items),
+					"limit":     limit,
+					"truncated": len(res.Items) >= limit,
+				}, types.Meta{})
 				return nil
 			}
 			rows := make([][]string, 0, len(res.Items))
@@ -439,8 +473,11 @@ func Execute(version, commit string) int {
 			return nil
 		},
 	}
-	opListCmd.Flags().StringVar(&opListTarget, "db", "", "Filter by target ref")
+	opListCmd.Flags().StringVar(&opListTarget, "db", "", "Filter by target ref or alias")
+	opListCmd.Flags().StringVar(&opListEnv, "env", "", "Filter by environment code")
+	opListCmd.Flags().StringVar(&opListSystem, "system", "", "Filter by system slug")
 	opListCmd.Flags().StringVar(&opListStatus, "status", "", "Filter by status")
+	opListCmd.Flags().IntVar(&opListLimit, "limit", 50, "Maximum operations to return (1..500)")
 	annotateCommand(opListCmd, RiskRead, "agent-dbctl op list --json")
 
 	opCancelCmd := &cobra.Command{
@@ -455,7 +492,7 @@ func Execute(version, commit string) int {
 				return nil
 			}
 			var resp types.ExecResponse
-			if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/ops/"+args[0]+"/cancel", map[string]any{}, &resp); err != nil {
+			if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/ops/"+url.PathEscape(args[0])+"/cancel", map[string]any{}, &resp); err != nil {
 				exitCode = writeRPCErr(ic, err)
 				return nil
 			}
@@ -467,7 +504,8 @@ func Execute(version, commit string) int {
 		},
 	}
 	annotateCommand(opCancelCmd, RiskExecuteRemote, "agent-dbctl op cancel op_012345 --json")
-	opCmd.AddCommand(opStatusCmd, opListCmd, opCancelCmd)
+	opWaitCmd := newOpWaitCmd(ioCtx, version, commit, &exitCode)
+	opCmd.AddCommand(opStatusCmd, opListCmd, opCancelCmd, opWaitCmd)
 
 	// ---- ui ----
 	uiCmd := &cobra.Command{Use: "ui", Short: "Open the local human Web Console"}
@@ -717,7 +755,11 @@ func Execute(version, commit string) int {
 				exitCode = writeRPCErr(ic, err)
 				return nil
 			}
-			exitCode = ic.WriteSuccess(res, types.Meta{})
+			if ic.JSONMode {
+				exitCode = ic.WriteSuccess(res, types.Meta{})
+				return nil
+			}
+			_, _ = fmt.Fprintln(ic.Stdout, "Reloaded external plugins.")
 			return nil
 		},
 	}
@@ -725,42 +767,7 @@ func Execute(version, commit string) int {
 	pluginCmd.AddCommand(pluginListCmd, pluginVerifyCmd, pluginReloadCmd)
 
 	// ---- audit ----
-	auditCmd := &cobra.Command{Use: "audit", Short: "Audit trail integrity verification"}
-	auditVerifyCmd := &cobra.Command{
-		Use:   "verify",
-		Short: "Verify append-only SHA-256 hash chain integrity",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ic := ioCtx()
-			paths, err := config.ResolvePaths(ic.Session)
-			if err != nil {
-				exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
-				return nil
-			}
-			st, err := store.Open(cmd.Context(), paths.DBPath)
-			if err != nil {
-				exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
-				return nil
-			}
-			defer func() { _ = st.Close() }()
-			res, err := st.VerifyAuditChain(cmd.Context())
-			if err != nil {
-				exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
-				return nil
-			}
-			if !res.Valid {
-				exitCode = ic.WriteError(types.ErrCodeAuditTampered, false, res.Reason, "Audit chain tampering or sequence gap detected.", map[string]any{"verify": res}, nil, types.Meta{})
-				return nil
-			}
-			if ic.JSONMode {
-				exitCode = ic.WriteSuccess(res, types.Meta{})
-				return nil
-			}
-			_, _ = fmt.Fprintf(ic.Stdout, "Audit chain valid (%d entries, head=%s)\n", res.CheckedCount, res.LastHash)
-			return nil
-		},
-	}
-	annotateCommand(auditVerifyCmd, RiskRead, "agent-dbctl audit verify --json")
-	auditCmd.AddCommand(auditVerifyCmd)
+	auditCmd := newAuditCmd(ioCtx, version, commit, &exitCode)
 
 	// ---- doctor / describe / version / capabilities / skill ----
 	var doctorLive bool
@@ -785,6 +792,9 @@ func Execute(version, commit string) int {
 			sec := secrets.NewStore(paths)
 			plugins, _ := drvplugin.ScanPlugins(paths.PluginsDir)
 
+			dirMode, dbMode, permOK := inspectFilePermissions(paths)
+			webhookConfigured := strings.TrimSpace(os.Getenv(approval.EnvWebhookURL)) != ""
+
 			var daemonID *daemon.Identity
 			if cl, err := daemon.NewClient(paths); err == nil {
 				if id, err := cl.GetIdentity(cmd.Context()); err == nil {
@@ -793,47 +803,91 @@ func Execute(version, commit string) int {
 			}
 
 			report := map[string]any{
-				"binary_path":    ic.BinPath,
-				"version":        version,
-				"commit":         commit,
-				"config_home":    paths.ConfigHome,
-				"session":        paths.Session,
-				"sqlite_wal":     walMode,
-				"audit_valid":    chainRes.Valid,
-				"audit_entries":  chainRes.CheckedCount,
-				"secret_backend": sec.Name(),
-				"daemon":         daemonID,
-				"plugins_count":  len(plugins),
+				"binary_path":        ic.BinPath,
+				"version":            version,
+				"commit":             commit,
+				"config_home":        paths.ConfigHome,
+				"session":            paths.Session,
+				"config_dir_mode":    dirMode,
+				"db_file_mode":       dbMode,
+				"permissions_ok":     permOK,
+				"sqlite_wal":         walMode,
+				"audit_valid":        chainRes.Valid,
+				"audit_entries":      chainRes.CheckedCount,
+				"secret_backend":     sec.Name(),
+				"webhook_configured": webhookConfigured,
+				"daemon":             daemonID,
+				"plugins_count":      len(plugins),
 			}
+
+			if doctorLive {
+				cl, clErr := ensureDaemon(ic, version, commit)
+				if clErr != nil {
+					exitCode = writeClientInitErr(ic, clErr)
+					return nil
+				}
+				if id, err := cl.GetIdentity(cmd.Context()); err == nil {
+					daemonID = &id
+					report["daemon"] = daemonID
+				}
+				cwd, _ := os.Getwd()
+				var testRes struct {
+					Results []types.PingResult `json:"results"`
+				}
+				if err := cl.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/test", map[string]any{
+					"all":    true,
+					"filter": daemon.ListFilter{WorkspaceCWD: cwd},
+				}, &testRes); err != nil {
+					exitCode = writeRPCErr(ic, err)
+					return nil
+				}
+				reachable, failed := 0, 0
+				for _, r := range testRes.Results {
+					if r.Reachable {
+						reachable++
+					} else {
+						failed++
+					}
+				}
+				report["live_checked"] = true
+				report["live_targets_total"] = len(testRes.Results)
+				report["live_targets_reachable"] = reachable
+				report["live_targets_failed"] = failed
+				report["live_results"] = testRes.Results
+			}
+
 			if ic.JSONMode {
 				exitCode = ic.WriteSuccess(report, types.Meta{})
 				return nil
 			}
-			_, _ = fmt.Fprintf(ic.Stdout, "Version: %s (%s)\nConfig: %s\nSQLite WAL: %s\nAudit Chain: valid=%v (%d entries)\nSecret Backend: %s\n",
-				version, commit, paths.ConfigHome, walMode, chainRes.Valid, chainRes.CheckedCount, sec.Name())
+			_, _ = fmt.Fprintf(ic.Stdout, "Version: %s (%s)\nConfig: %s (dir=%s, db=%s, ok=%v)\nSQLite WAL: %s\nAudit Chain: valid=%v (%d entries)\nSecret Backend: %s\nWebhook Configured: %v\n",
+				version, commit, paths.ConfigHome, dirMode, dbMode, permOK, walMode, chainRes.Valid, chainRes.CheckedCount, sec.Name(), webhookConfigured)
+			if doctorLive {
+				_, _ = fmt.Fprintf(ic.Stdout, "Live Targets: %v reachable / %v total\n", report["live_targets_reachable"], report["live_targets_total"])
+			}
 			return nil
 		},
 	}
-	doctorCmd.Flags().BoolVar(&doctorLive, "live", false, "Include live checks")
+	doctorCmd.Flags().BoolVar(&doctorLive, "live", false, "Include live database connectivity checks")
 	annotateCommand(doctorCmd, RiskRead, "agent-dbctl doctor --json")
 
 	describeCmd := &cobra.Command{
-		Use:   "describe [command]",
+		Use:   "describe [command...]",
 		Short: "Machine-readable command & flag schema generated directly from parser",
-		Args:  cobra.MaximumNArgs(1),
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
-			target := ""
-			if len(args) == 1 {
-				target = args[0]
-			}
+			target := strings.TrimSpace(strings.Join(args, " "))
 			specs := BuildDescribeSpecs(root, target)
 			if target != "" && len(specs) == 0 {
 				exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, fmt.Sprintf("Unknown command %q", target), "", nil, []string{ic.BinPath + " describe --json"}, types.Meta{})
 				return nil
 			}
 			if ic.JSONMode {
-				exitCode = ic.WriteSuccess(map[string]any{"commands": specs}, types.Meta{})
+				exitCode = ic.WriteSuccess(map[string]any{
+					"commands":   specs,
+					"exit_codes": DefaultExitCodes(),
+				}, types.Meta{})
 				return nil
 			}
 			for _, s := range specs {
@@ -870,8 +924,8 @@ func Execute(version, commit string) int {
 				"builtin_engines":    []string{"postgres", "mysql", "sqlite", "mongodb", "redis"},
 				"plugin_protocol":    "grpc-v1",
 				"host_api_version":   drvplugin.SupportedHostAPIVersion,
-				"approval_providers": []string{"local-web"},
-				"features":           []string{"dry_run", "preflight", "async_wait_false", "hash_chain_audit", "system_workspace_match"},
+				"approval_providers": []string{"local-web", "webhook"},
+				"features":           []string{"dry_run", "preflight", "async_wait_false", "op_wait", "hash_chain_audit", "audit_list_export", "crash_recovery", "system_workspace_match"},
 			}
 			if ic.JSONMode {
 				exitCode = ic.WriteSuccess(caps, types.Meta{})
@@ -1219,4 +1273,23 @@ func writeRPCErr(ic IOContext, err error) int {
 		return ic.WriteError(le.Code, false, le.Message, "Pick an exact target ref or alias from context.", ctxMap, next, types.Meta{})
 	}
 	return ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
+}
+
+func inspectFilePermissions(paths config.Paths) (dirMode string, dbMode string, ok bool) {
+	ok = true
+	if info, err := os.Stat(paths.ConfigHome); err == nil {
+		perm := info.Mode().Perm()
+		dirMode = fmt.Sprintf("%04o", perm)
+		if runtime.GOOS != "windows" && perm&0o077 != 0 {
+			ok = false
+		}
+	}
+	if info, err := os.Stat(paths.DBPath); err == nil {
+		perm := info.Mode().Perm()
+		dbMode = fmt.Sprintf("%04o", perm)
+		if runtime.GOOS != "windows" && perm&0o077 != 0 {
+			ok = false
+		}
+	}
+	return dirMode, dbMode, ok
 }

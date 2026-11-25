@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/x0c/agent-dbctl/internal/cli"
@@ -176,5 +177,90 @@ func TestCLISilentSkillSync(t *testing.T) {
 	}
 	if _, err := os.Stat(dest); !os.IsNotExist(err) {
 		t.Fatalf("expected skill uninstalled, err=%v", err)
+	}
+}
+
+func TestCLIDescribeAuditListExportDoctorLiveAndOps(t *testing.T) {
+	bin := buildTestCLI(t)
+	cfgHome := t.TempDir()
+
+	// 1. Multi-word unquoted describe + exit_codes + capabilities.
+	code, env, _ := runCLI(t, bin, cfgHome, "describe", "db", "list", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("describe db list failed: code=%d env=%+v", code, env)
+	}
+	data := env.Data.(map[string]any)
+	cmds := data["commands"].([]any)
+	if len(cmds) != 1 || cmds[0].(map[string]any)["path"] != "agent-dbctl db list" {
+		t.Fatalf("unexpected describe db list commands: %+v", cmds)
+	}
+	if _, ok := data["exit_codes"]; !ok {
+		t.Fatalf("expected exit_codes map in describe output")
+	}
+
+	code, env, _ = runCLI(t, bin, cfgHome, "capabilities", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("capabilities failed: %+v", env)
+	}
+	capBytes, _ := json.Marshal(env.Data)
+	if !strings.Contains(string(capBytes), `"webhook"`) || !strings.Contains(string(capBytes), `"op_wait"`) {
+		t.Fatalf("expected webhook & op_wait in capabilities, got %s", string(capBytes))
+	}
+
+	// 2. doctor --json + doctor --live --json (start isolated daemon and clean up).
+	t.Cleanup(func() {
+		_, _, _ = runCLI(t, bin, cfgHome, "daemon", "stop", "--json")
+	})
+	code, env, _ = runCLI(t, bin, cfgHome, "doctor", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("doctor failed: code=%d env=%+v", code, env)
+	}
+	docMap := env.Data.(map[string]any)
+	if permOK, _ := docMap["permissions_ok"].(bool); !permOK {
+		t.Fatalf("expected permissions_ok=true, got %+v", docMap)
+	}
+
+	code, env, _ = runCLI(t, bin, cfgHome, "doctor", "--live", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("doctor --live failed: code=%d env=%+v", code, env)
+	}
+	liveMap := env.Data.(map[string]any)
+	if checked, _ := liveMap["live_checked"].(bool); !checked {
+		t.Fatalf("expected live_checked=true, got %+v", liveMap)
+	}
+
+	// 3. audit list --json & audit export --format jsonl/csv --out + bad format rejection.
+	code, env, _ = runCLI(t, bin, cfgHome, "audit", "list", "--limit", "2", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("audit list failed: code=%d env=%+v", code, env)
+	}
+	audMap := env.Data.(map[string]any)
+	if int(audMap["returned"].(float64)) != 2 || int(audMap["total_matched"].(float64)) < 4 {
+		t.Fatalf("unexpected audit list counts: %+v", audMap)
+	}
+
+	outCSV := filepath.Join(t.TempDir(), "audit.csv")
+	code, env, _ = runCLI(t, bin, cfgHome, "audit", "export", "--format", "csv", "--out", outCSV, "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("audit export csv failed: code=%d env=%+v", code, env)
+	}
+	csvRaw, err := os.ReadFile(outCSV)
+	if err != nil || !strings.HasPrefix(string(csvRaw), "seq,id,created_at_utc,") {
+		t.Fatalf("unexpected exported CSV: err=%v content=%q", err, string(csvRaw))
+	}
+
+	code, env, _ = runCLI(t, bin, cfgHome, "audit", "export", "--format", "xml", "--json")
+	if code != types.ExitUsage || env.OK || env.Error == nil || env.Error.Code != types.ErrCodeInvalidUsage {
+		t.Fatalf("expected invalid_usage exit 2 for bad export format, got code=%d env=%+v", code, env)
+	}
+
+	// 4. op list --limit & op status missing -> ExitNotFound (3) or ExitFailure.
+	code, env, _ = runCLI(t, bin, cfgHome, "op", "list", "--limit", "5", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("op list failed: code=%d env=%+v", code, env)
+	}
+	opMap := env.Data.(map[string]any)
+	if int(opMap["limit"].(float64)) != 5 {
+		t.Fatalf("expected limit=5 echoed, got %+v", opMap)
 	}
 }

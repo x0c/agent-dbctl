@@ -44,10 +44,16 @@ Pin and reuse the verified absolute binary path (`"$BIN"`) for the rest of the s
    - Pass verbatim engine syntax (PostgreSQL/MySQL/SQLite SQL, MongoDB JSON `RunCommand`, or Redis commands). Do not ask `agent-dbctl` to translate dialects.
    - Prefer `--file <path>` or `--stdin` for multi-line SQL or JSON queries to avoid shell escaping errors.
    - Always pass `--reason "<concise reason>"` so human reviewers on the Web approval screen see why the operation is needed.
-   - Use `--wait=false` when targeting `guarded`/`strict` (`staging`/`prod`) writes or broad reads, then poll `op status`:
+   - Use `--wait=false` when targeting `guarded`/`strict` (`staging`/`prod`) writes or broad reads, then poll `op status` or wait cleanly with `op wait`:
      ```sh
      "$BIN" exec --db <ref> --reason "Backfill stuck order state" --wait=false --sql "UPDATE ..." --json
      "$BIN" op status <operation_id> --json
+     "$BIN" op wait <operation_id> --timeout 60s --json
+     ```
+   - Inspect or verify recent audit trails when auditing past runs:
+     ```sh
+     "$BIN" audit list --limit 20 --json
+     "$BIN" audit verify --json
      ```
 
 ## 3. Reading Output & Recovering Safely

@@ -1,0 +1,50 @@
+package cli
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/x0c/agent-dbctl/internal/types"
+)
+
+func newOpWaitCmd(ioCtx func() IOContext, version, commit string, exitCode *int) *cobra.Command {
+	var opts struct {
+		timeout time.Duration
+		outPath string
+		force   bool
+	}
+	cmd := &cobra.Command{
+		Use:   "wait <operation_id>",
+		Short: "Wait until an operation finishes approval/execution or timeout elapses",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ic := ioCtx()
+			client, err := ensureDaemon(ic, version, commit)
+			if err != nil {
+				*exitCode = writeClientInitErr(ic, err)
+				return nil
+			}
+			tSec := int(opts.timeout.Seconds())
+			if tSec <= 0 {
+				tSec = 120
+			}
+			path := fmt.Sprintf("/rpc/v1/ops/%s/wait?timeout_sec=%d", url.PathEscape(args[0]), tSec)
+			var resp types.ExecResponse
+			if err := client.DoJSON(cmd.Context(), http.MethodGet, path, nil, &resp); err != nil {
+				*exitCode = writeRPCErr(ic, err)
+				return nil
+			}
+			*exitCode = renderExecOutcome(ic, resp, opts.outPath, opts.force, types.Meta{})
+			return nil
+		},
+	}
+	cmd.Flags().DurationVar(&opts.timeout, "timeout", 120*time.Second, "Maximum wait duration (1s..10m)")
+	cmd.Flags().StringVar(&opts.outPath, "out", "", "Write result JSON atomically to file path")
+	cmd.Flags().BoolVar(&opts.force, "force", false, "Overwrite existing --out file")
+	annotateCommand(cmd, RiskRead, "agent-dbctl op wait op_012345 --timeout 60s --json")
+	return cmd
+}

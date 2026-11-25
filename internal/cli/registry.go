@@ -1,9 +1,27 @@
 package cli
 
 import (
+	"strings"
+
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+
+	"github.com/x0c/agent-dbctl/internal/types"
 )
+
+// DefaultExitCodes returns the documented OS exit code map exposed by `describe --json`.
+func DefaultExitCodes() map[int]string {
+	return map[int]string{
+		types.ExitSuccess:         "success",
+		types.ExitFailure:         "execution_or_internal_error",
+		types.ExitUsage:           "usage_or_validation_error",
+		types.ExitNotFound:        "not_found",
+		types.ExitDenied:          "policy_or_approval_denied",
+		types.ExitConflict:        "conflict_or_ambiguity",
+		types.ExitTimeout:         "timeout",
+		types.ExitWaitingApproval: "waiting_approval",
+	}
+}
 
 // CommandRisk labels each command's external effect for `describe`.
 type CommandRisk string
@@ -48,6 +66,7 @@ func annotateCommand(cmd *cobra.Command, risk CommandRisk, examples string) {
 
 // BuildDescribeSpecs traverses the live Cobra command tree as the single source of truth.
 func BuildDescribeSpecs(root *cobra.Command, filterPath string) []CommandSpec {
+	filterPath = strings.TrimSpace(filterPath)
 	var specs []CommandSpec
 	var walk func(c *cobra.Command)
 	walk = func(c *cobra.Command) {

@@ -8,10 +8,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/x0c/agent-dbctl/internal/config"
+	"github.com/x0c/agent-dbctl/internal/store"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
 
@@ -128,7 +130,22 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 
 	mux.HandleFunc("GET /rpc/v1/ops", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		items, err := svc.Store().ListOperations(r.Context(), q.Get("target"), q.Get("env"), q.Get("system"), q.Get("status"), q.Get("search"), 50)
+		limit := 50
+		if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				limit = n
+				if limit > 500 {
+					limit = 500
+				}
+			}
+		}
+		target := strings.TrimSpace(q.Get("target"))
+		if target != "" {
+			if d, err := svc.ResolveTarget(r.Context(), target, ""); err == nil {
+				target = d.Target.Ref
+			}
+		}
+		items, err := svc.Store().ListOperations(r.Context(), target, q.Get("env"), q.Get("system"), q.Get("status"), q.Get("search"), limit)
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -136,13 +153,72 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
 	})
 
-	mux.HandleFunc("POST /rpc/v1/ops/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
-		resp, err := svc.CancelOperation(r.Context(), r.PathValue("id"), "agent-cli")
+	mux.HandleFunc("GET /rpc/v1/ops/{id}/wait", func(w http.ResponseWriter, r *http.Request) {
+		timeoutSec := 120
+		if raw := strings.TrimSpace(r.URL.Query().Get("timeout_sec")); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				timeoutSec = n
+				if timeoutSec > 600 {
+					timeoutSec = 600
+				}
+			}
+		}
+		resp, err := svc.WaitForOperation(r.Context(), r.PathValue("id"), time.Duration(timeoutSec)*time.Second)
 		if err != nil {
 			writeStoreErr(w, err)
 			return
 		}
 		writeJSONResp(w, http.StatusOK, resp)
+	})
+
+	mux.HandleFunc("POST /rpc/v1/ops/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+		resp, err := svc.CancelOperationAndWait(r.Context(), r.PathValue("id"), "agent-cli")
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, resp)
+	})
+
+	mux.HandleFunc("GET /rpc/v1/audit", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		limit := 50
+		if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				limit = n
+				if limit > 1000 {
+					limit = 1000
+				}
+			}
+		}
+		offset := 0
+		if raw := strings.TrimSpace(q.Get("offset")); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+				offset = n
+			}
+		}
+		items, total, err := svc.Store().ListAuditEntriesFiltered(r.Context(), store.AuditFilter{
+			Action:      q.Get("action"),
+			TargetID:    q.Get("target"),
+			OperationID: q.Get("operation_id"),
+			Actor:       q.Get("actor"),
+			SinceUTC:    q.Get("since"),
+			UntilUTC:    q.Get("until"),
+			Limit:       limit,
+			Offset:      offset,
+		})
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"items":         items,
+			"total_matched": total,
+			"returned":      len(items),
+			"truncated":     offset+len(items) < total,
+			"limit":         limit,
+			"offset":        offset,
+		})
 	})
 
 	mux.HandleFunc("GET /rpc/v1/plugins", func(w http.ResponseWriter, _ *http.Request) {

@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +61,12 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 	if !strings.EqualFold(effectiveMode, "wal") {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite journal_mode mismatch: got %q, want wal", effectiveMode)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(dbPath, 0o600); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("chmod 0600 %s: %w", dbPath, err)
+		}
 	}
 
 	s := &Store{db: db, dbPath: dbPath}

@@ -101,3 +101,92 @@ func TestMonotonicInheritanceAndEvaluation(t *testing.T) {
 		t.Fatalf("expected AccessReadOnly even when only RWCredentialID is set, got %+v", evSingleRO)
 	}
 }
+
+func TestStrictBooleanMonotonicityAcrossScopes(t *testing.T) {
+	global := types.GlobalSecurityConfig{
+		ExecTimeoutSec:            15,
+		ApprovalTimeoutSec:        120,
+		MaxRows:                   200,
+		MaxBytes:                  262144,
+		ExplainMaxRows:            1000,
+		BlockMultiStatementInProd: true,
+		DefaultApprovalProvider:   "local-web",
+	}
+	guardedEnv := &types.Environment{Code: "staging", SafetyTier: types.SafetyTierGuarded}
+	yoloEnv := &types.Environment{Code: "dev", SafetyTier: types.SafetyTierYOLO}
+	sys := &types.System{ID: "sys1", Slug: "orders"}
+	tgt := types.Target{
+		ID:              "tgt1",
+		Ref:             "orders/staging/main",
+		OwnerSystemID:   "sys1",
+		EnvironmentCode: "staging",
+		Status:          types.TargetActive,
+	}
+
+	// Lower scope attempts to loosen all boolean approvals and AllowMultiStatement in guarded tier -> must be ignored.
+	loosen := []types.PolicyRuleSet{
+		{
+			ID:            "pol_env_safe",
+			Name:          "env-require-safe-read",
+			ScopeType:     "env",
+			ScopeID:       "staging",
+			AllowSafeRead: boolPtr(false),
+		},
+		{
+			ID:                            "pol_loosen",
+			Name:                          "try-loosen",
+			ScopeType:                     "target",
+			ScopeID:                       "tgt1",
+			AllowSafeRead:                 boolPtr(true),
+			RequireApprovalOnHighCostRead: boolPtr(false),
+			RequireApprovalOnWrite:        boolPtr(false),
+			RequireApprovalOnDDL:          boolPtr(false),
+			RequireApprovalOnAdmin:        boolPtr(false),
+			RequireApprovalOnUnknown:      boolPtr(false),
+			AllowMultiStatement:           boolPtr(true),
+		},
+	}
+	eff := policy.ResolveEffectivePolicy(global, guardedEnv, sys, tgt, loosen)
+	if eff.AllowSafeRead {
+		t.Fatalf("expected AllowSafeRead to remain tightened false")
+	}
+	if eff.Sources["allow_safe_read"] != "env:staging" {
+		t.Fatalf("expected allow_safe_read source env:staging, got %q", eff.Sources["allow_safe_read"])
+	}
+	if !eff.RequireApprovalOnHighCostRead || !eff.RequireApprovalOnWrite || !eff.RequireApprovalOnDDL || !eff.RequireApprovalOnAdmin || !eff.RequireApprovalOnUnknown {
+		t.Fatalf("lower scope must never disable approval requirements: %+v", eff)
+	}
+	if eff.AllowMultiStatement {
+		t.Fatalf("lower scope must never enable AllowMultiStatement when guarded env disabled it")
+	}
+	if eff.Sources["require_approval_on_write"] != "env:staging" {
+		t.Fatalf("expected source preserved as env:staging, got %q", eff.Sources["require_approval_on_write"])
+	}
+
+	// Lower scope CAN tighten a dev (YOLO) target.
+	devTgt := types.Target{
+		ID:              "tgt_dev",
+		Ref:             "orders/dev/main",
+		OwnerSystemID:   "sys1",
+		EnvironmentCode: "dev",
+		Status:          types.TargetActive,
+	}
+	tightenDev := []types.PolicyRuleSet{
+		{
+			ID:                     "pol_dev_tight",
+			Name:                   "tighten-dev",
+			ScopeType:              "target",
+			ScopeID:                "tgt_dev",
+			AllowSafeRead:          boolPtr(false),
+			RequireApprovalOnWrite: boolPtr(true),
+			AllowMultiStatement:    boolPtr(false),
+		},
+	}
+	effDev := policy.ResolveEffectivePolicy(global, yoloEnv, sys, devTgt, tightenDev)
+	if effDev.AllowSafeRead || !effDev.RequireApprovalOnWrite || effDev.AllowMultiStatement {
+		t.Fatalf("expected dev target tightened by target policy, got %+v", effDev)
+	}
+	if effDev.Sources["require_approval_on_write"] != "target:orders/dev/main" {
+		t.Fatalf("expected tightened source target:orders/dev/main, got %q", effDev.Sources["require_approval_on_write"])
+	}
+}

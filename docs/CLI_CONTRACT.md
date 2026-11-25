@@ -76,16 +76,19 @@ agent-dbctl exec --db <ref_or_alias> [--sql <stmt> | --file <path> | --stdin]
                  [--out <path> [--force]] [--wait=true|false]
                  (flag aliases: --target/--source -> --db; --query/--cmd -> --sql; --limit -> --max-rows)
 
-agent-dbctl op status <operation_id>
-agent-dbctl op list [--db <ref_or_alias>] [--status <status>] [--limit <n>]
+agent-dbctl op status <operation_id> [--out <path> [--force]]
+agent-dbctl op wait <operation_id> [--timeout <dur>] [--out <path> [--force]]
+agent-dbctl op list [--db <ref_or_alias>] [--env <code,...>] [--system <slug>] [--status <status>] [--limit <n>]
 agent-dbctl op cancel <operation_id>
 
 agent-dbctl ui open [--no-open]
 agent-dbctl daemon start | status | stop | restart
 agent-dbctl plugin list | verify | reload
 agent-dbctl audit verify
+agent-dbctl audit list [--action <kw>] [--target <kw>] [--op <id>] [--actor <name>] [--since <time>] [--until <time>] [--limit <n>] [--offset <n>] [--out <path> [--force]]
+agent-dbctl audit export [--format jsonl|csv] [--action <kw>] [--target <kw>] [--op <id>] [--actor <name>] [--since <time>] [--until <time>] [--limit <n>] [--out <path> [--force]]
 agent-dbctl doctor [--live]
-agent-dbctl describe [command]
+agent-dbctl describe [command...]
 agent-dbctl version
 agent-dbctl capabilities
 agent-dbctl skill install [--dry-run] [--force] [--runtime <name>]

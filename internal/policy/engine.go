@@ -64,73 +64,72 @@ func ResolveEffectivePolicy(
 		eff.AllowMultiStatement = !global.BlockMultiStatementInProd
 		eff.Sources["safety_tier"] = envLabel
 	}
+	eff.Sources["allow_safe_read"] = envLabel
+	eff.Sources["require_approval_on_high_cost_read"] = envLabel
+	eff.Sources["require_approval_on_write"] = envLabel
+	eff.Sources["require_approval_on_ddl"] = envLabel
+	eff.Sources["require_approval_on_admin"] = envLabel
+	eff.Sources["require_approval_on_unknown"] = envLabel
+	if tier == types.SafetyTierStrict && global.BlockMultiStatementInProd {
+		eff.Sources["allow_multi_statement"] = "global"
+	} else {
+		eff.Sources["allow_multi_statement"] = envLabel
+	}
 
 	byID := make(map[string]types.PolicyRuleSet, len(policies))
 	for _, p := range policies {
 		byID[p.ID] = p
 	}
 
+	// Lower levels can only tighten permissions and caps; loosening is never permitted.
 	apply := func(p types.PolicyRuleSet, src string) {
-		if p.AllowSafeRead != nil {
-			eff.AllowSafeRead = *p.AllowSafeRead
+		if p.AllowSafeRead != nil && !*p.AllowSafeRead && eff.AllowSafeRead {
+			eff.AllowSafeRead = false
 			eff.Sources["allow_safe_read"] = src
 		}
-		if p.RequireApprovalOnHighCostRead != nil {
-			eff.RequireApprovalOnHighCostRead = *p.RequireApprovalOnHighCostRead
+		if p.RequireApprovalOnHighCostRead != nil && *p.RequireApprovalOnHighCostRead && !eff.RequireApprovalOnHighCostRead {
+			eff.RequireApprovalOnHighCostRead = true
 			eff.Sources["require_approval_on_high_cost_read"] = src
 		}
-		if p.RequireApprovalOnWrite != nil {
-			eff.RequireApprovalOnWrite = *p.RequireApprovalOnWrite
+		if p.RequireApprovalOnWrite != nil && *p.RequireApprovalOnWrite && !eff.RequireApprovalOnWrite {
+			eff.RequireApprovalOnWrite = true
 			eff.Sources["require_approval_on_write"] = src
 		}
-		if p.RequireApprovalOnDDL != nil {
-			eff.RequireApprovalOnDDL = *p.RequireApprovalOnDDL
+		if p.RequireApprovalOnDDL != nil && *p.RequireApprovalOnDDL && !eff.RequireApprovalOnDDL {
+			eff.RequireApprovalOnDDL = true
 			eff.Sources["require_approval_on_ddl"] = src
 		}
-		if p.RequireApprovalOnAdmin != nil {
-			eff.RequireApprovalOnAdmin = *p.RequireApprovalOnAdmin
+		if p.RequireApprovalOnAdmin != nil && *p.RequireApprovalOnAdmin && !eff.RequireApprovalOnAdmin {
+			eff.RequireApprovalOnAdmin = true
 			eff.Sources["require_approval_on_admin"] = src
 		}
-		if p.RequireApprovalOnUnknown != nil {
-			eff.RequireApprovalOnUnknown = *p.RequireApprovalOnUnknown
+		if p.RequireApprovalOnUnknown != nil && *p.RequireApprovalOnUnknown && !eff.RequireApprovalOnUnknown {
+			eff.RequireApprovalOnUnknown = true
 			eff.Sources["require_approval_on_unknown"] = src
 		}
-		if p.AllowMultiStatement != nil {
-			// Strict prod global multi-statement block cannot be loosened by lower scopes.
-			if tier != types.SafetyTierStrict || !global.BlockMultiStatementInProd || !*p.AllowMultiStatement {
-				eff.AllowMultiStatement = *p.AllowMultiStatement
-				eff.Sources["allow_multi_statement"] = src
-			}
+		if p.AllowMultiStatement != nil && !*p.AllowMultiStatement && eff.AllowMultiStatement {
+			eff.AllowMultiStatement = false
+			eff.Sources["allow_multi_statement"] = src
 		}
-		if p.ExecTimeoutSec != nil && *p.ExecTimeoutSec > 0 {
-			if *p.ExecTimeoutSec < eff.ExecTimeoutSec {
-				eff.ExecTimeoutSec = *p.ExecTimeoutSec
-				eff.Sources["exec_timeout_sec"] = src
-			}
+		if p.ExecTimeoutSec != nil && *p.ExecTimeoutSec > 0 && (eff.ExecTimeoutSec <= 0 || *p.ExecTimeoutSec < eff.ExecTimeoutSec) {
+			eff.ExecTimeoutSec = *p.ExecTimeoutSec
+			eff.Sources["exec_timeout_sec"] = src
 		}
-		if p.ApprovalTimeoutSec != nil && *p.ApprovalTimeoutSec > 0 {
-			if *p.ApprovalTimeoutSec < eff.ApprovalTimeoutSec {
-				eff.ApprovalTimeoutSec = *p.ApprovalTimeoutSec
-				eff.Sources["approval_timeout_sec"] = src
-			}
+		if p.ApprovalTimeoutSec != nil && *p.ApprovalTimeoutSec > 0 && (eff.ApprovalTimeoutSec <= 0 || *p.ApprovalTimeoutSec < eff.ApprovalTimeoutSec) {
+			eff.ApprovalTimeoutSec = *p.ApprovalTimeoutSec
+			eff.Sources["approval_timeout_sec"] = src
 		}
-		if p.MaxRows != nil && *p.MaxRows > 0 {
-			if *p.MaxRows < eff.MaxRows {
-				eff.MaxRows = *p.MaxRows
-				eff.Sources["max_rows"] = src
-			}
+		if p.MaxRows != nil && *p.MaxRows > 0 && (eff.MaxRows <= 0 || *p.MaxRows < eff.MaxRows) {
+			eff.MaxRows = *p.MaxRows
+			eff.Sources["max_rows"] = src
 		}
-		if p.MaxBytes != nil && *p.MaxBytes > 0 {
-			if *p.MaxBytes < eff.MaxBytes {
-				eff.MaxBytes = *p.MaxBytes
-				eff.Sources["max_bytes"] = src
-			}
+		if p.MaxBytes != nil && *p.MaxBytes > 0 && (eff.MaxBytes <= 0 || *p.MaxBytes < eff.MaxBytes) {
+			eff.MaxBytes = *p.MaxBytes
+			eff.Sources["max_bytes"] = src
 		}
-		if p.ExplainMaxRows != nil && *p.ExplainMaxRows > 0 {
-			if *p.ExplainMaxRows < eff.ExplainMaxRows {
-				eff.ExplainMaxRows = *p.ExplainMaxRows
-				eff.Sources["explain_max_rows"] = src
-			}
+		if p.ExplainMaxRows != nil && *p.ExplainMaxRows > 0 && (eff.ExplainMaxRows <= 0 || *p.ExplainMaxRows < eff.ExplainMaxRows) {
+			eff.ExplainMaxRows = *p.ExplainMaxRows
+			eff.Sources["explain_max_rows"] = src
 		}
 		if p.ApprovalProvider != "" {
 			eff.ApprovalProvider = p.ApprovalProvider

@@ -37,8 +37,8 @@ func seedTestOp(t *testing.T, st *store.Store, id string) types.Operation {
 	op, err := st.CreateOperation(context.Background(), types.Operation{
 		ID: id, TargetID: "t1", TargetRef: "orders/prod/db", SystemID: "s1", SystemSlug: "orders",
 		EnvironmentCode: "prod", Engine: "postgres", Actor: "agent",
-		QueryText: "UPDATE users SET secret = 'plainSecret123' WHERE id = 1",
-		QueryRedacted: "UPDATE users SET secret = '***' WHERE id = 1",
+		QueryText: "UPDATE users SET note = 'sample-literal-value' WHERE id = 1",
+		QueryRedacted: "UPDATE users SET note = '***' WHERE id = 1",
 		RiskLevel: types.RiskWrite, Decision: types.DecisionRequireApproval,
 		Classification: types.Classification{IsReadOnly: false, RiskLevel: types.RiskWrite},
 		Status:         types.OpWaitingApproval, CredentialMode: types.AccessReadWrite,
@@ -203,7 +203,7 @@ func TestWebhookProviderSecuritySigningAndLifecycle(t *testing.T) {
 		t.Fatalf("unexpected event sequence: %+v", events)
 	}
 	qRedacted, _ := events[0]["query_redacted"].(string)
-	if strings.Contains(qRedacted, "plainSecret123") || !strings.Contains(qRedacted, "'***'") {
+	if strings.Contains(qRedacted, "sample-literal-value") || !strings.Contains(qRedacted, "'***'") {
 		t.Fatalf("expected redacted query in webhook payload, got %q", qRedacted)
 	}
 }
