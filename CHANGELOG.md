@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.5.0
+
+### English
+
+- **Enterprise Client/Server mode, PostgreSQL/Redis backends & container stack**: Added `agent-dbctl serve` with PostgreSQL catalog and hash-chained audit persistence (advisory-locked per chain), `AES-256-GCM` server-side encrypted credential storage (`encrypted_db`), Redis-backed SSE event bus and bounded query result relay, multi-stage `Dockerfile`, and `compose.yaml` (`--profile tls` Caddy ingress and password-protected Redis).
+- **OIDC / SSO, scoped RBAC & remote CLI contexts**: Added OIDC authorization-code + PKCE authentication (`admin_emails` role mapping, auto-SSO, state-scoped error redirects) alongside local bootstrap admin login, 4-role scoped RBAC (`platform_admin`, `system_admin`, `approver`, `developer`), API token management in the Web Console `Access` tab (`CLI Session` badge support), and `agent-dbctl context add|use|list|delete`, `login`, and `logout` (with server token revocation).
+- **SSRF protection, scoped UI dialogs & bootstrap resilience**: Blocked loopback, private, link-local, and cloud metadata destinations on server-initiated connections (including hostname and DNS resolution checks behind proxies and SSH tunnels), added inline `scope_type`/`scope_id` selectors across Instance, Network, and Credential dialogs, and added an explicit retry panel on non-401 Web Console bootstrap failures.
+- **Dameng DM8 reliability & hot-path performance**: Retried `db schema` with uppercase schema fallback on Dameng `-2103` errors and optimized hot paths across the SQL classifier, policy engine, hash-chain audit serialization, driver pooling, catalog resolution, store queries, and skill sync.
+- **Documentation**: Rewrote `README.md` and `README.zh-CN.md` from a user-first perspective and updated architecture, CLI contract, and deployment guides.
+
+### 简体中文
+
+- **企业级 Client/Server 模式、PostgreSQL/Redis 后端与容器化部署**：新增 `agent-dbctl serve` 中心服务模式，支持 PostgreSQL 资产与防篡改哈希链审计存储（链内咨询锁串行化）、`AES-256-GCM` 服务端加密凭据存储（`encrypted_db`）、基于 Redis 的 SSE 事件总线与有界查询结果接力，并提供多阶段 `Dockerfile` 与 `compose.yaml`（含 `--profile tls` Caddy 入口与强制口令认证的 Redis）。
+- **OIDC 单点登录、分级 RBAC 与远程 CLI 上下文**：新增 OIDC 授权码 + PKCE 登录（支持 `admin_emails` 角色映射、自动 SSO 与基于 `state` 的安全错误回跳）及本地引导管理员登录，支持四级作用域角色（`platform_admin`、`system_admin`、`approver`、`developer`）、Web 控制台 `Access` 令牌管理（补齐 `CLI 会话` 标签）以及 `agent-dbctl context add|use|list|delete`、`login`、`logout`（同步吊销服务端令牌）。
+- **SSRF 防护、作用域表单与引导容错**：在服务端发起的连接及代理/SSH 隧道出口默认拦截回环、内网、链路本地与云元数据目标（含代理后主机名与 DNS 解析校验），为实例、网络与凭据新建/编辑弹窗补齐 `scope_type`/`scope_id` 选择器，并在 Web 控制台非 401 引导失败时展示可重试错误面板，避免无限骨架屏卡死。
+- **达梦 DM8 兼容性与核心链路性能优化**：为达梦 `db schema` 遇到 `-2103` 错误时增加大写模式名回退重试，并针对 SQL 分类器、策略引擎、审计哈希链序列化、驱动连接池、目录匹配、存储查询与伴随 Skill 同步进行了压测与热路径优化。
+- **文档更新**：以用户视角重写 `README.md` 与 `README.zh-CN.md`，并同步更新架构、CLI 契约与部署运维文档。
+
 ## v0.4.1
 
 ### English
