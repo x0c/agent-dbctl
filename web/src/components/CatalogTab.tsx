@@ -4,6 +4,10 @@ import {
   type ColumnDef,
   ConfirmAction,
   DataTable,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
   FormDialog,
   FormField,
   Input,
@@ -30,7 +34,22 @@ import {
   Textarea,
   toast,
 } from '@x0c/ui'
-import { Download, FolderGit2, GitBranch, Plus, RefreshCw, Search, Upload, Wifi } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronRight,
+  Download,
+  FolderGit2,
+  GitBranch,
+  KeyRound,
+  Layers,
+  Network,
+  Plus,
+  RefreshCw,
+  Search,
+  Server,
+  Upload,
+  Wifi,
+} from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   api,
@@ -48,8 +67,10 @@ import { resolveDisplayItem } from '../lib/catalog'
 import { useI18n } from '../lib/i18n'
 import { MetaBadge } from './MetaBadge'
 
-export type CatalogSubTab = 'targets' | 'systems' | 'instances' | 'networks' | 'credentials' | 'environments'
-type SubTab = CatalogSubTab
+export type CatalogSubTab = 'targets' | 'systems' | 'instances' | 'networks' | 'credentials'
+type PrimaryTab = 'targets' | 'systems'
+type ResourceKind = 'instances' | 'networks' | 'credentials'
+type DialogKind = 'add-db' | 'targets' | 'systems' | 'instances' | 'networks' | 'credentials' | 'topology'
 
 const ALL_SYSTEMS = '__all__'
 
@@ -107,7 +128,12 @@ export function CatalogTab({
   deepLinkCredential?: string | null
 }) {
   const { locale, t } = useI18n()
-  const [subTab, setSubTab] = useState<SubTab>(deepLinkCredential ? 'credentials' : initialSubTab)
+  const [subTab, setSubTab] = useState<PrimaryTab>(initialSubTab === 'systems' ? 'systems' : 'targets')
+  const [resourceSheet, setResourceSheet] = useState<ResourceKind | null>(
+    !deepLinkCredential && (initialSubTab === 'instances' || initialSubTab === 'networks' || initialSubTab === 'credentials')
+      ? initialSubTab
+      : null,
+  )
   const handledDeepLinkRef = useRef<string | null>(null)
   const [systemFilter, setSystemFilter] = useState<string>(ALL_SYSTEMS)
   const [searchQuery, setSearchQuery] = useState<string>('')
@@ -125,18 +151,31 @@ export function CatalogTab({
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  const [dialog, setDialog] = useState<SubTab | 'topology' | null>(null)
+  const [dialog, setDialog] = useState<DialogKind | null>(null)
   const [saving, setSaving] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
 
-  const [sysForm, setSysForm] = useState({ id: '', slug: '', name: '', owner: '', description: '', tags: '', workspace_paths: '', git_remotes: '' })
-  const [envForm, setEnvForm] = useState<EnvironmentRecord>({
-    code: '',
-    safety_tier: 'guarded',
-    labels: { en: '', zh: '' },
-    color: '#D97706',
-    sort_order: 25,
+  const [addMode, setAddMode] = useState<'fields' | 'uri'>('fields')
+  const [showAddAdvanced, setShowAddAdvanced] = useState(false)
+  const [addForm, setAddForm] = useState({
+    dsn: '',
+    engine: 'postgres',
+    host: '127.0.0.1',
+    port: 5432,
+    database: '',
+    user: '',
+    secret_value: '',
+    systemChoice: '__new__',
+    newSystemSlug: '',
+    env: 'dev',
+    alias: '',
+    ref: '',
+    network: '',
+    existingCred: '',
+    access_level: 'read_only' as 'read_only' | 'read_write',
+    testOnSave: false,
   })
+  const [sysForm, setSysForm] = useState({ id: '', slug: '', name: '', owner: '', description: '', tags: '', workspace_paths: '', git_remotes: '' })
   const [netForm, setNetForm] = useState<Partial<NetworkProfileRecord>>({
     id: '',
     name: '',
@@ -246,7 +285,6 @@ export function CatalogTab({
       return
     }
     handledDeepLinkRef.current = deepLinkCredential
-    setSubTab('credentials')
     setCredForm({ ...found, secret_value: '' })
     setMultilineSecret(false)
     setFormError(null)
@@ -325,43 +363,98 @@ export function CatalogTab({
     }
   }
 
+  const openResourceCreate = (kind: ResourceKind) => {
+    setFormError(null)
+    if (kind === 'networks') {
+      setNetForm({ id: '', name: '', mode: 'direct', proxy_url: '', bastion_host: '', bastion_port: 22, bastion_user: '', bastion_credential_id: '', ssh_strict_host_key: true, tls_mode: 'prefer' })
+    } else if (kind === 'credentials') {
+      setMultilineSecret(false)
+      setCredForm({ id: '', name: '', kind: 'keychain', access_level: 'read_only', username: '', env_var_name: '', exec_command: '', secret_value: '' })
+    } else {
+      setInstForm({ id: '', name: '', engine: 'postgres', host: '127.0.0.1', port: 5432, role: 'standalone', primary_instance_id: '', network_profile_id: '', tls_mode: 'prefer' })
+    }
+    setDialog(kind)
+  }
+
   const openCreate = () => {
     setFormError(null)
     if (subTab === 'systems') {
       setSysForm({ id: '', slug: '', name: '', owner: '', description: '', tags: '', workspace_paths: '', git_remotes: '' })
-    } else if (subTab === 'environments') {
-      setEnvForm({ code: '', safety_tier: 'guarded', labels: { en: '', zh: '' }, color: '#D97706', sort_order: 25 })
-    } else if (subTab === 'networks') {
-      setNetForm({ id: '', name: '', mode: 'direct', proxy_url: '', bastion_host: '', bastion_port: 22, bastion_user: '', bastion_credential_id: '', ssh_strict_host_key: true, tls_mode: 'prefer' })
-    } else if (subTab === 'credentials') {
-      setMultilineSecret(false)
-      setCredForm({ id: '', name: '', kind: 'keychain', access_level: 'read_only', username: '', env_var_name: '', exec_command: '', secret_value: '' })
-    } else if (subTab === 'instances') {
-      setInstForm({ id: '', name: '', engine: 'postgres', host: '127.0.0.1', port: 5432, role: 'standalone', primary_instance_id: '', network_profile_id: '', tls_mode: 'prefer' })
-    } else {
-      const defSys = systemFilter !== ALL_SYSTEMS ? systemFilter : (systems[0]?.id ?? '')
-      setTargetForm({
-        id: '',
-        ref: '',
-        alias: '',
-        owner_system_id: defSys,
-        linked_system_ids: [],
-        environment_code: envs[0]?.code ?? 'dev',
-        instance_id: instances[0]?.id ?? '',
-        database_name: '',
-        ro_credential_id: '',
-        rw_credential_id: '',
-        status: 'active',
-        description: '',
-      })
+      setDialog('systems')
+      return
     }
-    setDialog(subTab)
+    const defSys = systemFilter !== ALL_SYSTEMS ? systemFilter : (systems[0]?.id ?? '__new__')
+    setAddMode('fields')
+    setShowAddAdvanced(false)
+    setAddForm({
+      dsn: '',
+      engine: 'postgres',
+      host: '127.0.0.1',
+      port: 5432,
+      database: '',
+      user: '',
+      secret_value: '',
+      systemChoice: defSys,
+      newSystemSlug: '',
+      env: envs[0]?.code ?? 'dev',
+      alias: '',
+      ref: '',
+      network: '',
+      existingCred: '',
+      access_level: 'read_only',
+      testOnSave: false,
+    })
+    setDialog('add-db')
   }
 
   const handleSave = async () => {
     setSaving(true)
     setFormError(null)
     try {
+      if (dialog === 'add-db') {
+        const systemSlug = addForm.systemChoice === '__new__' ? addForm.newSystemSlug.trim() : addForm.systemChoice
+        const isSQLite = addMode === 'fields' && addForm.engine === 'sqlite'
+        const res = await api.addDatabase({
+          ...(addMode === 'uri'
+            ? { dsn: addForm.dsn.trim() }
+            : {
+                engine: addForm.engine,
+                host: addForm.host.trim(),
+                port: isSQLite ? 0 : addForm.port,
+                database: addForm.database.trim(),
+                ...(isSQLite
+                  ? {}
+                  : {
+                      user: addForm.user.trim(),
+                      secret_value: addForm.secret_value,
+                      secret_provided: addForm.secret_value !== '',
+                    }),
+              }),
+          system: systemSlug || undefined,
+          env: addForm.env,
+          alias: addForm.alias.trim() || undefined,
+          ref: addForm.ref.trim() || undefined,
+          network: addForm.network || undefined,
+          ...(addForm.existingCred
+            ? addForm.access_level === 'read_write'
+              ? { rw_cred: addForm.existingCred }
+              : { ro_cred: addForm.existingCred }
+            : { access_level: addForm.access_level }),
+          test: addForm.testOnSave,
+        })
+        setDialog(null)
+        if (res.ping) {
+          if (res.ping.reachable) {
+            toast.success(t('catalog.reachableToast', { ms: res.ping.latency_ms, ver: res.ping.server_version || '?' }))
+          } else {
+            toast.error(res.ping.error || t('catalog.unreachable'))
+          }
+        } else {
+          toast.success(t('common.saved'))
+        }
+        await loadAll()
+        return
+      }
       if (dialog === 'systems') {
         await api.saveSystem({
           id: sysForm.id || undefined,
@@ -373,9 +466,6 @@ export function CatalogTab({
           workspace_paths: sysForm.workspace_paths.split('\n').map((s) => s.trim()).filter(Boolean),
           git_remotes: sysForm.git_remotes.split('\n').map((s) => s.trim()).filter(Boolean),
         })
-      } else if (dialog === 'environments') {
-        await api.saveEnvironment(envForm)
-        await onRefreshBootstrap()
       } else if (dialog === 'networks') {
         await api.saveNetworkProfile(netForm)
       } else if (dialog === 'credentials') {
@@ -736,27 +826,35 @@ export function CatalogTab({
     },
   ]
 
-  const envColumns: ColumnDef<EnvironmentRecord, unknown>[] = [
-    { accessorKey: 'code', header: t('catalog.col.code'), cell: ({ row }) => <MetaBadge items={catalog.environments} code={row.original.code} /> },
-    { accessorKey: 'safety_tier', header: t('catalog.col.safetyTier'), cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.safety_tier}</Badge> },
-    { accessorKey: 'sort_order', header: t('catalog.col.order') },
-    {
-      id: 'actions',
-      header: '',
-      cell: ({ row }) => (
-        <div className="flex justify-end">
-          <Button size="sm" variant="outline" onClick={() => { setFormError(null); setEnvForm({ ...row.original }); setDialog('environments') }}>{t('common.edit')}</Button>
-        </div>
-      ),
-    },
-  ]
-
   return (
     <div className="space-y-5">
       <PageHeader
         title={t('catalog.title')}
         actions={
           <div className="flex flex-wrap items-center gap-2">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm">
+                  <Layers className="size-3.5" />
+                  {t('catalog.resources')}
+                  <ChevronDown className="size-3.5 opacity-60" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => setResourceSheet('instances')}>
+                  <Server className="size-3.5" />
+                  {t('catalog.resources.instances', { count: instances.length })}
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setResourceSheet('networks')}>
+                  <Network className="size-3.5" />
+                  {t('catalog.resources.networks', { count: networks.length })}
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setResourceSheet('credentials')}>
+                  <KeyRound className="size-3.5" />
+                  {t('catalog.resources.credentials', { count: credentials.length })}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <Button
               variant="outline"
               size="sm"
@@ -788,14 +886,10 @@ export function CatalogTab({
 
       {error && <Notice tone="error">{error}</Notice>}
 
-      <Tabs value={subTab} onValueChange={(v) => setSubTab(v as SubTab)}>
+      <Tabs value={subTab} onValueChange={(v) => setSubTab(v as PrimaryTab)}>
         <TabsList>
           <TabsTrigger value="targets">{t('catalog.tabs.targets', { count: filteredTargets.length })}</TabsTrigger>
           <TabsTrigger value="systems">{t('catalog.tabs.systems', { count: systems.length })}</TabsTrigger>
-          <TabsTrigger value="instances">{t('catalog.tabs.instances', { count: instances.length })}</TabsTrigger>
-          <TabsTrigger value="networks">{t('catalog.tabs.networks', { count: networks.length })}</TabsTrigger>
-          <TabsTrigger value="credentials">{t('catalog.tabs.credentials', { count: credentials.length })}</TabsTrigger>
-          <TabsTrigger value="environments">{t('catalog.tabs.environments', { count: envs.length })}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="targets">
@@ -844,27 +938,258 @@ export function CatalogTab({
             <DataTable columns={systemColumns} data={systems} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.systems')} />
           </Panel>
         </TabsContent>
-        <TabsContent value="instances">
-          <Panel flush>
-            <DataTable columns={instanceColumns} data={instances} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.instances')} />
-          </Panel>
-        </TabsContent>
-        <TabsContent value="networks">
-          <Panel flush>
-            <DataTable columns={netColumns} data={networks} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.networks')} />
-          </Panel>
-        </TabsContent>
-        <TabsContent value="credentials">
-          <Panel flush>
-            <DataTable columns={credColumns} data={credentials} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.credentials')} />
-          </Panel>
-        </TabsContent>
-        <TabsContent value="environments">
-          <Panel flush>
-            <DataTable columns={envColumns} data={envs} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.environments')} />
-          </Panel>
-        </TabsContent>
       </Tabs>
+
+      <FormDialog
+        open={dialog === 'add-db'}
+        onOpenChange={(o) => !o && setDialog(null)}
+        title={t('catalog.dialog.addDb')}
+        submitLabel={t('common.save')}
+        cancelLabel={t('common.cancel')}
+        error={formError}
+        pending={saving}
+        onSubmit={handleSave}
+      >
+        <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-muted/40 p-1">
+          <Button
+            type="button"
+            size="sm"
+            variant={addMode === 'fields' ? 'default' : 'ghost'}
+            className="h-7 text-xs"
+            onClick={() => setAddMode('fields')}
+          >
+            {t('catalog.addDb.modeFields')}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={addMode === 'uri' ? 'default' : 'ghost'}
+            className="h-7 text-xs"
+            onClick={() => setAddMode('uri')}
+          >
+            {t('catalog.addDb.modeUri')}
+          </Button>
+        </div>
+
+        {addMode === 'uri' ? (
+          <div className="grid gap-3 sm:grid-cols-[1fr_160px]">
+            <FormField label={t('catalog.addDb.dsn')}>
+              <Input
+                value={addForm.dsn}
+                onChange={(e) => setAddForm((p) => ({ ...p, dsn: e.target.value }))}
+                placeholder={t('catalog.addDb.dsnPh')}
+                className="font-mono text-xs"
+              />
+            </FormField>
+            <FormField label={t('catalog.field.environment')}>
+              <Select value={addForm.env} onValueChange={(v) => setAddForm((p) => ({ ...p, env: v }))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {envs.map((e) => (
+                    <SelectItem key={e.code} value={e.code}>
+                      {resolveDisplayItem(catalog.environments, e.code, locale).label} ({e.safety_tier})
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </FormField>
+          </div>
+        ) : (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <FormField label={t('catalog.field.engine')}>
+                <Select
+                  value={addForm.engine}
+                  onValueChange={(v) =>
+                    setAddForm((p) => {
+                      const prevDef = DEFAULT_ENGINE_PORTS[p.engine] ?? 0
+                      const nextDef = DEFAULT_ENGINE_PORTS[v] ?? 0
+                      const keepCustomPort = p.port && p.port !== prevDef && v !== 'sqlite'
+                      return {
+                        ...p,
+                        engine: v,
+                        port: v === 'sqlite' ? 0 : keepCustomPort ? p.port : nextDef,
+                        host: v === 'sqlite' && p.host === '127.0.0.1' ? '' : p.host,
+                      }
+                    })
+                  }
+                >
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {catalog.engines.map((e) => (
+                      <SelectItem key={e.code} value={e.code}>
+                        {resolveDisplayItem(catalog.engines, e.code, locale).label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FormField>
+              <FormField label={t('catalog.field.environment')}>
+                <Select value={addForm.env} onValueChange={(v) => setAddForm((p) => ({ ...p, env: v }))}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {envs.map((e) => (
+                      <SelectItem key={e.code} value={e.code}>
+                        {resolveDisplayItem(catalog.environments, e.code, locale).label} ({e.safety_tier})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FormField>
+            </div>
+            {addForm.engine === 'sqlite' ? (
+              <FormField label={t('catalog.field.sqlitePath')}>
+                <Input
+                  value={addForm.host}
+                  onChange={(e) => setAddForm((p) => ({ ...p, host: e.target.value, port: 0 }))}
+                  placeholder="~/.config/app/data.db"
+                />
+              </FormField>
+            ) : (
+              <>
+                <div className="grid grid-cols-[1fr_110px] gap-3">
+                  <FormField label={t('catalog.field.host')}>
+                    <Input value={addForm.host} onChange={(e) => setAddForm((p) => ({ ...p, host: e.target.value }))} />
+                  </FormField>
+                  <FormField label={t('catalog.field.port')}>
+                    <Input
+                      type="number"
+                      value={addForm.port}
+                      onChange={(e) => setAddForm((p) => ({ ...p, port: Number(e.target.value) }))}
+                    />
+                  </FormField>
+                </div>
+                <FormField label={t('catalog.field.databaseName')}>
+                  <Input
+                    value={addForm.database}
+                    onChange={(e) => setAddForm((p) => ({ ...p, database: e.target.value }))}
+                    placeholder="orders"
+                  />
+                </FormField>
+                {!addForm.existingCred && (
+                  <div className="grid grid-cols-2 gap-3">
+                    <FormField label={t('catalog.field.username')}>
+                      <Input value={addForm.user} onChange={(e) => setAddForm((p) => ({ ...p, user: e.target.value }))} />
+                    </FormField>
+                    <FormField label={t('catalog.addDb.password')}>
+                      <Input
+                        type="password"
+                        value={addForm.secret_value}
+                        onChange={(e) => setAddForm((p) => ({ ...p, secret_value: e.target.value }))}
+                        placeholder={t('catalog.addDb.passwordPh')}
+                      />
+                    </FormField>
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        )}
+
+        <div className={addForm.systemChoice === '__new__' ? 'grid grid-cols-2 gap-3' : undefined}>
+          <FormField label={t('catalog.field.ownerSystem')}>
+            <Select value={addForm.systemChoice} onValueChange={(v) => setAddForm((p) => ({ ...p, systemChoice: v }))}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {systems.map((s) => (
+                  <SelectItem key={s.id} value={s.id}>{s.name} ({s.slug})</SelectItem>
+                ))}
+                <SelectItem value="__new__">{t('catalog.addDb.newSystem')}</SelectItem>
+              </SelectContent>
+            </Select>
+          </FormField>
+          {addForm.systemChoice === '__new__' && (
+            <FormField label={t('catalog.addDb.systemSlug')}>
+              <Input
+                value={addForm.newSystemSlug}
+                onChange={(e) => setAddForm((p) => ({ ...p, newSystemSlug: e.target.value }))}
+                placeholder="order-core"
+              />
+            </FormField>
+          )}
+        </div>
+
+        <button
+          type="button"
+          className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground"
+          onClick={() => setShowAddAdvanced((v) => !v)}
+        >
+          {showAddAdvanced ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+          {t('catalog.addDb.advanced')}
+        </button>
+
+        {showAddAdvanced && (
+          <div className="space-y-3 rounded-md border border-border p-3">
+            <div className="grid grid-cols-2 gap-3">
+              <FormField label={t('catalog.field.alias')}>
+                <Input
+                  value={addForm.alias}
+                  onChange={(e) => setAddForm((p) => ({ ...p, alias: e.target.value }))}
+                  placeholder="prod-orders"
+                />
+              </FormField>
+              <FormField label={t('catalog.field.ref')}>
+                <Input
+                  value={addForm.ref}
+                  onChange={(e) => setAddForm((p) => ({ ...p, ref: e.target.value }))}
+                  placeholder={t('catalog.addDb.refPh')}
+                />
+              </FormField>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <FormField label={t('catalog.field.networkProfile')}>
+                <Select
+                  value={addForm.network || '__direct'}
+                  onValueChange={(v) => setAddForm((p) => ({ ...p, network: v === '__direct' ? '' : v }))}
+                >
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__direct">{t('catalog.field.directDefault')}</SelectItem>
+                    {networks.map((n) => (
+                      <SelectItem key={n.id} value={n.id}>{n.name} ({n.mode})</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FormField>
+              <FormField label={t('catalog.field.accessLevel')}>
+                <Select
+                  value={addForm.access_level}
+                  onValueChange={(v) => setAddForm((p) => ({ ...p, access_level: v as 'read_only' | 'read_write' }))}
+                >
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="read_only">read_only</SelectItem>
+                    <SelectItem value="read_write">read_write</SelectItem>
+                  </SelectContent>
+                </Select>
+              </FormField>
+            </div>
+            {credentials.length > 0 && (
+              <FormField label={t('catalog.addDb.reuseCred')}>
+                <Select
+                  value={addForm.existingCred || '__auto'}
+                  onValueChange={(v) => setAddForm((p) => ({ ...p, existingCred: v === '__auto' ? '' : v }))}
+                >
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__auto">{t('catalog.addDb.autoCred')}</SelectItem>
+                    {credentials.map((c) => (
+                      <SelectItem key={c.id} value={c.id}>{c.name} ({c.access_level})</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FormField>
+            )}
+            <label className="flex items-center justify-between text-sm">
+              <span>{t('catalog.addDb.testOnSave')}</span>
+              <Switch
+                checked={addForm.testOnSave}
+                onCheckedChange={(c) => setAddForm((p) => ({ ...p, testOnSave: c }))}
+              />
+            </label>
+          </div>
+        )}
+      </FormDialog>
 
       <FormDialog
         open={dialog === 'systems'}
@@ -1298,47 +1623,6 @@ export function CatalogTab({
       </FormDialog>
 
       <FormDialog
-        open={dialog === 'environments'}
-        onOpenChange={(o) => !o && setDialog(null)}
-        title={t('catalog.dialog.envConfig')}
-        submitLabel={t('common.save')}
-        cancelLabel={t('common.cancel')}
-        error={formError}
-        pending={saving}
-        onSubmit={handleSave}
-      >
-        <FormField label={t('catalog.field.code')}>
-          <Input value={envForm.code} onChange={(e) => setEnvForm((p) => ({ ...p, code: e.target.value }))} placeholder="uat" />
-        </FormField>
-        <FormField label={t('catalog.field.safetyTier')}>
-          <Select value={envForm.safety_tier} onValueChange={(v) => setEnvForm((p) => ({ ...p, safety_tier: v as EnvironmentRecord['safety_tier'] }))}>
-            <SelectTrigger><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="yolo">{t('catalog.tier.yolo')}</SelectItem>
-              <SelectItem value="guarded">{t('catalog.tier.guarded')}</SelectItem>
-              <SelectItem value="strict">{t('catalog.tier.strict')}</SelectItem>
-            </SelectContent>
-          </Select>
-        </FormField>
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label={t('catalog.field.labelEn')}>
-            <Input value={envForm.labels.en ?? ''} onChange={(e) => setEnvForm((p) => ({ ...p, labels: { ...p.labels, en: e.target.value } }))} />
-          </FormField>
-          <FormField label={t('catalog.field.labelZh')}>
-            <Input value={envForm.labels.zh ?? ''} onChange={(e) => setEnvForm((p) => ({ ...p, labels: { ...p.labels, zh: e.target.value } }))} />
-          </FormField>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <FormField label={t('catalog.field.color')}>
-            <Input value={envForm.color} onChange={(e) => setEnvForm((p) => ({ ...p, color: e.target.value }))} />
-          </FormField>
-          <FormField label={t('catalog.field.sortOrder')}>
-            <Input type="number" value={envForm.sort_order} onChange={(e) => setEnvForm((p) => ({ ...p, sort_order: Number(e.target.value) }))} />
-          </FormField>
-        </div>
-      </FormDialog>
-
-      <FormDialog
         open={dialog === 'topology'}
         onOpenChange={(o) => !o && setDialog(null)}
         title={t('catalog.dialog.topologyTitle')}
@@ -1372,6 +1656,43 @@ export function CatalogTab({
           </Button>
         </div>
       </FormDialog>
+
+      <Sheet open={Boolean(resourceSheet)} onOpenChange={(o) => !o && setResourceSheet(null)}>
+        <SheetContent className="w-full sm:max-w-3xl">
+          <SheetHeader>
+            <SheetTitle>
+              {resourceSheet === 'instances' && t('catalog.resources.instances', { count: instances.length })}
+              {resourceSheet === 'networks' && t('catalog.resources.networks', { count: networks.length })}
+              {resourceSheet === 'credentials' && t('catalog.resources.credentials', { count: credentials.length })}
+            </SheetTitle>
+          </SheetHeader>
+          <SheetBody>
+            {resourceSheet && (
+              <div className="space-y-3">
+                <div className="flex justify-end">
+                  <Button size="sm" onClick={() => openResourceCreate(resourceSheet)}>
+                    <Plus className="size-3.5" />
+                    {resourceSheet === 'instances' && t('catalog.resources.newInstance')}
+                    {resourceSheet === 'networks' && t('catalog.resources.newNetwork')}
+                    {resourceSheet === 'credentials' && t('catalog.resources.newCredential')}
+                  </Button>
+                </div>
+                <Panel flush>
+                  {resourceSheet === 'instances' && (
+                    <DataTable columns={instanceColumns} data={instances} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.instances')} />
+                  )}
+                  {resourceSheet === 'networks' && (
+                    <DataTable columns={netColumns} data={networks} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.networks')} />
+                  )}
+                  {resourceSheet === 'credentials' && (
+                    <DataTable columns={credColumns} data={credentials} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.credentials')} />
+                  )}
+                </Panel>
+              </div>
+            )}
+          </SheetBody>
+        </SheetContent>
+      </Sheet>
 
       <Sheet open={Boolean(discoverSheet)} onOpenChange={(o) => !o && setDiscoverSheet(null)}>
         <SheetContent>

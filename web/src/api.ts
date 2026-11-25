@@ -47,6 +47,49 @@ export interface BootstrapPayload {
   ui_csrf_token?: string
 }
 
+export interface DBAddRequest {
+  dsn?: string
+  engine?: string
+  host?: string
+  port?: number
+  database?: string
+  tls_mode?: string
+  ref?: string
+  alias?: string
+  system?: string
+  system_name?: string
+  env?: string
+  instance?: string
+  network?: string
+  user?: string
+  cred_kind?: 'keychain' | 'env_ref' | 'exec_provider'
+  access_level?: 'read_only' | 'read_write'
+  ro_cred?: string
+  rw_cred?: string
+  env_var_name?: string
+  exec_command?: string
+  secret_value?: string
+  secret_provided?: boolean
+  status?: 'active' | 'maintenance' | 'disabled'
+  description?: string
+  test?: boolean
+}
+
+export interface DBAddResponse {
+  status: string
+  target: {
+    ref: string
+    alias?: string
+    system?: string
+    env: string
+    engine: string
+    database?: string
+  }
+  actions: Record<string, string>
+  ping?: PingResult
+  warnings?: string[]
+}
+
 export interface SystemRecord {
   id: string
   slug: string
@@ -553,6 +596,8 @@ export const api = {
     request<{ databases: string[] }>(`/api/v1/instances/${id}/discover`, { method: 'POST', body: JSON.stringify(body) }),
 
   listTargets: () => request<{ items: TargetDetail[] }>('/api/v1/targets'),
+  addDatabase: (req: DBAddRequest) =>
+    request<DBAddResponse>('/api/v1/db/add', { method: 'POST', body: JSON.stringify(req) }),
   saveTarget: (t: Partial<TargetRecord>) =>
     request<TargetRecord>('/api/v1/targets', { method: 'POST', body: JSON.stringify(t) }),
   deleteTarget: (id: string) =>

@@ -6,19 +6,20 @@ import { ApprovalsTab } from './components/ApprovalsTab'
 import { AuditTab } from './components/AuditTab'
 import { CatalogTab, type CatalogSubTab } from './components/CatalogTab'
 import { DriversTab } from './components/DriversTab'
-import { PoliciesTab } from './components/PoliciesTab'
+import { PoliciesTab, type PoliciesSubTab } from './components/PoliciesTab'
 import { loadCachedCatalog, saveCachedCatalog } from './lib/catalog'
 import { useI18n } from './lib/i18n'
 
 type Tab = 'approvals' | 'catalog' | 'policies' | 'audit' | 'drivers'
 
-const CATALOG_SUBTABS = new Set<CatalogSubTab>(['targets', 'systems', 'instances', 'networks', 'credentials', 'environments'])
+const CATALOG_SUBTABS = new Set<CatalogSubTab>(['targets', 'systems', 'instances', 'networks', 'credentials'])
 
 function parseDeepLink(): {
   tab: Tab
   approvalId: string | null
   approvalToken: string | null
   catalogSubTab: CatalogSubTab
+  policiesSubTab: PoliciesSubTab
   credentialId: string | null
 } {
   const path = window.location.pathname
@@ -30,6 +31,7 @@ function parseDeepLink(): {
       approvalId: decodeURIComponent(approvalMatch[1]),
       approvalToken: sp.get('token'),
       catalogSubTab: 'targets',
+      policiesSubTab: 'guardrails',
       credentialId: null,
     }
   }
@@ -39,15 +41,26 @@ function parseDeepLink(): {
       approvalId: null,
       approvalToken: null,
       catalogSubTab: 'targets',
+      policiesSubTab: 'guardrails',
       credentialId: null,
     }
   }
   if (path === '/catalog' || path.startsWith('/catalog/')) {
-    const rawSub = sp.get('subtab') as CatalogSubTab | null
+    const rawSub = sp.get('subtab')
+    if (rawSub === 'environments') {
+      return {
+        tab: 'policies',
+        approvalId: null,
+        approvalToken: null,
+        catalogSubTab: 'targets',
+        policiesSubTab: 'environments',
+        credentialId: null,
+      }
+    }
     const credential = sp.get('credential')
     const catalogSubTab: CatalogSubTab =
-      rawSub && CATALOG_SUBTABS.has(rawSub)
-        ? rawSub
+      rawSub && CATALOG_SUBTABS.has(rawSub as CatalogSubTab)
+        ? (rawSub as CatalogSubTab)
         : credential
           ? 'credentials'
           : 'targets'
@@ -56,19 +69,23 @@ function parseDeepLink(): {
       approvalId: null,
       approvalToken: null,
       catalogSubTab,
+      policiesSubTab: 'guardrails',
       credentialId: credential,
     }
   }
   if (path === '/policies' || path.startsWith('/policies/')) {
-    return { tab: 'policies', approvalId: null, approvalToken: null, catalogSubTab: 'targets', credentialId: null }
+    const rawSub = sp.get('subtab')
+    const policiesSubTab: PoliciesSubTab =
+      rawSub === 'patterns' || rawSub === 'environments' ? rawSub : 'guardrails'
+    return { tab: 'policies', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab, credentialId: null }
   }
   if (path === '/audit' || path.startsWith('/audit/')) {
-    return { tab: 'audit', approvalId: null, approvalToken: null, catalogSubTab: 'targets', credentialId: null }
+    return { tab: 'audit', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null }
   }
   if (path === '/drivers' || path.startsWith('/drivers/')) {
-    return { tab: 'drivers', approvalId: null, approvalToken: null, catalogSubTab: 'targets', credentialId: null }
+    return { tab: 'drivers', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null }
   }
-  return { tab: 'approvals', approvalId: null, approvalToken: null, catalogSubTab: 'targets', credentialId: null }
+  return { tab: 'approvals', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null }
 }
 
 export function App() {
@@ -175,6 +192,8 @@ export function App() {
         {tab === 'policies' && (
           <PoliciesTab
             catalog={catalog}
+            initialSubTab={initialLink.policiesSubTab}
+            onRefreshBootstrap={refreshBootstrap}
             onSavedGlobal={(cfg) =>
               setBootstrap((prev) => (prev ? { ...prev, global_security: cfg } : prev))
             }

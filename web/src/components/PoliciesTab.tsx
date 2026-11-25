@@ -36,13 +36,20 @@ import {
 } from '../api'
 import { resolveDisplayItem } from '../lib/catalog'
 import { useI18n } from '../lib/i18n'
+import { MetaBadge } from './MetaBadge'
 import { RiskPatternsPanel } from './RiskPatternsPanel'
+
+export type PoliciesSubTab = 'guardrails' | 'patterns' | 'environments'
 
 export function PoliciesTab({
   catalog,
+  initialSubTab = 'guardrails',
+  onRefreshBootstrap,
   onSavedGlobal,
 }: {
   catalog: DisplayCatalog
+  initialSubTab?: PoliciesSubTab
+  onRefreshBootstrap: () => Promise<void>
   onSavedGlobal: (cfg: GlobalSecurityConfig) => void
 }) {
   const { locale, t } = useI18n()
@@ -55,7 +62,7 @@ export function PoliciesTab({
   const [savingGlobal, setSavingGlobal] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const [subTab, setSubTab] = useState<'guardrails' | 'patterns'>('guardrails')
+  const [subTab, setSubTab] = useState<PoliciesSubTab>(initialSubTab)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [savingPol, setSavingPol] = useState(false)
   const [polErr, setPolErr] = useState<string | null>(null)
@@ -65,6 +72,16 @@ export function PoliciesTab({
     scope_type: 'env',
     scope_id: 'prod',
     approval_provider: '',
+  })
+  const [envDialogOpen, setEnvDialogOpen] = useState(false)
+  const [savingEnv, setSavingEnv] = useState(false)
+  const [envErr, setEnvErr] = useState<string | null>(null)
+  const [envForm, setEnvForm] = useState<EnvironmentRecord>({
+    code: '',
+    safety_tier: 'guarded',
+    labels: { en: '', zh: '' },
+    color: '#D97706',
+    sort_order: 25,
   })
 
   const load = async () => {
@@ -124,6 +141,48 @@ export function PoliciesTab({
       setSavingPol(false)
     }
   }
+
+  const saveEnv = async (e?: FormEvent<HTMLFormElement>) => {
+    e?.preventDefault()
+    setSavingEnv(true)
+    setEnvErr(null)
+    try {
+      await api.saveEnvironment(envForm)
+      await onRefreshBootstrap()
+      setEnvDialogOpen(false)
+      toast.success(t('common.saved'))
+      await load()
+    } catch (err) {
+      setEnvErr(err instanceof Error ? err.message : t('common.saveFailed'))
+    } finally {
+      setSavingEnv(false)
+    }
+  }
+
+  const envColumns: ColumnDef<EnvironmentRecord, unknown>[] = [
+    { accessorKey: 'code', header: t('catalog.col.code'), cell: ({ row }) => <MetaBadge items={catalog.environments} code={row.original.code} /> },
+    { accessorKey: 'safety_tier', header: t('catalog.col.safetyTier'), cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.safety_tier}</Badge> },
+    { accessorKey: 'sort_order', header: t('catalog.col.order') },
+    {
+      id: 'actions',
+      header: '',
+      cell: ({ row }) => (
+        <div className="flex justify-end">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              setEnvErr(null)
+              setEnvForm({ ...row.original })
+              setEnvDialogOpen(true)
+            }}
+          >
+            {t('common.edit')}
+          </Button>
+        </div>
+      ),
+    },
+  ]
 
   const columns: ColumnDef<PolicyRuleSet, unknown>[] = [
     {
@@ -194,33 +253,48 @@ export function PoliciesTab({
               <RefreshCw className={loading ? 'animate-spin' : undefined} />
               {t('common.refresh')}
             </Button>
-            <Button
-              size="sm"
-              onClick={() => {
-                setPolErr(null)
-                setPolForm({
-                  id: '',
-                  name: '',
-                  scope_type: 'env',
-                  scope_id: envs[0]?.code ?? 'prod',
-                  approval_provider: '',
-                })
-                setDialogOpen(true)
-              }}
-            >
-              <Plus />
-              {t('policies.newOverride')}
-            </Button>
+            {subTab === 'environments' ? (
+              <Button
+                size="sm"
+                onClick={() => {
+                  setEnvErr(null)
+                  setEnvForm({ code: '', safety_tier: 'guarded', labels: { en: '', zh: '' }, color: '#D97706', sort_order: 25 })
+                  setEnvDialogOpen(true)
+                }}
+              >
+                <Plus />
+                {t('policies.newEnvironment')}
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                onClick={() => {
+                  setPolErr(null)
+                  setPolForm({
+                    id: '',
+                    name: '',
+                    scope_type: 'env',
+                    scope_id: envs[0]?.code ?? 'prod',
+                    approval_provider: '',
+                  })
+                  setDialogOpen(true)
+                }}
+              >
+                <Plus />
+                {t('policies.newOverride')}
+              </Button>
+            )}
           </div>
         }
       />
 
       {error && <Notice tone="error">{error}</Notice>}
 
-      <Tabs value={subTab} onValueChange={(v) => setSubTab(v as typeof subTab)}>
+      <Tabs value={subTab} onValueChange={(v) => setSubTab(v as PoliciesSubTab)}>
         <TabsList>
           <TabsTrigger value="guardrails">{t('policies.tab.guardrails')}</TabsTrigger>
           <TabsTrigger value="patterns">{t('policies.tab.patterns')}</TabsTrigger>
+          <TabsTrigger value="environments">{t('catalog.tabs.environments', { count: envs.length })}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="guardrails" className="space-y-5 pt-2">
@@ -335,7 +409,59 @@ export function PoliciesTab({
         <TabsContent value="patterns" className="pt-2">
           <RiskPatternsPanel envs={envs} systems={systems} targets={targets} />
         </TabsContent>
+
+        <TabsContent value="environments" className="pt-2">
+          <Panel flush>
+            <DataTable
+              columns={envColumns}
+              data={envs}
+              searchPlaceholder={t('common.search')}
+              emptyLabel={t('catalog.empty.environments')}
+            />
+          </Panel>
+        </TabsContent>
       </Tabs>
+
+      <FormDialog
+        open={envDialogOpen}
+        onOpenChange={setEnvDialogOpen}
+        title={t('catalog.dialog.envConfig')}
+        submitLabel={t('common.save')}
+        cancelLabel={t('common.cancel')}
+        error={envErr}
+        pending={savingEnv}
+        onSubmit={saveEnv}
+      >
+        <FormField label={t('catalog.field.code')}>
+          <Input value={envForm.code} onChange={(e) => setEnvForm((p) => ({ ...p, code: e.target.value }))} placeholder="uat" />
+        </FormField>
+        <FormField label={t('catalog.field.safetyTier')}>
+          <Select value={envForm.safety_tier} onValueChange={(v) => setEnvForm((p) => ({ ...p, safety_tier: v as EnvironmentRecord['safety_tier'] }))}>
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="yolo">{t('catalog.tier.yolo')}</SelectItem>
+              <SelectItem value="guarded">{t('catalog.tier.guarded')}</SelectItem>
+              <SelectItem value="strict">{t('catalog.tier.strict')}</SelectItem>
+            </SelectContent>
+          </Select>
+        </FormField>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={t('catalog.field.labelEn')}>
+            <Input value={envForm.labels.en ?? ''} onChange={(e) => setEnvForm((p) => ({ ...p, labels: { ...p.labels, en: e.target.value } }))} />
+          </FormField>
+          <FormField label={t('catalog.field.labelZh')}>
+            <Input value={envForm.labels.zh ?? ''} onChange={(e) => setEnvForm((p) => ({ ...p, labels: { ...p.labels, zh: e.target.value } }))} />
+          </FormField>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={t('catalog.field.color')}>
+            <Input value={envForm.color} onChange={(e) => setEnvForm((p) => ({ ...p, color: e.target.value }))} />
+          </FormField>
+          <FormField label={t('catalog.field.sortOrder')}>
+            <Input type="number" value={envForm.sort_order} onChange={(e) => setEnvForm((p) => ({ ...p, sort_order: Number(e.target.value) }))} />
+          </FormField>
+        </div>
+      </FormDialog>
 
       <FormDialog
         open={dialogOpen}

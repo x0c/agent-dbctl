@@ -290,7 +290,23 @@ func NewWebHandler(svc *Service) http.Handler {
 		writeJSONResp(w, http.StatusOK, map[string]any{"databases": dbs})
 	})
 
-	// Targets
+	// Targets & One-Shot DB Add
+	mux.HandleFunc("POST /api/v1/db/add", func(w http.ResponseWriter, r *http.Request) {
+		var req DBAddRequest
+		if err := decodeJSONBody(r, &req); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.NoWorkspace = true
+		req.WorkspaceCWD = ""
+		req.WorkspaceGitRemotes = nil
+		res, err := svc.AdminAddDatabase(r.Context(), "web-admin", req)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, res)
+	})
 	mux.HandleFunc("GET /api/v1/targets", func(w http.ResponseWriter, r *http.Request) {
 		items, err := svc.BuildTargetDetails(r.Context(), "")
 		if err != nil {
