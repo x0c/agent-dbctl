@@ -416,6 +416,14 @@ func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
 			writeHTTPErr(w, http.StatusNotFound, "OIDC is not enabled")
 			return
 		}
+		if oidcErr := strings.TrimSpace(r.URL.Query().Get("error")); oidcErr != "" {
+			msg := strings.TrimSpace(r.URL.Query().Get("error_description"))
+			if msg == "" {
+				msg = oidcErr
+			}
+			http.Redirect(w, r, "/?error="+url.QueryEscape(msg), http.StatusFound)
+			return
+		}
 		stateRaw := r.URL.Query().Get("state")
 		code := r.URL.Query().Get("code")
 		if stateRaw == "" || code == "" {
@@ -1075,7 +1083,10 @@ func mintCLISessionToken(ctx context.Context, svc *Service, u types.User, prefix
 
 func sanitizeReturnTo(raw string) string {
 	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || !strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "//") {
+	if trimmed == "" || !strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/\\") {
+		return "/"
+	}
+	if strings.HasPrefix(trimmed, "/api/") || strings.HasPrefix(trimmed, "/rpc/") {
 		return "/"
 	}
 	return trimmed
@@ -1169,16 +1180,11 @@ func resolveRequestPrincipal(r *http.Request, svc *Service) (types.Principal, bo
 }
 
 func (s *Service) touchAPITokenLastUsedAsync(tokenID string) {
-	if s == nil || s.rootCtx == nil || s.rootCtx.Err() != nil {
-		return
-	}
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		ctx, cancel := context.WithTimeout(s.rootCtx, 5*time.Second)
+	s.goBackground(func(rootCtx context.Context) {
+		ctx, cancel := context.WithTimeout(rootCtx, 5*time.Second)
 		defer cancel()
 		s.store.TouchAPITokenLastUsed(ctx, tokenID)
-	}()
+	})
 }
 
 func resolveBearerPrincipal(r *http.Request, svc *Service) (types.Principal, bool) {

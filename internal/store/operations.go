@@ -32,6 +32,8 @@ type AuditFilter struct {
 	Actor       string
 	SinceUTC    string
 	UntilUTC    string
+	BeforeSeq   int64
+	SkipCount   bool
 	Limit       int
 	Offset      int
 }
@@ -646,6 +648,10 @@ func (s *Store) ListAuditEntriesFiltered(ctx context.Context, f AuditFilter) ([]
 		conds = append(conds, "created_at_utc <= ?")
 		args = append(args, f.UntilUTC)
 	}
+	if f.BeforeSeq > 0 {
+		conds = append(conds, "seq < ?")
+		args = append(args, f.BeforeSeq)
+	}
 
 	whereClause := ""
 	if len(conds) > 0 {
@@ -653,9 +659,11 @@ func (s *Store) ListAuditEntriesFiltered(ctx context.Context, f AuditFilter) ([]
 	}
 
 	var totalMatched int
-	countQ := `SELECT COUNT(1) FROM audit_logs` + whereClause
-	if err := s.dbQueryRow(ctx, countQ, args...).Scan(&totalMatched); err != nil {
-		return nil, 0, err
+	if !f.SkipCount {
+		countQ := `SELECT COUNT(1) FROM audit_logs` + whereClause
+		if err := s.dbQueryRow(ctx, countQ, args...).Scan(&totalMatched); err != nil {
+			return nil, 0, err
+		}
 	}
 
 	q := `SELECT seq, id, actor, action, target_id, operation_id, payload_json, prev_hash, entry_hash, created_at_utc FROM audit_logs` +

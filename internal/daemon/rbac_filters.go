@@ -128,13 +128,6 @@ func filterOperationsForPrincipal(p types.Principal, items []types.Operation) []
 	return out
 }
 
-func targetDetailSystemScope(d types.TargetDetail) (string, string) {
-	if d.OwnerSystem != nil {
-		return d.OwnerSystem.ID, d.OwnerSystem.Slug
-	}
-	return d.Target.OwnerSystemID, ""
-}
-
 func isAuthorizedAuditEntry(p types.Principal, allowedTargets map[string]bool, e types.AuditEntry) bool {
 	return strings.EqualFold(e.Actor, p.Subject) || allowedTargets[e.TargetID] || allowedTargets[strings.ToLower(e.TargetID)]
 }
@@ -174,16 +167,21 @@ func (s *Service) listAuthorizedAuditEntries(ctx context.Context, f store.AuditF
 	}
 
 	const batchSize = 500
-	dbOffset := 0
+	var beforeSeq int64
 	totalAuthorized := 0
 	page := make([]types.AuditEntry, 0, limit)
 	for {
 		chunkFilter := f
 		chunkFilter.Limit = batchSize
-		chunkFilter.Offset = dbOffset
-		chunk, rawTotal, err := s.store.ListAuditEntriesFiltered(ctx, chunkFilter)
+		chunkFilter.Offset = 0
+		chunkFilter.BeforeSeq = beforeSeq
+		chunkFilter.SkipCount = true
+		chunk, _, err := s.store.ListAuditEntriesFiltered(ctx, chunkFilter)
 		if err != nil {
 			return nil, 0, false, err
+		}
+		if len(chunk) == 0 {
+			break
 		}
 		for _, e := range chunk {
 			if isAuthorizedAuditEntry(p, allowedTargets, e) {
@@ -192,9 +190,9 @@ func (s *Service) listAuthorizedAuditEntries(ctx context.Context, f store.AuditF
 				}
 				totalAuthorized++
 			}
+			beforeSeq = e.Seq
 		}
-		dbOffset += len(chunk)
-		if len(chunk) == 0 || dbOffset >= rawTotal || len(chunk) < batchSize {
+		if len(chunk) < batchSize || beforeSeq <= 1 {
 			break
 		}
 	}

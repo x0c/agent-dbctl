@@ -1892,8 +1892,19 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 func (s *Service) AdminApplyTopology(ctx context.Context, actor string, bundle types.TopologyBundle, dryRun bool) (types.TopologyImportResult, error) {
 	actor = s.effectiveActor(ctx, actor)
 	if s.IsServerMode() {
-		if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionTopologyWrite, rbac.ResourceScope{}); err != nil {
+		p := rbac.PrincipalFromContext(ctx)
+		if err := rbac.Authorize(p, rbac.ActionTopologyWrite, rbac.ResourceScope{}); err != nil {
 			return types.TopologyImportResult{}, err
+		}
+		if bundle.GlobalSecurity != nil {
+			if err := rbac.Authorize(p, rbac.ActionGlobalSecurityWrite, rbac.ResourceScope{}); err != nil {
+				return types.TopologyImportResult{}, err
+			}
+		}
+		if len(bundle.Environments) > 0 {
+			if err := rbac.Authorize(p, rbac.ActionEnvWrite, rbac.ResourceScope{}); err != nil {
+				return types.TopologyImportResult{}, err
+			}
 		}
 		for _, np := range bundle.NetworkProfiles {
 			if err := validateProxyURL(np.ProxyURL, true); err != nil {

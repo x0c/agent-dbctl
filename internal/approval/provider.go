@@ -143,6 +143,7 @@ func (m *Manager) Submit(ctx context.Context, providerName string, op types.Oper
 		EnvironmentCode: op.EnvironmentCode,
 		Engine:          op.Engine,
 		Actor:           op.Actor,
+		PrincipalID:     op.PrincipalID,
 		Reason:          op.Reason,
 		WorkspaceCWD:    op.WorkspaceCWD,
 		QueryText:       op.QueryText,

@@ -212,10 +212,10 @@ func Authorize(p types.Principal, action Action, res ResourceScope) error {
 		return nil
 	}
 
-	// Human-only boundary: AgentTokens can never resolve human approvals or manage users.
+	// Human-only boundary: AgentTokens can never resolve human approvals or mutate platform security/envs/topology/plugins/users.
 	if p.Kind == types.PrincipalAgentToken {
 		switch action {
-		case ActionApprovalResolve, ActionUserManage, ActionGlobalSecurityWrite, ActionEnvWrite, ActionPluginManage, ActionCredentialExecWrite:
+		case ActionApprovalResolve, ActionUserManage, ActionGlobalSecurityWrite, ActionEnvWrite, ActionPluginManage, ActionCredentialExecWrite, ActionTopologyWrite:
 			return fmt.Errorf("forbidden: action %s is restricted to human principals", action)
 		}
 	}

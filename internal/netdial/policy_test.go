@@ -102,4 +102,34 @@ func TestDialPolicyEgressAndSSHGuards(t *testing.T) {
 	}, secrets.ResolvedSecret{Secret: "pass"}, defaultServerPol.NewDialer()); err == nil {
 		t.Fatalf("expected dialSSHClientWithDialer Control hook to block loopback")
 	}
+
+	// Control hook must strip IPv6 zones, unmap IPv4-mapped IPv6, block CGNAT/broadcast/NAT64, and fail closed on non-IPs.
+	ctrl := defaultServerPol.NewDialer().Control
+	if ctrl == nil {
+		t.Fatalf("expected Control hook when EnforceEgressGuard=true")
+	}
+	for _, addr := range []string{
+		"[::1%lo0]:5432",
+		"[fe80::1%en0]:80",
+		"[::ffff:127.0.0.1]:5432",
+		"[::ffff:169.254.169.254]:80",
+		"100.100.100.200:80",
+		"255.255.255.255:5432",
+		"[64:ff9b::127.0.0.1]:5432",
+		"not-an-ip-literal:5432",
+	} {
+		if err := ctrl("tcp", addr, nil); err == nil {
+			t.Fatalf("expected Control to reject %s", addr)
+		}
+	}
+	// Proxy and tunnel paths must reject literal restricted target hosts (e.g. cloud metadata).
+	for _, prof := range []*types.NetworkProfile{
+		{Mode: types.NetworkHTTPProxy, ProxyURL: "http://198.51.100.2:3128"},
+		{Mode: types.NetworkSOCKS5, ProxyURL: "socks5://198.51.100.2:1080"},
+		{Mode: types.NetworkSSHTunnel, BastionHost: "198.51.100.2", BastionUser: "ops"},
+	} {
+		if _, err := BuildContextWithPolicy(context.Background(), prof, secrets.ResolvedSecret{Secret: "pass"}, "", "169.254.169.254", pol); err == nil {
+			t.Fatalf("expected %s to reject metadata target 169.254.169.254", prof.Mode)
+		}
+	}
 }

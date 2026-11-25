@@ -5,11 +5,18 @@ import {
   Button,
   type CommandAction,
   CommandPalette,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
   MobileTabBar,
   SideNav,
   SideNavItem,
   SideNavSection,
   Toaster,
+  UserAvatar,
   toast,
 } from '@x0c/ui'
 import { Cpu, Database, KeyRound, Languages, LogOut, ScrollText, Search, ShieldAlert, ShieldCheck } from 'lucide-react'
@@ -164,6 +171,12 @@ export function App() {
   const refreshBootstrap = async () => {
     try {
       const data = await api.bootstrap()
+      try {
+        sessionStorage.removeItem('dbctl_manual_logout')
+        sessionStorage.removeItem('dbctl_oidc_auto_ts')
+      } catch {
+        // Ignore restricted storage environments.
+      }
       setAuthState('authenticated')
       setAuthInfo(null)
       setBootstrap(data)
@@ -194,6 +207,12 @@ export function App() {
   }, [])
 
   const handleLogout = async () => {
+    try {
+      sessionStorage.setItem('dbctl_manual_logout', '1')
+      sessionStorage.removeItem('dbctl_oidc_auto_ts')
+    } catch {
+      // Ignore restricted storage environments.
+    }
     await api.logout()
     clearCachedCatalog()
     setCatalog(EMPTY_CATALOG)
@@ -324,36 +343,62 @@ export function App() {
               ⌘K
             </kbd>
           </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-8 gap-1.5 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground"
-            title={t('common.langToggleTitle')}
-            aria-label={t('common.langToggleTitle')}
-            onClick={() => setLocale(locale === 'zh' ? 'en' : 'zh')}
-          >
-            <Languages className="size-3.5" />
-            <span>{t('common.langToggle')}</span>
-          </Button>
-          {isServerMode && bootstrap?.current_user && (
-            <div className="flex items-center gap-2 pl-1">
-              <span className="hidden text-xs text-muted-foreground md:inline">
-                {bootstrap.current_user.email || bootstrap.current_user.display_name}
-              </span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="h-8 gap-1.5 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground"
-                onClick={() => void handleLogout()}
-                title={t('nav.signOut')}
-                aria-label={t('nav.signOut')}
-              >
-                <LogOut className="size-3.5" />
-                <span className="hidden sm:inline">{t('nav.signOut')}</span>
-              </Button>
-            </div>
+          {isServerMode && bootstrap?.current_user ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={bootstrap.current_user.email || bootstrap.current_user.display_name}
+                  className="ml-1 cursor-pointer rounded-full transition-opacity hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-foreground"
+                >
+                  <UserAvatar
+                    name={bootstrap.current_user.display_name}
+                    email={bootstrap.current_user.email}
+                    size="sm"
+                  />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-60">
+                <DropdownMenuLabel className="flex items-center gap-3 py-2">
+                  <UserAvatar
+                    name={bootstrap.current_user.display_name}
+                    email={bootstrap.current_user.email}
+                  />
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium">
+                      {bootstrap.current_user.display_name || bootstrap.current_user.email}
+                    </div>
+                    {bootstrap.current_user.display_name && bootstrap.current_user.email && (
+                      <div className="truncate text-xs font-normal text-muted-foreground">
+                        {bootstrap.current_user.email}
+                      </div>
+                    )}
+                  </div>
+                </DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onSelect={() => setLocale(locale === 'zh' ? 'en' : 'zh')}>
+                  <Languages className="size-4" />
+                  <span>{locale === 'zh' ? 'English' : '中文'}</span>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onSelect={() => void handleLogout()}>
+                  <LogOut className="size-4" />
+                  <span>{t('nav.signOut')}</span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-8 px-2 text-xs text-muted-foreground hover:text-foreground"
+              title={t('common.langToggleTitle')}
+              aria-label={t('common.langToggleTitle')}
+              onClick={() => setLocale(locale === 'zh' ? 'en' : 'zh')}
+            >
+              <Languages className="size-4" />
+            </Button>
           )}
         </div>
       </AppTopbar>

@@ -564,7 +564,7 @@ func TestRemoteServerEnterpriseCS(t *testing.T) {
 	}
 
 	// 5. Platform admin Device Flow session mints PrincipalHuman (can mutate envs/security via CLI),
-	// whereas scoped AgentToken stays blocked by ActionEnvWrite.
+	// whereas scoped AgentToken stays blocked by ActionEnvWrite & ActionTopologyWrite.
 	if err := aliceClient.DoJSON(ctx, http.MethodPost, "/rpc/v1/environments", map[string]any{
 		"environment": types.Environment{
 			Code:       "qa-blocked",
@@ -572,6 +572,14 @@ func TestRemoteServerEnterpriseCS(t *testing.T) {
 		},
 	}, nil); err == nil {
 		t.Fatalf("agent token must not mutate environments via CLI")
+	}
+	if err := aliceClient.DoJSON(ctx, http.MethodPost, "/rpc/v1/topology", map[string]any{
+		"dry_run": true,
+		"bundle": types.TopologyBundle{
+			GlobalSecurity: &types.GlobalSecurityConfig{ExecTimeoutSec: 30},
+		},
+	}, nil); err == nil {
+		t.Fatalf("agent token must not call /rpc/v1/topology")
 	}
 
 	var adminDevStart types.DeviceCodeStartResponse

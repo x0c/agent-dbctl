@@ -406,12 +406,7 @@ func registerWebAPIRoutes(mux *http.ServeMux, svc *Service) {
 		for _, d := range details {
 			if d.Target.ID == id || d.Target.Ref == id {
 				if svc.IsServerMode() {
-					sysID, sysSlug := targetDetailSystemScope(d)
-					if !requireHTTPAction(w, r, rbac.ActionDBTest, rbac.ResourceScope{
-						SystemID:        sysID,
-						SystemSlug:      sysSlug,
-						EnvironmentCode: d.Target.EnvironmentCode,
-					}) {
+					if !requireHTTPAction(w, r, rbac.ActionDBTest, scopeForTarget(d)) {
 						return
 					}
 				}
@@ -431,12 +426,7 @@ func registerWebAPIRoutes(mux *http.ServeMux, svc *Service) {
 			p := rbac.PrincipalFromContext(r.Context())
 			filtered := make([]types.TargetDetail, 0, len(details))
 			for _, d := range details {
-				sysID, sysSlug := targetDetailSystemScope(d)
-				if rbac.Authorize(p, rbac.ActionDBTest, rbac.ResourceScope{
-					SystemID:        sysID,
-					SystemSlug:      sysSlug,
-					EnvironmentCode: d.Target.EnvironmentCode,
-				}) == nil {
+				if rbac.Authorize(p, rbac.ActionDBTest, scopeForTarget(d)) == nil {
 					filtered = append(filtered, d)
 				}
 			}

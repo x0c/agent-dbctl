@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"strings"
 	"syscall"
@@ -27,11 +28,14 @@ type DialPolicy struct {
 var defaultBlockedNets = mustParseCIDRs([]string{
 	"127.0.0.0/8",
 	"::1/128",
+	"100.64.0.0/10",
 	"169.254.0.0/16",
 	"fe80::/10",
 	"0.0.0.0/8",
 	"224.0.0.0/4",
+	"240.0.0.0/4",
 	"ff00::/8",
+	"64:ff9b::/96",
 })
 
 func mustParseCIDRs(cidrs []string) []*net.IPNet {
@@ -103,6 +107,19 @@ func ipInAny(ip net.IP, nets []*net.IPNet) bool {
 	return false
 }
 
+func parseNetIPAddress(raw string) (net.IP, error) {
+	trimmed := strings.TrimSpace(raw)
+	if ap, err := netip.ParseAddrPort(trimmed); err == nil {
+		addr := ap.Addr().WithZone("").Unmap()
+		return net.IP(addr.AsSlice()), nil
+	}
+	if addr, err := netip.ParseAddr(strings.Trim(trimmed, "[]")); err == nil {
+		addr = addr.WithZone("").Unmap()
+		return net.IP(addr.AsSlice()), nil
+	}
+	return nil, fmt.Errorf("egress blocked: invalid network address %q", raw)
+}
+
 // NewDialer constructs a net.Dialer enforcing post-DNS IP checks before TCP connect.
 func (p DialPolicy) NewDialer() *net.Dialer {
 	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
@@ -110,13 +127,9 @@ func (p DialPolicy) NewDialer() *net.Dialer {
 		return d
 	}
 	d.Control = func(network, address string, _ syscall.RawConn) error {
-		host, _, err := net.SplitHostPort(address)
+		ip, err := parseNetIPAddress(address)
 		if err != nil {
-			host = address
-		}
-		ip := net.ParseIP(strings.Trim(host, "[]"))
-		if ip == nil {
-			return nil
+			return err
 		}
 		return p.CheckIP(ip)
 	}
@@ -157,6 +170,12 @@ func BuildContextWithPolicy(ctx context.Context, np *types.NetworkProfile, basti
 		if pol.RejectProxyAuth && u.User != nil {
 			return DialResult{}, fmt.Errorf("proxy_url must not embed credentials in server mode")
 		}
+		if err := checkDialHostPolicy(ctx, u.Hostname(), pol); err != nil {
+			return DialResult{}, err
+		}
+		if err := checkTargetLiteralPolicy(targetHost, pol); err != nil {
+			return DialResult{}, err
+		}
 		var auth *proxy.Auth
 		if u.User != nil {
 			pw, _ := u.User.Password()
@@ -189,8 +208,14 @@ func BuildContextWithPolicy(ctx context.Context, np *types.NetworkProfile, basti
 		if err := checkDialHostPolicy(ctx, u.Hostname(), pol); err != nil {
 			return DialResult{}, err
 		}
+		if err := checkTargetLiteralPolicy(targetHost, pol); err != nil {
+			return DialResult{}, err
+		}
 		return DialResult{
 			DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+				if err := checkTargetLiteralPolicy(addr, pol); err != nil {
+					return nil, err
+				}
 				return dialHTTPConnectWithDialer(dctx, u, addr, d)
 			},
 			TLSMode:   tlsMode,
@@ -205,6 +230,9 @@ func BuildContextWithPolicy(ctx context.Context, np *types.NetworkProfile, basti
 		if err := checkDialHostPolicy(ctx, np.BastionHost, pol); err != nil {
 			return DialResult{}, err
 		}
+		if err := checkTargetLiteralPolicy(targetHost, pol); err != nil {
+			return DialResult{}, err
+		}
 		return buildSSHTunnelWithDialer(ctx, np, bastionCred, tlsMode, tlsCfg, d)
 
 	default:
@@ -212,12 +240,32 @@ func BuildContextWithPolicy(ctx context.Context, np *types.NetworkProfile, basti
 	}
 }
 
+func checkTargetLiteralPolicy(hostOrAddr string, pol DialPolicy) error {
+	if !pol.EnforceEgressGuard || strings.TrimSpace(hostOrAddr) == "" {
+		return nil
+	}
+	host := strings.TrimSpace(hostOrAddr)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if ip, err := parseNetIPAddress(host); err == nil {
+		return pol.CheckIP(ip)
+	}
+	if strings.Contains(host, "%") {
+		return fmt.Errorf("egress blocked: scoped target host %q", hostOrAddr)
+	}
+	return nil
+}
+
 func checkDialHostPolicy(ctx context.Context, host string, pol DialPolicy) error {
 	if !pol.EnforceEgressGuard || strings.TrimSpace(host) == "" {
 		return nil
 	}
-	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+	if ip, err := parseNetIPAddress(host); err == nil {
 		return pol.CheckIP(ip)
+	}
+	if strings.Contains(host, "%") {
+		return fmt.Errorf("egress blocked: invalid scoped host %q", host)
 	}
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
@@ -240,6 +288,9 @@ func (p *TunnelPool) BuildContextWithPolicy(ctx context.Context, np *types.Netwo
 		return DialResult{}, fmt.Errorf("ssh_tunnel requires explicit bastion credential secret in server mode")
 	}
 	if err := checkDialHostPolicy(ctx, np.BastionHost, pol); err != nil {
+		return DialResult{}, err
+	}
+	if err := checkTargetLiteralPolicy(targetHost, pol); err != nil {
 		return DialResult{}, err
 	}
 	return p.buildContextWithDialer(ctx, np, bastionCred, instanceTLSMode, targetHost, pol.NewDialer())

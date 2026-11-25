@@ -80,6 +80,8 @@ type Service struct {
 
 	rootCtx    context.Context
 	cancelRoot context.CancelFunc
+	wgMu       sync.RWMutex
+	stopping   bool
 	wg         sync.WaitGroup
 
 	opMu      sync.Mutex
@@ -219,12 +221,35 @@ func (s *Service) Done() <-chan struct{} {
 
 // CancelBackground cancels long-lived background streams/waiters at shutdown start.
 func (s *Service) CancelBackground() {
-	s.cancelRoot()
+	s.wgMu.Lock()
+	s.stopping = true
+	if s.cancelRoot != nil {
+		s.cancelRoot()
+	}
+	s.wgMu.Unlock()
+}
+
+func (s *Service) goBackground(fn func(context.Context)) bool {
+	if s == nil {
+		return false
+	}
+	s.wgMu.RLock()
+	if s.stopping || s.rootCtx == nil || s.rootCtx.Err() != nil {
+		s.wgMu.RUnlock()
+		return false
+	}
+	s.wg.Add(1)
+	s.wgMu.RUnlock()
+	go func() {
+		defer s.wg.Done()
+		fn(s.rootCtx)
+	}()
+	return true
 }
 
 // Shutdown gracefully stops background workers, slots, pools, approvals, plugins, and store.
 func (s *Service) Shutdown() {
-	s.cancelRoot()
+	s.CancelBackground()
 	s.approvals.Shutdown()
 	s.wg.Wait()
 	s.slots.Wait()
@@ -632,9 +657,9 @@ func (s *Service) openDriverConn(ctx context.Context, detail types.TargetDetail,
 		}
 	}
 
-	needsBridge := effectiveNet != nil &&
+	needsBridge := s.dialPolicy.EnforceEgressGuard || (effectiveNet != nil &&
 		effectiveNet.Mode != "" &&
-		effectiveNet.Mode != types.NetworkDirect
+		effectiveNet.Mode != types.NetworkDirect)
 
 	connCfg := driver.ConnectionConfig{
 		Engine:          inst.Engine,
@@ -789,22 +814,53 @@ func (s *Service) PingTargets(ctx context.Context, details []types.TargetDetail)
 	return results
 }
 
+func (s *Service) authorizeInstanceAction(ctx context.Context, inst types.Instance, credID string, action rbac.Action) (*types.CredentialProfile, error) {
+	p := rbac.PrincipalFromContext(ctx)
+	if s.IsServerMode() {
+		st := strings.ToLower(strings.TrimSpace(inst.ScopeType))
+		if st == "" || st == "global" {
+			if !rbac.IsPlatformAdmin(p) {
+				return nil, fmt.Errorf("forbidden: action %s on global instance requires platform_admin", action)
+			}
+		} else {
+			if err := rbac.Authorize(p, action, s.scopeForScopedResource(ctx, inst.ScopeType, inst.ScopeID)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	var cp *types.CredentialProfile
+	if strings.TrimSpace(credID) != "" {
+		cp = s.resolveCredentialProfile(ctx, credID)
+		if cp == nil {
+			return nil, fmt.Errorf("%w: credential profile %q not found", store.ErrNotFound, credID)
+		}
+		if s.IsServerMode() {
+			cst := strings.ToLower(strings.TrimSpace(cp.ScopeType))
+			if cst != "" && cst != "global" {
+				if err := rbac.Authorize(p, rbac.ActionCatalogRead, s.scopeForScopedResource(ctx, cp.ScopeType, cp.ScopeID)); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	return cp, nil
+}
+
 // PingInstance tests an instance directly and discovers databases on it.
 func (s *Service) PingInstance(ctx context.Context, instanceID, credID, dbName string) (types.PingResult, error) {
 	inst, err := s.store.GetInstance(ctx, instanceID)
 	if err != nil {
 		return types.PingResult{}, err
 	}
-	if s.IsServerMode() {
-		if authErr := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionDBTest, s.scopeForScopedResource(ctx, inst.ScopeType, inst.ScopeID)); authErr != nil {
-			return types.PingResult{}, authErr
-		}
+	cp, err := s.authorizeInstanceAction(ctx, inst, credID, rbac.ActionDBTest)
+	if err != nil {
+		return types.PingResult{}, err
 	}
 	detail := types.TargetDetail{
 		Target:         types.Target{Ref: inst.Name, DatabaseName: dbName, ROCredentialID: credID},
 		Instance:       &inst,
 		NetworkProfile: s.resolveNetworkProfile(ctx, inst.NetworkProfileID),
-		ROCredential:   s.resolveCredentialProfile(ctx, credID),
+		ROCredential:   cp,
 	}
 	return s.PingTarget(ctx, detail), nil
 }
@@ -815,16 +871,15 @@ func (s *Service) DiscoverInstance(ctx context.Context, instanceID, credID, dbNa
 	if err != nil {
 		return nil, err
 	}
-	if s.IsServerMode() {
-		if authErr := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionInstanceDiscover, s.scopeForScopedResource(ctx, inst.ScopeType, inst.ScopeID)); authErr != nil {
-			return nil, authErr
-		}
+	cp, err := s.authorizeInstanceAction(ctx, inst, credID, rbac.ActionInstanceDiscover)
+	if err != nil {
+		return nil, err
 	}
 	detail := types.TargetDetail{
 		Target:         types.Target{Ref: inst.Name, DatabaseName: dbName, ROCredentialID: credID},
 		Instance:       &inst,
 		NetworkProfile: s.resolveNetworkProfile(ctx, inst.NetworkProfileID),
-		ROCredential:   s.resolveCredentialProfile(ctx, credID),
+		ROCredential:   cp,
 	}
 	connCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -1126,11 +1181,11 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 		s.broadcast(Event{Type: "operation_updated", Data: op})
 
 		// Spawn waiter to react when approval expires/resolves asynchronously.
-		s.wg.Add(1)
-		go func(opSnapshot types.Operation, targetDetail types.TargetDetail, evaluation types.PolicyEvaluation, approvalID string, maxR int, maxB int64, tSec int) {
-			defer s.wg.Done()
-			s.driveApprovalLifecycle(opSnapshot, targetDetail, evaluation, approvalID, maxR, maxB, tSec)
-		}(op, detail, eval, app.ID, req.MaxRows, req.MaxBytes, req.TimeoutSec)
+		if !s.goBackground(func(context.Context) {
+			s.driveApprovalLifecycle(op, detail, eval, app.ID, req.MaxRows, req.MaxBytes, req.TimeoutSec)
+		}) {
+			s.driveApprovalLifecycle(op, detail, eval, app.ID, req.MaxRows, req.MaxBytes, req.TimeoutSec)
+		}
 
 		if !req.Wait {
 			resp := s.responseFromOperation(op, eval)
@@ -1236,9 +1291,7 @@ func (s *Service) runExecutionWithConn(parentCtx context.Context, op types.Opera
 	s.setOpCancel(op.ID, cancel)
 	stopLease := make(chan struct{})
 	if s.IsServerMode() {
-		s.wg.Add(1)
-		go func(opID, nodeID string) {
-			defer s.wg.Done()
+		s.goBackground(func(context.Context) {
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -1248,13 +1301,13 @@ func (s *Service) runExecutionWithConn(parentCtx context.Context, op types.Opera
 				case <-execCtx.Done():
 					return
 				case <-ticker.C:
-					if cancelReq, _ := s.store.RenewOperationLease(execCtx, opID, nodeID, 45*time.Second); cancelReq {
+					if cancelReq, _ := s.store.RenewOperationLease(execCtx, op.ID, s.nodeID, 45*time.Second); cancelReq {
 						cancel()
 						return
 					}
 				}
 			}
-		}(op.ID, s.nodeID)
+		})
 	}
 	defer func() {
 		close(stopLease)
@@ -1565,12 +1618,7 @@ func (s *Service) TestRiskPattern(ctx context.Context, req types.PatternTestRequ
 			return types.PatternTestResult{}, err
 		}
 		if s.IsServerMode() {
-			sysID, sysSlug := targetDetailSystemScope(detail)
-			if authErr := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionCatalogRead, rbac.ResourceScope{
-				SystemID:        sysID,
-				SystemSlug:      sysSlug,
-				EnvironmentCode: detail.Target.EnvironmentCode,
-			}); authErr != nil {
+			if authErr := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionCatalogRead, scopeForTarget(detail)); authErr != nil {
 				return types.PatternTestResult{}, authErr
 			}
 		}

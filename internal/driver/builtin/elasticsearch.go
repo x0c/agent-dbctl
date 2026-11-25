@@ -90,7 +90,12 @@ func buildESConn(cfg driver.ConnectionConfig) *esConn {
 	ec := &esConn{
 		baseURL:   baseURL,
 		transport: tr,
-		client:    &http.Client{Transport: tr},
+		client: &http.Client{
+			Transport: tr,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		cfg:       cfg,
 		closeHook: driver.CloseOnce(cfg.CloseHook),
 	}

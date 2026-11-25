@@ -462,6 +462,7 @@ func (s *Store) CreateOIDCAuthState(ctx context.Context, st types.OIDCAuthState)
 	if st.CreatedAtUTC == "" {
 		st.CreatedAtUTC = now
 	}
+	_, _ = s.dbExec(ctx, `DELETE FROM oidc_auth_states WHERE expires_at_utc < ?`, now)
 	_, err := s.dbExec(ctx, `
 		INSERT INTO oidc_auth_states(state_hash, nonce, pkce_verifier, return_to, expires_at_utc, created_at_utc)
 		VALUES (?, ?, ?, ?, ?, ?)`,
@@ -473,9 +474,12 @@ func (s *Store) CreateOIDCAuthState(ctx context.Context, st types.OIDCAuthState)
 func (s *Store) ConsumeOIDCAuthState(ctx context.Context, stateHash string) (types.OIDCAuthState, error) {
 	var st types.OIDCAuthState
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		row := s.txQueryRow(ctx, tx, `
-			SELECT state_hash, nonce, pkce_verifier, return_to, expires_at_utc, created_at_utc
-			FROM oidc_auth_states WHERE state_hash = ?`, stateHash)
+		q := `SELECT state_hash, nonce, pkce_verifier, return_to, expires_at_utc, created_at_utc
+			FROM oidc_auth_states WHERE state_hash = ?`
+		if s.isPG() {
+			q += ` FOR UPDATE`
+		}
+		row := s.txQueryRow(ctx, tx, q, stateHash)
 		err := row.Scan(&st.StateHash, &st.Nonce, &st.PKCEVerifier, &st.ReturnTo, &st.ExpiresAtUTC, &st.CreatedAtUTC)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
@@ -483,8 +487,12 @@ func (s *Store) ConsumeOIDCAuthState(ctx context.Context, stateHash string) (typ
 		if err != nil {
 			return err
 		}
-		if _, delErr := s.txExec(ctx, tx, `DELETE FROM oidc_auth_states WHERE state_hash = ?`, stateHash); delErr != nil {
+		delRes, delErr := s.txExec(ctx, tx, `DELETE FROM oidc_auth_states WHERE state_hash = ?`, stateHash)
+		if delErr != nil {
 			return delErr
+		}
+		if n, _ := delRes.RowsAffected(); n == 0 {
+			return ErrNotFound
 		}
 		if exp, ok := parseUTCTime(st.ExpiresAtUTC); !ok || time.Now().UTC().After(exp) {
 			return ErrNotFound
