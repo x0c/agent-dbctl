@@ -256,18 +256,18 @@ func TestRemoteServerEnterpriseCS(t *testing.T) {
 			SafetyTier:     types.SafetyTierGuarded,
 			AccessLevel:    types.AccessReadWrite,
 			User:           "orders_user",
-			SecretValue: "s3cr3t-orders-pass",
+			SecretValue:    "orders-test-pw",
 			SecretProvided: true,
 		},
 		{
-			Engine:   "sqlite",
-			Host:     billingDB,
-			Database: billingDB,
-			System:   "billing",
-			Env:      "prod",
-			SafetyTier: types.SafetyTierStrict,
-			User:     "billing_user",
-			SecretValue: "s3cr3t-billing-pass",
+			Engine:         "sqlite",
+			Host:           billingDB,
+			Database:       billingDB,
+			System:         "billing",
+			Env:            "prod",
+			SafetyTier:     types.SafetyTierStrict,
+			User:           "billing_user",
+			SecretValue:    "billing-test-pw",
 			SecretProvided: true,
 		},
 	} {
@@ -293,7 +293,7 @@ func TestRemoteServerEnterpriseCS(t *testing.T) {
 		t.Fatalf("read encrypted_secrets: %v", err)
 	}
 	_ = rawDB.Close()
-	if encCipher == "" || strings.Contains(encCipher, "s3cr3t") {
+	if encCipher == "" || strings.Contains(encCipher, "orders-test-pw") || strings.Contains(encCipher, "billing-test-pw") {
 		t.Fatalf("encrypted_secrets leaked plaintext or was empty: %q", encCipher)
 	}
 

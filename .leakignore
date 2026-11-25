@@ -2,3 +2,6 @@
 fp:36e83d2e597557c2
 # Confirmed synthetic Git remote credential-stripping unit-test fixture in f5ec5ee (replaced in follow-up commit)
 fp:9f05ac9c15e9ff4f
+# Confirmed synthetic master-key & test-password fixtures in dcce1ac (replaced in follow-up commit)
+fp:7dc83093af4c23e9
+fp:99922593d9d5ddf8

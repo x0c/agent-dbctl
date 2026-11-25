@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -84,7 +85,7 @@ func TestServerConfigValidation(t *testing.T) {
 		t.Fatalf("ResolvePaths: %v", err)
 	}
 
-	keyHex := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	keyHex := strings.Repeat("01234567", 8)
 	cfgPath := filepath.Join(tmp, "server.yaml")
 	yamlBody := `
 listen_addr: "127.0.0.1:8080"
