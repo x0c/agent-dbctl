@@ -1,4 +1,4 @@
-import { AdminShell, type AdminNavItem, Badge, Toaster, toast } from './ui'
+import { AdminShell, type AdminNavItem, Badge, Toaster, toast } from '@x0c/ui'
 import { Cpu, Database, ScrollText, ShieldCheck, ShieldAlert } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api, type BootstrapPayload, type DisplayCatalog } from './api'

@@ -18,7 +18,7 @@ import {
   SelectValue,
   Switch,
   toast,
-} from '../ui'
+} from '@x0c/ui'
 import { Plus, RefreshCw, Save } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import {

@@ -9,7 +9,7 @@ import {
   Panel,
   fmtDateTime,
   toast,
-} from '../ui'
+} from '@x0c/ui'
 import { AlertTriangle, Check, Clock, RefreshCw, ShieldAlert, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import {

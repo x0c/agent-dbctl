@@ -8,7 +8,7 @@ import {
   Panel,
   StatusDot,
   toast,
-} from '../ui'
+} from '@x0c/ui'
 import { RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api, type DiscoveredPlugin, type DriverMetadata } from '../api'

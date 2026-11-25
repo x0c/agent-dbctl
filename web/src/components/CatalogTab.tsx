@@ -29,7 +29,7 @@ import {
   TabsTrigger,
   Textarea,
   toast,
-} from '../ui'
+} from '@x0c/ui'
 import { Download, FolderGit2, Plus, RefreshCw, Search, Upload, Wifi } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import {
