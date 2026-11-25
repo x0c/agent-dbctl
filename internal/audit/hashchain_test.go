@@ -1,6 +1,8 @@
 package audit_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -17,6 +19,35 @@ func TestComputeEntryHashDeterministic(t *testing.T) {
 	h3 := audit.ComputeEntryHash(2, audit.GenesisPrevHash, "alice", "operation.submit", "tgt_1", "op_1", `{"a":1}`, "2026-11-25T00:00:00Z")
 	if h1 == h3 {
 		t.Fatalf("expected seq change to alter hash")
+	}
+
+	// Verify fast encoder matches encoding/json byte-for-byte on special characters (<, >, &, quotes, unicode, control chars).
+	specialPayload := `{"msg":"hi <tag> & \"quoted\" \n \u2028 日本語"}`
+	type legacyHashInput struct {
+		Seq          int64  `json:"seq"`
+		PrevHash     string `json:"prev_hash"`
+		Actor        string `json:"actor"`
+		Action       string `json:"action"`
+		TargetID     string `json:"target_id"`
+		OperationID  string `json:"operation_id"`
+		PayloadJSON  string `json:"payload_json"`
+		CreatedAtUTC string `json:"created_at_utc"`
+	}
+	raw, _ := json.Marshal(legacyHashInput{
+		Seq:          99,
+		PrevHash:     audit.GenesisPrevHash,
+		Actor:        "user<admin>&",
+		Action:       `op\"test`,
+		TargetID:     "tgt_1",
+		OperationID:  "op_1",
+		PayloadJSON:  specialPayload,
+		CreatedAtUTC: "2026-11-25T00:00:00Z",
+	})
+	wantSum := sha256.Sum256(raw)
+	want := hex.EncodeToString(wantSum[:])
+	got := audit.ComputeEntryHash(99, audit.GenesisPrevHash, "user<admin>&", `op\"test`, "tgt_1", "op_1", specialPayload, "2026-11-25T00:00:00Z")
+	if got != want {
+		t.Fatalf("ComputeEntryHash mismatch: got %q, want %q", got, want)
 	}
 }
 

@@ -42,6 +42,17 @@ func (e *TargetLookupError) Error() string {
 
 // BuildTargetDetails enriches all targets with system, env, instance, network, credentials (secret-free), and effective policy.
 func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string, gitRemotes ...string) ([]types.TargetDetail, error) {
+	return s.buildTargetDetails(ctx, workspaceCWD, true, gitRemotes...)
+}
+
+func (s *Service) buildTargetDetails(ctx context.Context, workspaceCWD string, includeHasSecret bool, gitRemotes ...string) ([]types.TargetDetail, error) {
+	targets, err := s.store.ListTargets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(targets) == 0 {
+		return nil, nil
+	}
 	global, err := s.store.GetGlobalSecurityConfig(ctx)
 	if err != nil {
 		return nil, err
@@ -63,10 +74,6 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string, g
 		return nil, err
 	}
 	insts, err := s.store.ListInstances(ctx)
-	if err != nil {
-		return nil, err
-	}
-	targets, err := s.store.ListTargets(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +100,9 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string, g
 	}
 	credMap := make(map[string]types.CredentialProfile, len(creds))
 	for _, item := range creds {
-		item.HasSecret = s.hasCredentialSecret(ctx, item)
+		if includeHasSecret {
+			item.HasSecret = s.hasCredentialSecret(ctx, item)
+		}
 		credMap[item.ID] = item
 	}
 	instMap := make(map[string]types.Instance, len(insts))
@@ -103,6 +112,21 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string, g
 
 	normRemotes := config.NormalizeGitRemotes(gitRemotes)
 	allowLocalPathMatch := !s.IsServerMode()
+	sysRankCache := make(map[string]int, len(systems))
+	getSysRank := func(sys types.System) int {
+		if r, ok := sysRankCache[sys.ID]; ok {
+			return r
+		}
+		r := 0
+		if allowLocalPathMatch && matchesWorkspace(workspaceCWD, sys.WorkspacePaths) {
+			r = 2
+		} else if matchesGitRemotes(normRemotes, sys.GitRemotes) {
+			r = 1
+		}
+		sysRankCache[sys.ID] = r
+		return r
+	}
+
 	p := rbac.PrincipalFromContext(ctx)
 	type rankedTarget struct {
 		detail types.TargetDetail
@@ -117,26 +141,18 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string, g
 			sysCopy := sys
 			ownerPtr = &sysCopy
 			d.OwnerSystem = ownerPtr
-			if allowLocalPathMatch && matchesWorkspace(workspaceCWD, sys.WorkspacePaths) {
+			if sr := getSysRank(sys); sr > 0 {
 				d.WorkspaceMatch = true
-				rank = 2
-			} else if matchesGitRemotes(normRemotes, sys.GitRemotes) {
-				d.WorkspaceMatch = true
-				rank = 1
+				rank = sr
 			}
 		}
 		for _, lid := range t.LinkedSystemIDs {
 			if lsys, ok := sysMap[lid]; ok {
 				d.LinkedSystems = append(d.LinkedSystems, lsys)
-				if allowLocalPathMatch && matchesWorkspace(workspaceCWD, lsys.WorkspacePaths) {
+				if sr := getSysRank(lsys); sr > 0 {
 					d.WorkspaceMatch = true
-					if rank < 2 {
-						rank = 2
-					}
-				} else if matchesGitRemotes(normRemotes, lsys.GitRemotes) {
-					d.WorkspaceMatch = true
-					if rank < 1 {
-						rank = 1
+					if sr > rank {
+						rank = sr
 					}
 				}
 			}
@@ -402,7 +418,7 @@ func BuildEngineGuides(drivers []types.DriverMetadata) []EngineGuide {
 
 // ListTargetsFiltered filters targets and populates recovery hints when zero hits occur.
 func (s *Service) ListTargetsFiltered(ctx context.Context, f ListFilter) ([]types.TargetDetail, []string, []string, error) {
-	all, err := s.BuildTargetDetails(ctx, f.WorkspaceCWD, f.WorkspaceGitRemotes...)
+	all, err := s.buildTargetDetails(ctx, f.WorkspaceCWD, false, f.WorkspaceGitRemotes...)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -487,17 +503,32 @@ func (s *Service) ListTargetsFiltered(ctx context.Context, f ListFilter) ([]type
 
 // ResolveTarget resolves ref/alias using tiered matching: exact > prefix > substring.
 func (s *Service) ResolveTarget(ctx context.Context, query, workspaceCWD string, gitRemotes ...string) (types.TargetDetail, error) {
-	all, err := s.BuildTargetDetails(ctx, workspaceCWD, gitRemotes...)
-	if err != nil {
-		return types.TargetDetail{}, err
-	}
 	q := strings.TrimSpace(query)
 	if q == "" {
+		all, err := s.buildTargetDetails(ctx, workspaceCWD, false, gitRemotes...)
+		if err != nil {
+			return types.TargetDetail{}, err
+		}
 		return types.TargetDetail{}, &TargetLookupError{
 			Code:         types.ErrCodeInvalidUsage,
 			Message:      "Target database identifier is required.",
 			SimilarNames: topTargetNames(all, 8),
 		}
+	}
+
+	targets, err := s.store.ListTargets(ctx)
+	if err != nil {
+		return types.TargetDetail{}, err
+	}
+	if !s.IsServerMode() {
+		if matched, singleOK := matchSingleTargetRecord(targets, q); singleOK {
+			return s.enrichSingleTargetDetail(ctx, matched, workspaceCWD, gitRemotes...)
+		}
+	}
+
+	all, err := s.buildTargetDetails(ctx, workspaceCWD, false, gitRemotes...)
+	if err != nil {
+		return types.TargetDetail{}, err
 	}
 	ql := strings.ToLower(q)
 
@@ -562,6 +593,153 @@ func (s *Service) ResolveTarget(ctx context.Context, query, workspaceCWD string,
 		Message:      "Database target " + q + " was not found.",
 		SimilarNames: suggestSimilarTargets(all, ql, 5),
 	}
+}
+
+func matchSingleTargetRecord(targets []types.Target, q string) (types.Target, bool) {
+	ql := strings.ToLower(q)
+
+	var exactIdx = -1
+	for i := range targets {
+		t := &targets[i]
+		if strings.EqualFold(t.Ref, q) || (t.Alias != "" && strings.EqualFold(t.Alias, q)) || strings.EqualFold(t.ID, q) {
+			if exactIdx >= 0 {
+				return types.Target{}, false
+			}
+			exactIdx = i
+		}
+	}
+	if exactIdx >= 0 {
+		return targets[exactIdx], true
+	}
+
+	var prefixIdx = -1
+	for i := range targets {
+		t := &targets[i]
+		if strings.HasPrefix(strings.ToLower(t.Ref), ql) || (t.Alias != "" && strings.HasPrefix(strings.ToLower(t.Alias), ql)) {
+			if prefixIdx >= 0 {
+				return types.Target{}, false
+			}
+			prefixIdx = i
+		}
+	}
+	if prefixIdx >= 0 {
+		return targets[prefixIdx], true
+	}
+
+	var subIdx = -1
+	for i := range targets {
+		t := &targets[i]
+		if strings.Contains(strings.ToLower(t.Ref), ql) ||
+			(t.Alias != "" && strings.Contains(strings.ToLower(t.Alias), ql)) ||
+			strings.Contains(strings.ToLower(t.DatabaseName), ql) {
+			if subIdx >= 0 {
+				return types.Target{}, false
+			}
+			subIdx = i
+		}
+	}
+	if subIdx >= 0 {
+		return targets[subIdx], true
+	}
+	return types.Target{}, false
+}
+
+func (s *Service) enrichSingleTargetDetail(ctx context.Context, t types.Target, workspaceCWD string, gitRemotes ...string) (types.TargetDetail, error) {
+	global, err := s.store.GetGlobalSecurityConfig(ctx)
+	if err != nil {
+		return types.TargetDetail{}, err
+	}
+	systems, err := s.store.ListSystems(ctx)
+	if err != nil {
+		return types.TargetDetail{}, err
+	}
+	envs, err := s.store.ListEnvironments(ctx)
+	if err != nil {
+		return types.TargetDetail{}, err
+	}
+	policies, err := s.store.ListPolicies(ctx)
+	if err != nil {
+		return types.TargetDetail{}, err
+	}
+	patternRules, err := s.store.ListRiskPatternRules(ctx)
+	if err != nil {
+		return types.TargetDetail{}, err
+	}
+
+	d := types.TargetDetail{Target: t}
+	normRemotes := config.NormalizeGitRemotes(gitRemotes)
+	allowLocalPathMatch := !s.IsServerMode()
+
+	var ownerPtr *types.System
+	var linkedNeed map[string]struct{}
+	if len(t.LinkedSystemIDs) > 0 {
+		linkedNeed = make(map[string]struct{}, len(t.LinkedSystemIDs))
+		for _, lid := range t.LinkedSystemIDs {
+			linkedNeed[lid] = struct{}{}
+		}
+	}
+	for i := range systems {
+		sys := systems[i]
+		if sys.ID == t.OwnerSystemID {
+			sysCopy := sys
+			ownerPtr = &sysCopy
+			d.OwnerSystem = ownerPtr
+			if (allowLocalPathMatch && matchesWorkspace(workspaceCWD, sys.WorkspacePaths)) || matchesGitRemotes(normRemotes, sys.GitRemotes) {
+				d.WorkspaceMatch = true
+			}
+		}
+		if _, ok := linkedNeed[sys.ID]; ok {
+			d.LinkedSystems = append(d.LinkedSystems, sys)
+			if !d.WorkspaceMatch && ((allowLocalPathMatch && matchesWorkspace(workspaceCWD, sys.WorkspacePaths)) || matchesGitRemotes(normRemotes, sys.GitRemotes)) {
+				d.WorkspaceMatch = true
+			}
+		}
+	}
+
+	var envPtr *types.Environment
+	for i := range envs {
+		if envs[i].Code == t.EnvironmentCode {
+			envCopy := envs[i]
+			envPtr = &envCopy
+			d.Environment = envPtr
+			break
+		}
+	}
+
+	if inst, err := s.store.GetInstance(ctx, t.InstanceID); err == nil {
+		instCopy := inst
+		d.Instance = &instCopy
+		if inst.NetworkProfileID != "" {
+			d.NetworkProfile = s.resolveNetworkProfile(ctx, inst.NetworkProfileID)
+		}
+	}
+
+	if t.ROCredentialID != "" || t.RWCredentialID != "" {
+		if creds, err := s.store.ListCredentialProfiles(ctx); err == nil {
+			for i := range creds {
+				cp := creds[i]
+				if cp.ID == t.ROCredentialID {
+					cpCopy := cp
+					d.ROCredential = &cpCopy
+				}
+				if cp.ID == t.RWCredentialID {
+					cpCopy := cp
+					d.RWCredential = &cpCopy
+				}
+			}
+		}
+	}
+
+	d.EffectivePolicy = policy.ResolveEffectivePolicyWithSystems(global, envPtr, ownerPtr, d.LinkedSystems, t, policies)
+	if d.Instance != nil {
+		eng := d.Instance.Engine
+		fam := classify.EngineFamily(eng)
+		if drv, ok := s.drivers.Get(eng); ok {
+			fam = drv.Metadata().Family
+		}
+		d.EffectivePolicy.PatternRules = policy.ResolveEffectivePatternRulesWithSystems(envPtr, ownerPtr, d.LinkedSystems, t, eng, fam, patternRules)
+	}
+	return d, nil
 }
 
 func fmtAmbiguousMsg(q string, cands []types.TargetDetail) string {

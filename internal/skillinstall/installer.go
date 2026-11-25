@@ -168,28 +168,89 @@ func DetectRuntimeRoots() ([]RuntimeRoot, error) {
 	}
 
 	out := make([]RuntimeRoot, 0, len(candidates))
-	for _, c := range candidates {
+	needPathLookup := make([]int, 0, len(candidates))
+	for i, c := range candidates {
 		root := c.root
 		avail := isDir(c.baseDir) || isDir(root)
-		if !avail && c.cliBinary != "" {
-			if _, lookErr := exec.LookPath(c.cliBinary); lookErr == nil {
-				avail = true
-			}
-		}
 		if c.useShared && sharedExists {
 			root = shared
 			avail = true
 		}
-		resolved := resolveSymlinkPath(root)
+		if !avail && c.cliBinary != "" {
+			needPathLookup = append(needPathLookup, i)
+		}
 		out = append(out, RuntimeRoot{
-			Runtime:      c.name,
-			Root:         root,
-			ResolvedRoot: resolved,
-			Available:    avail,
-			RootExists:   isDir(resolved),
+			Runtime:   c.name,
+			Root:      root,
+			Available: avail,
 		})
 	}
+	if len(needPathLookup) > 0 {
+		needed := make(map[string]int, len(needPathLookup))
+		for _, idx := range needPathLookup {
+			needed[candidates[idx].cliBinary] = idx
+		}
+		for _, idx := range findBinariesInPath(needed) {
+			out[idx].Available = true
+		}
+	}
+	for i := range out {
+		resolved := resolveSymlinkPath(out[i].Root)
+		out[i].ResolvedRoot = resolved
+		out[i].RootExists = isDir(resolved)
+	}
 	return out, nil
+}
+
+func findBinariesInPath(needed map[string]int) []int {
+	if len(needed) == 0 {
+		return nil
+	}
+	// On Windows or non-standard PATHEXT setups, delegate to exec.LookPath per missing binary.
+	if os.Getenv("PATHEXT") != "" {
+		var found []int
+		for bin, idx := range needed {
+			if _, err := exec.LookPath(bin); err == nil {
+				found = append(found, idx)
+			}
+		}
+		return found
+	}
+	pathEnv := os.Getenv("PATH")
+	if pathEnv == "" {
+		return nil
+	}
+	var found []int
+	remaining := len(needed)
+	for _, dir := range filepath.SplitList(pathEnv) {
+		if dir == "" {
+			dir = "."
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			idx, want := needed[e.Name()]
+			if !want {
+				continue
+			}
+			info, err := os.Stat(filepath.Join(dir, e.Name()))
+			if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+				continue
+			}
+			found = append(found, idx)
+			delete(needed, e.Name())
+			remaining--
+			if remaining == 0 {
+				return found
+			}
+		}
+	}
+	return found
 }
 
 // resolveSymlinkPath resolves symlinks even if trailing path segments do not yet exist.
@@ -253,8 +314,27 @@ func deduplicateTargets(roots []RuntimeRoot, filterRuntime string) []TargetGroup
 }
 
 func targetsDigest(roots []RuntimeRoot) string {
-	b, _ := json.Marshal(roots)
-	return contentHash(string(b))
+	h := sha256.New()
+	for _, r := range roots {
+		_, _ = h.Write([]byte(r.Runtime))
+		_, _ = h.Write([]byte{'|'})
+		_, _ = h.Write([]byte(r.Root))
+		_, _ = h.Write([]byte{'|'})
+		_, _ = h.Write([]byte(r.ResolvedRoot))
+		_, _ = h.Write([]byte{'|'})
+		if r.Available {
+			_, _ = h.Write([]byte{'1'})
+		} else {
+			_, _ = h.Write([]byte{'0'})
+		}
+		if r.RootExists {
+			_, _ = h.Write([]byte{'1'})
+		} else {
+			_, _ = h.Write([]byte{'0'})
+		}
+		_, _ = h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:24]
 }
 
 func manifestFilePath() (string, error) {

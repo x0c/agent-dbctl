@@ -14,8 +14,10 @@ import (
 
 // FileStore stores secrets in a 0600 JSON file inside a 0700 directory using atomic renames.
 type FileStore struct {
-	path string
-	mu   sync.Mutex
+	path       string
+	mu         sync.Mutex
+	cachedInfo os.FileInfo
+	cachedMap  map[string]string
 }
 
 // NewFileStore creates an isolated 0600 file-backed secret store.
@@ -28,17 +30,25 @@ func (f *FileStore) Name() string {
 }
 
 func (f *FileStore) loadLocked() (map[string]string, error) {
+	info, statErr := os.Lstat(f.path)
+	if statErr == nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() && info.Mode().Perm()&0o077 == 0 {
+		if f.cachedInfo != nil && os.SameFile(f.cachedInfo, info) && info.ModTime().Equal(f.cachedInfo.ModTime()) && info.Size() == f.cachedInfo.Size() {
+			return f.cachedMap, nil
+		}
+	}
 	if err := config.EnsurePrivateDir(filepath.Dir(f.path)); err != nil {
 		return nil, err
 	}
 	err := config.ValidateRegularFile(f.path)
 	if errors.Is(err, os.ErrNotExist) {
+		f.cachedInfo = nil
+		f.cachedMap = nil
 		return map[string]string{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	info, err := os.Stat(f.path)
+	info, err = os.Stat(f.path)
 	if err != nil {
 		return nil, err
 	}
@@ -52,12 +62,17 @@ func (f *FileStore) loadLocked() (map[string]string, error) {
 		return nil, err
 	}
 	if len(raw) == 0 {
-		return map[string]string{}, nil
+		m := map[string]string{}
+		f.cachedInfo = info
+		f.cachedMap = m
+		return m, nil
 	}
 	m := map[string]string{}
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, fmt.Errorf("parse secret file: %w", err)
 	}
+	f.cachedInfo = info
+	f.cachedMap = m
 	return m, nil
 }
 
@@ -99,6 +114,13 @@ func (f *FileStore) saveLocked(m map[string]string) error {
 		return err
 	}
 	cleanup = false
+	if info, err := os.Stat(f.path); err == nil {
+		f.cachedInfo = info
+		f.cachedMap = m
+	} else {
+		f.cachedInfo = nil
+		f.cachedMap = nil
+	}
 	return nil
 }
 

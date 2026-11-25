@@ -6,37 +6,65 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 )
 
 const GenesisPrevHash = "0000000000000000000000000000000000000000000000000000000000000000"
 
-type hashInput struct {
-	Seq          int64  `json:"seq"`
-	PrevHash     string `json:"prev_hash"`
-	Actor        string `json:"actor"`
-	Action       string `json:"action"`
-	TargetID     string `json:"target_id"`
-	OperationID  string `json:"operation_id"`
-	PayloadJSON  string `json:"payload_json"`
-	CreatedAtUTC string `json:"created_at_utc"`
+var hashBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 512)
+		return &b
+	},
 }
 
 // ComputeEntryHash produces a deterministic SHA-256 hash without ambiguous separators.
 func ComputeEntryHash(seq int64, prevHash, actor, action, targetID, operationID, payloadJSON, createdAtUTC string) string {
-	b, _ := json.Marshal(hashInput{
-		Seq:          seq,
-		PrevHash:     prevHash,
-		Actor:        actor,
-		Action:       action,
-		TargetID:     targetID,
-		OperationID:  operationID,
-		PayloadJSON:  payloadJSON,
-		CreatedAtUTC: createdAtUTC,
-	})
-	sum := sha256.Sum256(b)
+	bp := hashBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+
+	buf = append(buf, `{"seq":`...)
+	buf = strconv.AppendInt(buf, seq, 10)
+	buf = append(buf, `,"prev_hash":`...)
+	buf = appendJSONString(buf, prevHash)
+	buf = append(buf, `,"actor":`...)
+	buf = appendJSONString(buf, actor)
+	buf = append(buf, `,"action":`...)
+	buf = appendJSONString(buf, action)
+	buf = append(buf, `,"target_id":`...)
+	buf = appendJSONString(buf, targetID)
+	buf = append(buf, `,"operation_id":`...)
+	buf = appendJSONString(buf, operationID)
+	buf = append(buf, `,"payload_json":`...)
+	buf = appendJSONString(buf, payloadJSON)
+	buf = append(buf, `,"created_at_utc":`...)
+	buf = appendJSONString(buf, createdAtUTC)
+	buf = append(buf, '}')
+
+	sum := sha256.Sum256(buf)
+	if cap(buf) <= 64*1024 {
+		*bp = buf
+		hashBufPool.Put(bp)
+	}
 	return hex.EncodeToString(sum[:])
+}
+
+// appendJSONString appends s encoded identically to encoding/json.Marshal(s).
+func appendJSONString(dst []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c >= 0x80 || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			b, _ := json.Marshal(s)
+			return append(dst, b...)
+		}
+	}
+	dst = append(dst, '"')
+	dst = append(dst, s...)
+	dst = append(dst, '"')
+	return dst
 }
 
 var (
@@ -139,17 +167,53 @@ func RedactQuery(raw string) string {
 	}
 
 	masked := redactLexLiterals(raw)
-	masked = uriPasswordRe.ReplaceAllString(masked, `$1:***@`)
-	masked = redactRedisAuth(masked)
-	masked = redisACLLineRe.ReplaceAllStringFunc(masked, func(cmd string) string {
-		return redisACLTokenRe.ReplaceAllString(cmd, `$1$2***`)
-	})
-	masked = redisConfigPassRe.ReplaceAllString(masked, `$1***`)
-	masked = sqlIdentifiedByRe.ReplaceAllString(masked, `$1***`)
-	masked = sqlWithPassRe.ReplaceAllString(masked, `$1***`)
-	masked = sqlPasswordEqRe.ReplaceAllString(masked, `$1***`)
-	masked = sqlSetPasswordRe.ReplaceAllString(masked, `$1***`)
+	if strings.Contains(masked, "://") {
+		masked = uriPasswordRe.ReplaceAllString(masked, `$1:***@`)
+	}
+	if containsFoldASCII(masked, "auth") {
+		masked = redactRedisAuth(masked)
+	}
+	if containsFoldASCII(masked, "acl") {
+		masked = redisACLLineRe.ReplaceAllStringFunc(masked, func(cmd string) string {
+			return redisACLTokenRe.ReplaceAllString(cmd, `$1$2***`)
+		})
+	}
+	if containsFoldASCII(masked, "config") {
+		masked = redisConfigPassRe.ReplaceAllString(masked, `$1***`)
+	}
+	if containsFoldASCII(masked, "identified") {
+		masked = sqlIdentifiedByRe.ReplaceAllString(masked, `$1***`)
+	}
+	if containsFoldASCII(masked, "password") {
+		masked = sqlWithPassRe.ReplaceAllString(masked, `$1***`)
+		masked = sqlPasswordEqRe.ReplaceAllString(masked, `$1***`)
+		masked = sqlSetPasswordRe.ReplaceAllString(masked, `$1***`)
+	}
 	return masked
+}
+
+func containsFoldASCII(s, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	if len(s) < len(sub) {
+		return false
+	}
+	firstLo := sub[0]
+	firstHi := firstLo
+	if firstLo >= 'a' && firstLo <= 'z' {
+		firstHi = firstLo - ('a' - 'A')
+	}
+	limit := len(s) - len(sub)
+	for i := 0; i <= limit; i++ {
+		if s[i] != firstLo && s[i] != firstHi {
+			continue
+		}
+		if strings.EqualFold(s[i:i+len(sub)], sub) {
+			return true
+		}
+	}
+	return false
 }
 
 func tryRedactJSON(raw string) (string, bool) {

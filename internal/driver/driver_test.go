@@ -2,6 +2,7 @@ package driver_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -48,6 +49,30 @@ func TestRowBufferMaxBytesWithUnlimitedRows(t *testing.T) {
 	}
 	if buf.LookaheadRows != 1 {
 		t.Fatalf("expected LookaheadRows=1, got %d", buf.LookaheadRows)
+	}
+}
+
+func TestRowBufferReturnedBytesExactParity(t *testing.T) {
+	rows := []any{
+		[]any{1, int64(42), "plain-ascii", true, false, nil},
+		[]any{"<html&tag>", "quote\"slash\\", "日本語", float64(3.14159)},
+		[]any{},
+		map[string]any{"k": "v<1>&2"},
+	}
+	var wantTotal int64
+	buf := driver.RowBuffer{MaxRows: 100, MaxBytes: 1 << 20}
+	for i, r := range rows {
+		raw, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantTotal += int64(len(raw))
+		if !buf.TryAcceptRow(r) {
+			t.Fatalf("row %d unexpectedly rejected", i)
+		}
+	}
+	if buf.ReturnedBytes != wantTotal {
+		t.Fatalf("ReturnedBytes=%d, want %d", buf.ReturnedBytes, wantTotal)
 	}
 }
 

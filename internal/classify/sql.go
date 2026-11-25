@@ -360,11 +360,18 @@ func classifySQLTokens(rawTokens []string, snippet string) types.StatementSummar
 	}
 
 	upper := make([]string, len(rawTokens))
+	hasPunct := false
 	for i, t := range rawTokens {
+		if t == "," || t == "." || t == ";" {
+			hasPunct = true
+		}
 		upper[i] = strings.ToUpper(t)
 	}
 	// Keyword-only view (without "," or ".") for sequence checks like FOR UPDATE / CROSS JOIN.
-	kwUpper := filterPunctuation(upper)
+	kwUpper := upper
+	if hasPunct {
+		kwUpper = filterPunctuation(upper)
+	}
 	if len(kwUpper) == 0 {
 		return types.StatementSummary{
 			StatementType: "UNKNOWN",
@@ -1310,18 +1317,51 @@ func parseDollarTag(rest string) (string, bool) {
 	return "", false
 }
 
+func isSQLWhitespace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
+}
+
 func tokenizeSQLWithPunctuation(stmt string) []string {
-	var tokens []string
+	tokens := make([]string, 0, 16)
 	i := 0
 	n := len(stmt)
 	for i < n {
 		ch := stmt[i]
-		if unicode.IsSpace(rune(ch)) {
+		if ch < 0x80 && isSQLWhitespace(ch) {
 			i++
 			continue
 		}
-		if ch == ',' || ch == ';' || ch == '.' || ch == '(' || ch == ')' || ch == '*' || ch == '=' {
-			tokens = append(tokens, string(ch))
+		if ch >= 0x80 && unicode.IsSpace(rune(ch)) {
+			i++
+			continue
+		}
+		switch ch {
+		case ',':
+			tokens = append(tokens, ",")
+			i++
+			continue
+		case ';':
+			tokens = append(tokens, ";")
+			i++
+			continue
+		case '.':
+			tokens = append(tokens, ".")
+			i++
+			continue
+		case '(':
+			tokens = append(tokens, "(")
+			i++
+			continue
+		case ')':
+			tokens = append(tokens, ")")
+			i++
+			continue
+		case '*':
+			tokens = append(tokens, "*")
+			i++
+			continue
+		case '=':
+			tokens = append(tokens, "=")
 			i++
 			continue
 		}
@@ -1376,7 +1416,7 @@ func tokenizeSQLWithPunctuation(stmt string) []string {
 		start := i
 		for i < n {
 			c := stmt[i]
-			if unicode.IsSpace(rune(c)) || c == ',' || c == ';' || c == '.' || c == '(' || c == ')' || c == '*' || c == '=' || c == '\'' || c == '"' || c == '`' {
+			if (c < 0x80 && isSQLWhitespace(c)) || c == ',' || c == ';' || c == '.' || c == '(' || c == ')' || c == '*' || c == '=' || c == '\'' || c == '"' || c == '`' || (c >= 0x80 && unicode.IsSpace(rune(c))) {
 				break
 			}
 			i++

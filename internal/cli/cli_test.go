@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,18 +20,53 @@ import (
 	"github.com/x0c/agent-dbctl/internal/types"
 )
 
+var (
+	testBinCacheMu sync.Mutex
+	testBinCache   = map[string]string{}
+	testBinRoot    string
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	testBinCacheMu.Lock()
+	root := testBinRoot
+	testBinCacheMu.Unlock()
+	if root != "" {
+		_ = os.RemoveAll(root)
+	}
+	os.Exit(code)
+}
+
 func buildTestCLIWithVersion(t *testing.T, ver, commit string) string {
 	t.Helper()
+	key := ver + "\x00" + commit
+	testBinCacheMu.Lock()
+	defer testBinCacheMu.Unlock()
+	if bin, ok := testBinCache[key]; ok {
+		return bin
+	}
+	if testBinRoot == "" {
+		dir, err := os.MkdirTemp("", "agent-dbctl-cli-test-*")
+		if err != nil {
+			t.Fatalf("create test bin temp dir: %v", err)
+		}
+		testBinRoot = dir
+	}
+	sub := filepath.Join(testBinRoot, ver+"-"+commit)
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir test bin dir: %v", err)
+	}
 	name := "agent-dbctl"
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
-	bin := filepath.Join(t.TempDir(), name)
+	bin := filepath.Join(sub, name)
 	ldflags := "-X main.version=" + ver + " -X main.buildCommit=" + commit
 	cmd := exec.Command("go", "build", "-ldflags", ldflags, "-o", bin, "../../cmd/agent-dbctl")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build test CLI (%s %s): %v\n%s", ver, commit, err, string(out))
 	}
+	testBinCache[key] = bin
 	return bin
 }
 

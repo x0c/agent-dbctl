@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/x0c/agent-dbctl/internal/classify"
 	"github.com/x0c/agent-dbctl/internal/types"
@@ -18,7 +19,15 @@ const (
 	maxConditionNodes = 64
 	maxRegexLength    = 512
 	maxRegexASTNodes  = 256
+	maxRegexCacheSize = 1024
 )
+
+var regexCache = struct {
+	mu sync.RWMutex
+	m  map[string]*regexp.Regexp
+}{
+	m: make(map[string]*regexp.Regexp, 64),
+}
 
 // ValidateRiskPatternRule checks field constraints, condition tree depth/size, and RE2 regex safety.
 func ValidateRiskPatternRule(r types.RiskPatternRule) error {
@@ -155,6 +164,17 @@ func compileSafeRegex(pattern string, caseSensitive bool) (*regexp.Regexp, error
 	if len(pattern) > maxRegexLength {
 		return nil, fmt.Errorf("regex pattern exceeds maximum length of %d bytes", maxRegexLength)
 	}
+	cacheKey := "0:" + pattern
+	if caseSensitive {
+		cacheKey = "1:" + pattern
+	}
+	regexCache.mu.RLock()
+	if cached, ok := regexCache.m[cacheKey]; ok {
+		regexCache.mu.RUnlock()
+		return cached, nil
+	}
+	regexCache.mu.RUnlock()
+
 	ast, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
 		return nil, fmt.Errorf("invalid regex syntax: %w", err)
@@ -170,6 +190,12 @@ func compileSafeRegex(pattern string, caseSensitive bool) (*regexp.Regexp, error
 	if err != nil {
 		return nil, fmt.Errorf("compile regex: %w", err)
 	}
+	regexCache.mu.Lock()
+	if len(regexCache.m) >= maxRegexCacheSize {
+		clear(regexCache.m)
+	}
+	regexCache.m[cacheKey] = re
+	regexCache.mu.Unlock()
 	return re, nil
 }
 
@@ -271,17 +297,24 @@ func ResolveEffectivePatternRulesWithSystems(
 		return r.ScopeType
 	}
 
-	var applicable []types.RiskPatternRule
+	engLower := strings.ToLower(strings.TrimSpace(engine))
+	engCanon := classify.CanonicalEngine(engLower)
+
+	type rankedRule struct {
+		rule types.RiskPatternRule
+		rank int
+	}
+	applicable := make([]rankedRule, 0, len(allRules))
 	for _, r := range allRules {
 		rank := scopeRank(r)
 		if rank == 0 {
 			continue
 		}
-		if !ruleAppliesToTarget(r, engine, family) {
+		if !ruleAppliesToTargetNormalized(r, engLower, engCanon, family) {
 			continue
 		}
 		r.ScopeLabel = scopeLabel(r)
-		applicable = append(applicable, r)
+		applicable = append(applicable, rankedRule{rule: r, rank: rank})
 	}
 	if len(applicable) == 0 {
 		return nil
@@ -289,15 +322,15 @@ func ResolveEffectivePatternRulesWithSystems(
 
 	// Sort ancestor-first so monotonic merge preserves/tightens ancestor enforcement.
 	sort.Slice(applicable, func(i, j int) bool {
-		ri, rj := scopeRank(applicable[i]), scopeRank(applicable[j])
-		if ri != rj {
-			return ri < rj
+		if applicable[i].rank != applicable[j].rank {
+			return applicable[i].rank < applicable[j].rank
 		}
-		return applicable[i].Name < applicable[j].Name
+		return applicable[i].rule.Name < applicable[j].rule.Name
 	})
 
 	byKey := make(map[string]types.RiskPatternRule, len(applicable))
-	for _, r := range applicable {
+	for _, item := range applicable {
+		r := item.rule
 		key := strings.ToLower(strings.TrimSpace(r.Name))
 		if key == "" {
 			key = r.ID
@@ -335,26 +368,26 @@ func ResolveEffectivePatternRulesWithSystems(
 		byKey[key] = merged
 	}
 
-	var out []types.RiskPatternRule
+	out := make([]types.RiskPatternRule, 0, len(byKey))
 	for _, r := range byKey {
 		if r.Enabled {
 			out = append(out, r)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Priority != out[j].Priority {
-			return out[i].Priority > out[j].Priority
-		}
-		return out[i].Name < out[j].Name
-	})
+	if len(out) > 1 {
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].Priority != out[j].Priority {
+				return out[i].Priority > out[j].Priority
+			}
+			return out[i].Name < out[j].Name
+		})
+	}
 	return out
 }
 
-func ruleAppliesToTarget(r types.RiskPatternRule, engine string, family types.EngineFamily) bool {
+func ruleAppliesToTargetNormalized(r types.RiskPatternRule, engLower, engCanon string, family types.EngineFamily) bool {
 	if len(r.Engines) > 0 {
 		matched := false
-		engLower := strings.ToLower(strings.TrimSpace(engine))
-		engCanon := classify.CanonicalEngine(engLower)
 		for _, e := range r.Engines {
 			el := strings.ToLower(strings.TrimSpace(e))
 			if el == "*" || el == "all" || el == engLower || (engCanon != "" && classify.CanonicalEngine(el) == engCanon) {
@@ -392,6 +425,38 @@ func MatchPatternRules(
 	if len(rules) == 0 {
 		return nil, qctx
 	}
+	return evalPatternRulesWithCtx(rules, qctx, cls, pf), qctx
+}
+
+func matchPatternRulesOnly(
+	rules []types.RiskPatternRule,
+	cls types.Classification,
+	pf *types.PreflightReport,
+	rawQuery string,
+) []types.MatchedRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	hasEnabled := false
+	for _, r := range rules {
+		if r.Enabled {
+			hasEnabled = true
+			break
+		}
+	}
+	if !hasEnabled {
+		return nil
+	}
+	qctx := classify.ExtractQueryContext(cls.Engine, rawQuery)
+	return evalPatternRulesWithCtx(rules, qctx, cls, pf)
+}
+
+func evalPatternRulesWithCtx(
+	rules []types.RiskPatternRule,
+	qctx classify.QueryContext,
+	cls types.Classification,
+	pf *types.PreflightReport,
+) []types.MatchedRule {
 	var matched []types.MatchedRule
 	for _, r := range rules {
 		if !r.Enabled {
@@ -417,14 +482,16 @@ func MatchPatternRules(
 			})
 		}
 	}
-	sort.Slice(matched, func(i, j int) bool {
-		si, sj := actionSeverity(matched[i].Action), actionSeverity(matched[j].Action)
-		if si != sj {
-			return si > sj
-		}
-		return matched[i].RuleName < matched[j].RuleName
-	})
-	return matched, qctx
+	if len(matched) > 1 {
+		sort.Slice(matched, func(i, j int) bool {
+			si, sj := actionSeverity(matched[i].Action), actionSeverity(matched[j].Action)
+			if si != sj {
+				return si > sj
+			}
+			return matched[i].RuleName < matched[j].RuleName
+		})
+	}
+	return matched
 }
 
 // HasPreflightPatternRule returns true when any enabled rule requires EXPLAIN preflight metrics.
@@ -694,15 +761,15 @@ func evalPreflightMetric(c types.PatternCondition, pf *types.PreflightReport) (b
 }
 
 func matchGlobCI(pattern, val string) bool {
-	p := strings.ToLower(strings.TrimSpace(pattern))
-	v := strings.ToLower(strings.TrimSpace(val))
+	p := strings.TrimSpace(pattern)
+	v := strings.TrimSpace(val)
 	if p == "" || v == "" {
 		return false
 	}
 	if !strings.ContainsAny(p, "*?[") {
-		return p == v
+		return strings.EqualFold(p, v)
 	}
-	ok, err := path.Match(p, v)
+	ok, err := path.Match(strings.ToLower(p), strings.ToLower(v))
 	return err == nil && ok
 }
 

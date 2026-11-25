@@ -127,6 +127,9 @@ func (s *Store) VerifyWAL(ctx context.Context) (string, error) {
 }
 
 func (s *Store) migrate(ctx context.Context) error {
+	if !s.isPG() && s.isCurrentSQLiteSchema(ctx) {
+		return nil
+	}
 	const schema = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
 	version INTEGER PRIMARY KEY,
@@ -555,6 +558,18 @@ CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
 	return nil
 }
 
+func (s *Store) isCurrentSQLiteSchema(ctx context.Context) bool {
+	var hasMig int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM schema_migrations WHERE version = 6`).Scan(&hasMig); err != nil || hasMig == 0 {
+		return false
+	}
+	var hasLatestTbl int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='operation_results'`).Scan(&hasLatestTbl); err != nil || hasLatestTbl == 0 {
+		return false
+	}
+	return true
+}
+
 func (s *Store) ensureColumnLocked(ctx context.Context, table, column, colDef string) error {
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
 	if err != nil {
@@ -587,6 +602,12 @@ func (s *Store) ensureColumnLocked(ctx context.Context, table, column, colDef st
 }
 
 func (s *Store) seedDefaults(ctx context.Context) error {
+	var secCount, envCount int
+	if err := s.dbQueryRow(ctx, `SELECT COUNT(1) FROM global_security_config`).Scan(&secCount); err == nil && secCount > 0 {
+		if err := s.dbQueryRow(ctx, `SELECT COUNT(1) FROM environments`).Scan(&envCount); err == nil && envCount > 0 {
+			return nil
+		}
+	}
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var count int
 		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM global_security_config`).Scan(&count); err != nil {

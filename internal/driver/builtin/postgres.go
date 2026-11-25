@@ -372,6 +372,13 @@ func (c *postgresConn) Execute(ctx context.Context, raw string, opts driver.Exec
 		buf := driver.RowBuffer{MaxRows: opts.MaxRows, MaxBytes: opts.MaxBytes}
 		var outRows [][]any
 		for rows.Next() {
+			if buf.Truncated {
+				buf.RecordLookahead()
+				if buf.ShouldStopLookahead() {
+					break
+				}
+				continue
+			}
 			vals, err := rows.Values()
 			if err != nil {
 				return nil, err

@@ -221,10 +221,6 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 	return b.r.Read(p)
 }
 
-func dialSSHClient(ctx context.Context, np *types.NetworkProfile, cred secrets.ResolvedSecret) (*ssh.Client, error) {
-	return dialSSHClientWithDialer(ctx, np, cred, defaultDialer())
-}
-
 func dialSSHClientWithDialer(ctx context.Context, np *types.NetworkProfile, cred secrets.ResolvedSecret, dialer *net.Dialer) (*ssh.Client, error) {
 	if dialer == nil {
 		dialer = defaultDialer()

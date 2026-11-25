@@ -486,27 +486,46 @@ func collectSQLRows(rows *sql.Rows, opts driver.ExecOpts) (*types.ExecResult, er
 		return nil, err
 	}
 	cols := make([]types.Column, len(colTypes))
+	isBinary := make([]bool, len(colTypes))
+	isJSON := make([]bool, len(colTypes))
 	for i, ct := range colTypes {
+		upperType := strings.ToUpper(ct.DatabaseTypeName())
 		cols[i] = types.Column{
 			Name:     ct.Name(),
-			TypeName: strings.ToUpper(ct.DatabaseTypeName()),
+			TypeName: upperType,
 		}
+		isBinary[i] = strings.Contains(upperType, "BLOB") ||
+			strings.Contains(upperType, "BYTEA") ||
+			strings.Contains(upperType, "BINARY")
+		isJSON[i] = strings.Contains(upperType, "JSON")
 	}
 
 	buf := driver.RowBuffer{MaxRows: opts.MaxRows, MaxBytes: opts.MaxBytes}
-	var outRows [][]any
+	capHint := 64
+	if opts.MaxRows > 0 && opts.MaxRows < capHint {
+		capHint = opts.MaxRows
+	}
+	outRows := make([][]any, 0, capHint)
+	scanDest := make([]any, len(cols))
+	scanPtrs := make([]any, len(cols))
+	for i := range cols {
+		scanPtrs[i] = &scanDest[i]
+	}
+
 	for rows.Next() {
-		scanDest := make([]any, len(cols))
-		scanPtrs := make([]any, len(cols))
-		for i := range cols {
-			scanPtrs[i] = &scanDest[i]
+		if buf.Truncated {
+			buf.RecordLookahead()
+			if buf.ShouldStopLookahead() {
+				break
+			}
+			continue
 		}
 		if err := rows.Scan(scanPtrs...); err != nil {
 			return nil, err
 		}
 		norm := make([]any, len(cols))
 		for i, v := range scanDest {
-			norm[i] = normalizeTypedSQLValue(v, cols[i].TypeName)
+			norm[i] = normalizeTypedSQLValueFlags(v, isBinary[i], isJSON[i])
 		}
 		if buf.TryAcceptRow(norm) {
 			outRows = append(outRows, norm)
@@ -546,18 +565,22 @@ func expandHomePath(p string) string {
 }
 
 func normalizeTypedSQLValue(v any, typeName string) any {
+	upperType := strings.ToUpper(typeName)
+	isBinaryCol := strings.Contains(upperType, "BLOB") ||
+		strings.Contains(upperType, "BYTEA") ||
+		strings.Contains(upperType, "BINARY")
+	return normalizeTypedSQLValueFlags(v, isBinaryCol, strings.Contains(upperType, "JSON"))
+}
+
+func normalizeTypedSQLValueFlags(v any, isBinaryCol, isJSONCol bool) any {
 	switch x := v.(type) {
 	case nil:
 		return nil
 	case []byte:
-		upperType := strings.ToUpper(typeName)
-		isBinaryCol := strings.Contains(upperType, "BLOB") ||
-			strings.Contains(upperType, "BYTEA") ||
-			strings.Contains(upperType, "BINARY")
 		if isBinaryCol && !utf8.Valid(x) {
 			return base64.StdEncoding.EncodeToString(x)
 		}
-		if !isBinaryCol || strings.Contains(upperType, "JSON") {
+		if !isBinaryCol || isJSONCol {
 			var js any
 			if len(x) > 0 && (x[0] == '{' || x[0] == '[') && json.Unmarshal(x, &js) == nil {
 				return js

@@ -199,26 +199,6 @@ func (s *Service) listAuthorizedAuditEntries(ctx context.Context, f store.AuditF
 	return page, totalAuthorized, offset+len(page) < totalAuthorized, nil
 }
 
-func filterAuditForPrincipal(ctx context.Context, svc *Service, p types.Principal, items []types.AuditEntry) []types.AuditEntry {
-	if rbac.IsPlatformAdmin(p) {
-		return items
-	}
-	allowedTargets := map[string]bool{}
-	if details, err := svc.BuildTargetDetails(ctx, ""); err == nil {
-		for _, d := range details {
-			allowedTargets[d.Target.ID] = true
-			allowedTargets[strings.ToLower(d.Target.Ref)] = true
-		}
-	}
-	out := make([]types.AuditEntry, 0, len(items))
-	for _, e := range items {
-		if isAuthorizedAuditEntry(p, allowedTargets, e) {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
 // ExportTopologyForPrincipal exports a TopologyBundle filtered to the caller's authorized systems in server mode.
 func (s *Service) ExportTopologyForPrincipal(ctx context.Context) (types.TopologyBundle, error) {
 	b, err := s.store.ExportTopology(ctx)

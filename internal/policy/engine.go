@@ -93,134 +93,136 @@ func ResolveEffectivePolicyWithSystems(
 		eff.Sources["allow_multi_statement"] = envLabel
 	}
 
-	byID := make(map[string]types.PolicyRuleSet, len(policies))
-	for _, p := range policies {
-		byID[p.ID] = p
-	}
-	scanReadExplicit := false
+	if len(policies) > 0 {
+		scanReadExplicit := false
 
-	// Lower levels can only tighten permissions and caps; loosening is never permitted.
-	apply := func(p types.PolicyRuleSet, src string) {
-		if p.AllowSafeRead != nil && !*p.AllowSafeRead && eff.AllowSafeRead {
-			eff.AllowSafeRead = false
-			eff.Sources["allow_safe_read"] = src
-		}
-		if p.RequireApprovalOnHighCostRead != nil && *p.RequireApprovalOnHighCostRead && !eff.RequireApprovalOnHighCostRead {
-			eff.RequireApprovalOnHighCostRead = true
-			eff.Sources["require_approval_on_high_cost_read"] = src
-		}
-		if p.RequireApprovalOnWrite != nil && *p.RequireApprovalOnWrite && !eff.RequireApprovalOnWrite {
-			eff.RequireApprovalOnWrite = true
-			eff.Sources["require_approval_on_write"] = src
-		}
-		if p.RequireApprovalOnDDL != nil && *p.RequireApprovalOnDDL && !eff.RequireApprovalOnDDL {
-			eff.RequireApprovalOnDDL = true
-			eff.Sources["require_approval_on_ddl"] = src
-		}
-		if p.RequireApprovalOnAdmin != nil && *p.RequireApprovalOnAdmin && !eff.RequireApprovalOnAdmin {
-			eff.RequireApprovalOnAdmin = true
-			eff.Sources["require_approval_on_admin"] = src
-		}
-		if p.RequireApprovalOnUnknown != nil && *p.RequireApprovalOnUnknown && !eff.RequireApprovalOnUnknown {
-			eff.RequireApprovalOnUnknown = true
-			eff.Sources["require_approval_on_unknown"] = src
-		}
-		if p.AllowMultiStatement != nil && !*p.AllowMultiStatement && eff.AllowMultiStatement {
-			eff.AllowMultiStatement = false
-			eff.Sources["allow_multi_statement"] = src
-		}
-		if p.ExecTimeoutSec != nil && *p.ExecTimeoutSec > 0 && (eff.ExecTimeoutSec <= 0 || *p.ExecTimeoutSec < eff.ExecTimeoutSec) {
-			eff.ExecTimeoutSec = *p.ExecTimeoutSec
-			eff.Sources["exec_timeout_sec"] = src
-		}
-		if p.ApprovalTimeoutSec != nil && *p.ApprovalTimeoutSec > 0 && (eff.ApprovalTimeoutSec <= 0 || *p.ApprovalTimeoutSec < eff.ApprovalTimeoutSec) {
-			eff.ApprovalTimeoutSec = *p.ApprovalTimeoutSec
-			eff.Sources["approval_timeout_sec"] = src
-		}
-		if p.MaxRows != nil && *p.MaxRows > 0 && (eff.MaxRows <= 0 || *p.MaxRows < eff.MaxRows) {
-			eff.MaxRows = *p.MaxRows
-			eff.Sources["max_rows"] = src
-		}
-		if p.MaxBytes != nil && *p.MaxBytes > 0 && (eff.MaxBytes <= 0 || *p.MaxBytes < eff.MaxBytes) {
-			eff.MaxBytes = *p.MaxBytes
-			eff.Sources["max_bytes"] = src
-		}
-		if p.ExplainMaxRows != nil && *p.ExplainMaxRows > 0 && (eff.ExplainMaxRows <= 0 || *p.ExplainMaxRows < eff.ExplainMaxRows) {
-			eff.ExplainMaxRows = *p.ExplainMaxRows
-			eff.Sources["explain_max_rows"] = src
-		}
-		if p.ApprovalProvider != "" {
-			eff.ApprovalProvider = p.ApprovalProvider
-			eff.Sources["approval_provider"] = src
-		}
-		if p.ScanReadMode != "" {
-			if !scanReadExplicit || scanReadSeverity(p.ScanReadMode) >= scanReadSeverity(eff.ScanReadMode) {
-				eff.ScanReadMode = p.ScanReadMode
-				eff.Sources["scan_read_mode"] = src
-				scanReadExplicit = true
+		// Lower levels can only tighten permissions and caps; loosening is never permitted.
+		apply := func(p types.PolicyRuleSet, src string) {
+			if p.AllowSafeRead != nil && !*p.AllowSafeRead && eff.AllowSafeRead {
+				eff.AllowSafeRead = false
+				eff.Sources["allow_safe_read"] = src
+			}
+			if p.RequireApprovalOnHighCostRead != nil && *p.RequireApprovalOnHighCostRead && !eff.RequireApprovalOnHighCostRead {
+				eff.RequireApprovalOnHighCostRead = true
+				eff.Sources["require_approval_on_high_cost_read"] = src
+			}
+			if p.RequireApprovalOnWrite != nil && *p.RequireApprovalOnWrite && !eff.RequireApprovalOnWrite {
+				eff.RequireApprovalOnWrite = true
+				eff.Sources["require_approval_on_write"] = src
+			}
+			if p.RequireApprovalOnDDL != nil && *p.RequireApprovalOnDDL && !eff.RequireApprovalOnDDL {
+				eff.RequireApprovalOnDDL = true
+				eff.Sources["require_approval_on_ddl"] = src
+			}
+			if p.RequireApprovalOnAdmin != nil && *p.RequireApprovalOnAdmin && !eff.RequireApprovalOnAdmin {
+				eff.RequireApprovalOnAdmin = true
+				eff.Sources["require_approval_on_admin"] = src
+			}
+			if p.RequireApprovalOnUnknown != nil && *p.RequireApprovalOnUnknown && !eff.RequireApprovalOnUnknown {
+				eff.RequireApprovalOnUnknown = true
+				eff.Sources["require_approval_on_unknown"] = src
+			}
+			if p.AllowMultiStatement != nil && !*p.AllowMultiStatement && eff.AllowMultiStatement {
+				eff.AllowMultiStatement = false
+				eff.Sources["allow_multi_statement"] = src
+			}
+			if p.ExecTimeoutSec != nil && *p.ExecTimeoutSec > 0 && (eff.ExecTimeoutSec <= 0 || *p.ExecTimeoutSec < eff.ExecTimeoutSec) {
+				eff.ExecTimeoutSec = *p.ExecTimeoutSec
+				eff.Sources["exec_timeout_sec"] = src
+			}
+			if p.ApprovalTimeoutSec != nil && *p.ApprovalTimeoutSec > 0 && (eff.ApprovalTimeoutSec <= 0 || *p.ApprovalTimeoutSec < eff.ApprovalTimeoutSec) {
+				eff.ApprovalTimeoutSec = *p.ApprovalTimeoutSec
+				eff.Sources["approval_timeout_sec"] = src
+			}
+			if p.MaxRows != nil && *p.MaxRows > 0 && (eff.MaxRows <= 0 || *p.MaxRows < eff.MaxRows) {
+				eff.MaxRows = *p.MaxRows
+				eff.Sources["max_rows"] = src
+			}
+			if p.MaxBytes != nil && *p.MaxBytes > 0 && (eff.MaxBytes <= 0 || *p.MaxBytes < eff.MaxBytes) {
+				eff.MaxBytes = *p.MaxBytes
+				eff.Sources["max_bytes"] = src
+			}
+			if p.ExplainMaxRows != nil && *p.ExplainMaxRows > 0 && (eff.ExplainMaxRows <= 0 || *p.ExplainMaxRows < eff.ExplainMaxRows) {
+				eff.ExplainMaxRows = *p.ExplainMaxRows
+				eff.Sources["explain_max_rows"] = src
+			}
+			if p.ApprovalProvider != "" {
+				eff.ApprovalProvider = p.ApprovalProvider
+				eff.Sources["approval_provider"] = src
+			}
+			if p.ScanReadMode != "" {
+				if !scanReadExplicit || scanReadSeverity(p.ScanReadMode) >= scanReadSeverity(eff.ScanReadMode) {
+					eff.ScanReadMode = p.ScanReadMode
+					eff.Sources["scan_read_mode"] = src
+					scanReadExplicit = true
+				}
 			}
 		}
-	}
 
-	appliedIDs := make(map[string]bool, len(policies))
-	applyOnce := func(p types.PolicyRuleSet, src string) {
-		if p.ID != "" && appliedIDs[p.ID] {
-			return
+		byID := make(map[string]types.PolicyRuleSet, len(policies))
+		for _, p := range policies {
+			byID[p.ID] = p
 		}
-		if p.ID != "" {
-			appliedIDs[p.ID] = true
+		appliedIDs := make(map[string]bool, len(policies))
+		applyOnce := func(p types.PolicyRuleSet, src string) {
+			if p.ID != "" && appliedIDs[p.ID] {
+				return
+			}
+			if p.ID != "" {
+				appliedIDs[p.ID] = true
+			}
+			apply(p, src)
 		}
-		apply(p, src)
-	}
 
-	if env != nil {
-		if env.DefaultPolicyID != "" {
-			if p, ok := byID[env.DefaultPolicyID]; ok {
-				applyOnce(p, "env:"+env.Code)
+		if env != nil {
+			if env.DefaultPolicyID != "" {
+				if p, ok := byID[env.DefaultPolicyID]; ok {
+					applyOnce(p, "env:"+env.Code)
+				}
+			}
+			for _, p := range policies {
+				if p.ScopeType == "env" && strings.EqualFold(p.ScopeID, env.Code) {
+					applyOnce(p, "env:"+env.Code)
+				}
+			}
+		}
+
+		applySystem := func(s types.System) {
+			src := "system:" + s.Slug
+			if s.Slug == "" {
+				src = "system:" + s.ID
+			}
+			if s.DefaultPolicyID != "" {
+				if p, ok := byID[s.DefaultPolicyID]; ok {
+					applyOnce(p, src)
+				}
+			}
+			for _, p := range policies {
+				if p.ScopeType == "system" && (p.ScopeID == s.ID || (s.Slug != "" && strings.EqualFold(p.ScopeID, s.Slug))) {
+					applyOnce(p, src)
+				}
+			}
+		}
+		if ownerSys != nil {
+			applySystem(*ownerSys)
+		}
+		for _, ls := range linkedSystems {
+			applySystem(ls)
+		}
+
+		tgtSrc := "target:" + tgt.Ref
+		if tgt.Ref == "" {
+			tgtSrc = "target:" + tgt.ID
+		}
+		if tgt.PolicyOverrideID != "" {
+			if p, ok := byID[tgt.PolicyOverrideID]; ok {
+				applyOnce(p, tgtSrc)
 			}
 		}
 		for _, p := range policies {
-			if p.ScopeType == "env" && strings.EqualFold(p.ScopeID, env.Code) {
-				applyOnce(p, "env:"+env.Code)
+			if p.ScopeType == "target" && (p.ScopeID == tgt.ID || (tgt.Ref != "" && strings.EqualFold(p.ScopeID, tgt.Ref))) {
+				applyOnce(p, tgtSrc)
 			}
-		}
-	}
-
-	applySystem := func(s types.System) {
-		src := "system:" + s.Slug
-		if s.Slug == "" {
-			src = "system:" + s.ID
-		}
-		if s.DefaultPolicyID != "" {
-			if p, ok := byID[s.DefaultPolicyID]; ok {
-				applyOnce(p, src)
-			}
-		}
-		for _, p := range policies {
-			if p.ScopeType == "system" && (p.ScopeID == s.ID || (s.Slug != "" && strings.EqualFold(p.ScopeID, s.Slug))) {
-				applyOnce(p, src)
-			}
-		}
-	}
-	if ownerSys != nil {
-		applySystem(*ownerSys)
-	}
-	for _, ls := range linkedSystems {
-		applySystem(ls)
-	}
-
-	tgtSrc := "target:" + tgt.Ref
-	if tgt.Ref == "" {
-		tgtSrc = "target:" + tgt.ID
-	}
-	if tgt.PolicyOverrideID != "" {
-		if p, ok := byID[tgt.PolicyOverrideID]; ok {
-			applyOnce(p, tgtSrc)
-		}
-	}
-	for _, p := range policies {
-		if p.ScopeType == "target" && (p.ScopeID == tgt.ID || (tgt.Ref != "" && strings.EqualFold(p.ScopeID, tgt.Ref))) {
-			applyOnce(p, tgtSrc)
 		}
 	}
 
@@ -269,8 +271,7 @@ func EvaluateQuery(
 	}
 
 	if len(eff.PatternRules) > 0 && rawQuery != "" {
-		matched, _ := MatchPatternRules(eff.PatternRules, cls, preflight, rawQuery)
-		eval.MatchedRules = matched
+		eval.MatchedRules = matchPatternRulesOnly(eff.PatternRules, cls, preflight, rawQuery)
 	}
 
 	if eff.ProdReadOnlyFreeze && eff.SafetyTier == types.SafetyTierStrict && !cls.IsReadOnly {

@@ -1,12 +1,14 @@
 package driver
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -174,6 +176,19 @@ type RowBuffer struct {
 	CutoffReason  string
 }
 
+var rowSizeBufPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, 512))
+	},
+}
+
+// RecordLookahead advances FetchedRows and LookaheadRows for an already-truncated RowBuffer
+// without marshaling or normalizing skipped rows.
+func (b *RowBuffer) RecordLookahead() {
+	b.FetchedRows++
+	b.LookaheadRows++
+}
+
 // TryAcceptRow checks whether adding one whole row fits within MaxRows and MaxBytes.
 func (b *RowBuffer) TryAcceptRow(row any) bool {
 	b.FetchedRows++
@@ -187,20 +202,88 @@ func (b *RowBuffer) TryAcceptRow(row any) bool {
 		b.LookaheadRows++
 		return false
 	}
-	encoded, err := json.Marshal(row)
-	if err != nil {
-		encoded = []byte(fmt.Sprint(row))
-	}
-	size := int64(len(encoded))
-	// Always allow at least 1 row if FetchedRows == 1 unless caller budget is 0, or check byte limit strictly after 1st row.
-	if b.MaxBytes > 0 && b.ReturnedBytes+size > b.MaxBytes && b.FetchedRows > 1 {
-		b.Truncated = true
-		b.CutoffReason = "max_bytes"
-		b.LookaheadRows++
-		return false
+	var size int64
+	if b.MaxBytes > 0 {
+		size = encodedRowByteSize(row)
+		// Always allow at least 1 row if FetchedRows == 1 unless caller budget is 0, or check byte limit strictly after 1st row.
+		if b.ReturnedBytes+size > b.MaxBytes && b.FetchedRows > 1 {
+			b.Truncated = true
+			b.CutoffReason = "max_bytes"
+			b.LookaheadRows++
+			return false
+		}
+	} else {
+		size = encodedRowByteSize(row)
 	}
 	b.ReturnedBytes += size
 	return true
+}
+
+func encodedRowByteSize(row any) int64 {
+	if slice, ok := row.([]any); ok {
+		if n, fastOK := fastJSONRowSliceSize(slice); fastOK {
+			return n
+		}
+	}
+	buf := rowSizeBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	enc := json.NewEncoder(buf)
+	if err := enc.Encode(row); err == nil && buf.Len() > 0 {
+		// json.Encoder.Encode appends '\n' after the exact json.Marshal output.
+		n := int64(buf.Len() - 1)
+		if buf.Cap() <= 64*1024 {
+			rowSizeBufPool.Put(buf)
+		}
+		return n
+	}
+	if buf.Cap() <= 64*1024 {
+		rowSizeBufPool.Put(buf)
+	}
+	return int64(len(fmt.Sprint(row)))
+}
+
+// fastJSONRowSliceSize computes the exact len(json.Marshal(slice)) with zero allocations
+// for common SQL row slices containing nil, bool, integers, finite float64, and plain ASCII strings.
+func fastJSONRowSliceSize(row []any) (int64, bool) {
+	if row == nil {
+		return 4, true // "null"
+	}
+	if len(row) == 0 {
+		return 2, true // "[]"
+	}
+	var numScratch [32]byte
+	total := int64(2 + len(row) - 1) // '[' + ']' + commas
+	for _, v := range row {
+		switch x := v.(type) {
+		case nil:
+			total += 4
+		case bool:
+			if x {
+				total += 4
+			} else {
+				total += 5
+			}
+		case int:
+			total += int64(len(strconv.AppendInt(numScratch[:0], int64(x), 10)))
+		case int64:
+			total += int64(len(strconv.AppendInt(numScratch[:0], x, 10)))
+		case int32:
+			total += int64(len(strconv.AppendInt(numScratch[:0], int64(x), 10)))
+		case uint64:
+			total += int64(len(strconv.AppendUint(numScratch[:0], x, 10)))
+		case string:
+			for i := 0; i < len(x); i++ {
+				c := x[i]
+				if c < 0x20 || c >= 0x80 || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+					return 0, false
+				}
+			}
+			total += int64(2 + len(x))
+		default:
+			return 0, false
+		}
+	}
+	return total, true
 }
 
 // ShouldStopLookahead returns true once bounded post-truncation row counting has been reached.
