@@ -580,8 +580,7 @@ func (s *Service) AdminUpsertNetworkProfile(ctx context.Context, actor string, n
 	if err != nil {
 		return AdminMutationResult[types.NetworkProfile]{}, err
 	}
-	s.InvalidateCatalogPools("network_profile", saved.ID)
-	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "network_profile", "id": saved.ID}})
+	s.InvalidateCatalogPools("network", saved.ID)
 	return AdminMutationResult[types.NetworkProfile]{
 		DryRun: false,
 		Status: action,
@@ -602,8 +601,7 @@ func (s *Service) AdminDeleteNetworkProfile(ctx context.Context, actor, idOrName
 	if err := s.store.DeleteNetworkProfile(ctx, s.effectiveActor(ctx, actor), cur.ID); err != nil {
 		return err
 	}
-	s.InvalidateCatalogPools("network_profile", cur.ID)
-	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "network_profile", "id": cur.ID}})
+	s.InvalidateCatalogPools("network", cur.ID)
 	return nil
 }
 
@@ -747,7 +745,6 @@ func (s *Service) AdminUpsertCredentialProfile(ctx context.Context, actor string
 	saved.HasSecret = s.hasCredentialSecret(ctx, saved)
 	if overallAction != "unchanged" {
 		s.InvalidateCatalogPools("credential", saved.ID)
-		s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "credential", "id": saved.ID}})
 	}
 	res := AdminMutationResult[types.CredentialProfile]{
 		DryRun: false,
@@ -788,7 +785,6 @@ func (s *Service) AdminDeleteCredentialProfile(ctx context.Context, actor, idOrN
 	}
 	_ = s.secrets.Delete(ctx, "cred:"+cur.ID)
 	s.InvalidateCatalogPools("credential", cur.ID)
-	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "credential", "id": cur.ID}})
 	return nil
 }
 
@@ -916,7 +912,6 @@ func (s *Service) AdminUpsertInstance(ctx context.Context, actor string, inst ty
 		return AdminMutationResult[types.Instance]{}, err
 	}
 	s.InvalidateCatalogPools("instance", saved.ID)
-	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "instance", "id": saved.ID}})
 	return AdminMutationResult[types.Instance]{
 		DryRun: false,
 		Status: action,
@@ -938,7 +933,6 @@ func (s *Service) AdminDeleteInstance(ctx context.Context, actor, idOrName strin
 		return err
 	}
 	s.InvalidateCatalogPools("instance", cur.ID)
-	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "instance", "id": cur.ID}})
 	return nil
 }
 
@@ -1122,7 +1116,6 @@ func (s *Service) AdminUpsertTarget(ctx context.Context, actor string, tgt types
 		return AdminMutationResult[types.Target]{}, err
 	}
 	s.InvalidateCatalogPools("target", saved.ID)
-	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "target", "id": saved.ID}})
 	return AdminMutationResult[types.Target]{
 		DryRun: false,
 		Status: action,
@@ -1150,7 +1143,6 @@ func (s *Service) AdminDeleteTarget(ctx context.Context, actor, idOrRefOrAlias s
 		return TargetDeleteResult{}, err
 	}
 	s.InvalidateCatalogPools("target", cur.ID)
-	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "target", "id": cur.ID}})
 
 	orphans := s.findOrphansAfterTargetDelete(ctx, cur)
 	res := TargetDeleteResult{
@@ -1945,7 +1937,6 @@ func (s *Service) AdminApplyTopology(ctx context.Context, actor string, bundle t
 	}
 	if res.Status == "applied" {
 		s.InvalidateCatalogPools("topology", "")
-		s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "topology"}})
 	}
 	return res, nil
 }

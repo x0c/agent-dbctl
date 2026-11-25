@@ -243,7 +243,11 @@ export function AccessTab({ currentUser }: { currentUser: BootstrapUser }) {
       header: t('access.col.ceiling'),
       cell: ({ row }) => (
         <div className="flex items-center gap-1.5">
-          <Badge variant="outline">{row.original.role_ceiling}</Badge>
+          {row.original.principal_kind === 'human' || !row.original.role_ceiling ? (
+            <Badge variant="secondary">{t('access.cliSession')}</Badge>
+          ) : (
+            <Badge variant="outline">{row.original.role_ceiling}</Badge>
+          )}
           {row.original.read_only_forced && <Badge variant="secondary">RO</Badge>}
         </div>
       ),

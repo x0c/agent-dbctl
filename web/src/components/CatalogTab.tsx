@@ -53,6 +53,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   api,
+  type BootstrapUser,
   type CredentialProfileRecord,
   type DisplayCatalog,
   type EnvironmentRecord,
@@ -118,11 +119,13 @@ const DEFAULT_ENGINE_PORTS: Record<string, number> = {
 
 export function CatalogTab({
   catalog,
+  currentUser,
   onRefreshBootstrap,
   initialSubTab = 'targets',
   deepLinkCredential = null,
 }: {
   catalog: DisplayCatalog
+  currentUser?: BootstrapUser
   onRefreshBootstrap: () => Promise<void>
   initialSubTab?: CatalogSubTab
   deepLinkCredential?: string | null
@@ -357,15 +360,72 @@ export function CatalogTab({
     }
   }
 
+  const defaultResourceScope = (): { scope_type: 'global' | 'system'; scope_id: string } => {
+    if (currentUser && !currentUser.is_platform_admin && systems.length > 0) {
+      const sysId = systemFilter !== ALL_SYSTEMS ? systemFilter : systems[0].id
+      return { scope_type: 'system', scope_id: sysId }
+    }
+    return { scope_type: 'global', scope_id: 'global' }
+  }
+
+  const renderScopeFields = (
+    scopeType: 'global' | 'system' | undefined,
+    scopeId: string | undefined,
+    onChange: (next: { scope_type: 'global' | 'system'; scope_id: string }) => void,
+  ) => {
+    const curType = scopeType === 'system' ? 'system' : 'global'
+    return (
+      <div className="grid grid-cols-2 gap-3">
+        <FormField label={t('policies.field.scopeType')}>
+          <Select
+            value={curType}
+            onValueChange={(v) => {
+              const st = v === 'system' ? 'system' : 'global'
+              onChange({
+                scope_type: st,
+                scope_id: st === 'global' ? 'global' : (systemFilter !== ALL_SYSTEMS ? systemFilter : systems[0]?.id ?? ''),
+              })
+            }}
+          >
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="global">global</SelectItem>
+              <SelectItem value="system" disabled={systems.length === 0}>system</SelectItem>
+            </SelectContent>
+          </Select>
+        </FormField>
+        <FormField label={t('policies.field.scopeTarget')}>
+          {curType === 'global' ? (
+            <Input value="global" disabled />
+          ) : (
+            <Select
+              value={scopeId || '__pick__'}
+              onValueChange={(v) => onChange({ scope_type: 'system', scope_id: v === '__pick__' ? '' : v })}
+            >
+              <SelectTrigger><SelectValue placeholder={t('policies.field.selectScope')} /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__pick__" disabled>{t('policies.field.selectScope')}</SelectItem>
+                {systems.map((s) => (
+                  <SelectItem key={s.id} value={s.id}>{s.slug}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+        </FormField>
+      </div>
+    )
+  }
+
   const openResourceCreate = (kind: ResourceKind) => {
     setFormError(null)
+    const defScope = defaultResourceScope()
     if (kind === 'networks') {
-      setNetForm({ id: '', name: '', mode: 'direct', proxy_url: '', bastion_host: '', bastion_port: 22, bastion_user: '', bastion_credential_id: '', ssh_strict_host_key: true, tls_mode: 'prefer' })
+      setNetForm({ id: '', name: '', ...defScope, mode: 'direct', proxy_url: '', bastion_host: '', bastion_port: 22, bastion_user: '', bastion_credential_id: '', ssh_strict_host_key: true, tls_mode: 'prefer' })
     } else if (kind === 'credentials') {
       setMultilineSecret(false)
-      setCredForm({ id: '', name: '', kind: 'keychain', access_level: 'read_only', username: '', env_var_name: '', exec_command: '', secret_value: '' })
+      setCredForm({ id: '', name: '', ...defScope, kind: 'keychain', access_level: 'read_only', username: '', env_var_name: '', exec_command: '', secret_value: '' })
     } else {
-      setInstForm({ id: '', name: '', engine: 'postgres', host: '127.0.0.1', port: 5432, role: 'standalone', primary_instance_id: '', network_profile_id: '', tls_mode: 'prefer' })
+      setInstForm({ id: '', name: '', ...defScope, engine: 'postgres', host: '127.0.0.1', port: 5432, role: 'standalone', primary_instance_id: '', network_profile_id: '', tls_mode: 'prefer' })
     }
     setDialog(kind)
   }
@@ -1245,6 +1305,7 @@ export function CatalogTab({
         <FormField label={t('catalog.field.name')}>
           <Input value={instForm.name ?? ''} onChange={(e) => setInstForm((p) => ({ ...p, name: e.target.value }))} placeholder="rds-order-prod-01" />
         </FormField>
+        {renderScopeFields(instForm.scope_type, instForm.scope_id, (sc) => setInstForm((p) => ({ ...p, ...sc })))}
         <div className="grid grid-cols-2 gap-3">
           <FormField label={t('catalog.field.engine')}>
             <Select
@@ -1507,6 +1568,7 @@ export function CatalogTab({
         <FormField label={t('catalog.field.name')}>
           <Input value={netForm.name ?? ''} onChange={(e) => setNetForm((p) => ({ ...p, name: e.target.value }))} />
         </FormField>
+        {renderScopeFields(netForm.scope_type, netForm.scope_id, (sc) => setNetForm((p) => ({ ...p, ...sc })))}
         <FormField label={t('catalog.field.mode')}>
           <Select value={netForm.mode ?? 'direct'} onValueChange={(v) => setNetForm((p) => ({ ...p, mode: v as NetworkProfileRecord['mode'] }))}>
             <SelectTrigger><SelectValue /></SelectTrigger>
@@ -1558,6 +1620,7 @@ export function CatalogTab({
         <FormField label={t('catalog.field.name')}>
           <Input value={credForm.name ?? ''} onChange={(e) => setCredForm((p) => ({ ...p, name: e.target.value }))} />
         </FormField>
+        {renderScopeFields(credForm.scope_type, credForm.scope_id, (sc) => setCredForm((p) => ({ ...p, ...sc })))}
         <div className="grid grid-cols-2 gap-3">
           <FormField label={t('catalog.field.kind')}>
             <Select value={credForm.kind ?? 'keychain'} onValueChange={(v) => setCredForm((p) => ({ ...p, kind: v as CredentialProfileRecord['kind'] }))}>

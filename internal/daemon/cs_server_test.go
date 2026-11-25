@@ -682,4 +682,75 @@ func TestRemoteServerEnterpriseCS(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("alice must not test unauthorized billing target, got %d", resp.StatusCode)
 	}
+
+	// 8. POST /rpc/v1/auth/logout must revoke the caller's PrincipalHuman CLI token on the server.
+	var logoutOut struct {
+		Revoked bool `json:"revoked"`
+	}
+	if err := adminCLI.DoJSON(ctx, http.MethodPost, "/rpc/v1/auth/logout", map[string]any{}, &logoutOut); err != nil {
+		t.Fatalf("adminCLI logout: %v", err)
+	}
+	if !logoutOut.Revoked {
+		t.Fatalf("expected /rpc/v1/auth/logout to revoke server CLI token")
+	}
+	if err := adminCLI.DoJSON(ctx, http.MethodGet, "/rpc/v1/whoami", nil, &adminWho); err == nil {
+		t.Fatalf("revoked CLI token must be rejected on subsequent /rpc/v1/whoami")
+	}
+
+	// 9. approval_resolved SSE filtering resolves SystemID from SystemSlug and permits requester PrincipalID.
+	var ordersID string
+	for _, td := range adminTargets.Items {
+		if td.OwnerSystem != nil && td.OwnerSystem.Slug == "orders" {
+			ordersID = td.OwnerSystem.ID
+			break
+		}
+	}
+	if ordersID == "" {
+		t.Fatalf("orders system ID not found")
+	}
+	ev := Event{
+		Type: "approval_resolved",
+		Data: types.ApprovalRequest{
+			ID:              "app_test_sse",
+			SystemSlug:      "orders",
+			EnvironmentCode: "prod",
+			PrincipalID:     "usr_requester_only",
+			QueryText:       "DROP TABLE secret_leak",
+		},
+	}
+	idBoundApprover := types.Principal{
+		Kind: types.PrincipalHuman,
+		ID:   "usr_id_bound",
+		Roles: []types.RoleBinding{{
+			Role:      types.RoleApprover,
+			ScopeType: types.ScopeSystem,
+			ScopeID:   ordersID,
+		}},
+	}
+	if _, ok := svc.filterEventForPrincipal(idBoundApprover, ev); !ok {
+		t.Fatalf("expected SystemID-bound approver to receive approval_resolved SSE event")
+	}
+	requester := types.Principal{
+		Kind: types.PrincipalHuman,
+		ID:   "usr_requester_only",
+	}
+	filteredEv, ok := svc.filterEventForPrincipal(requester, ev)
+	if !ok {
+		t.Fatalf("expected operation owner PrincipalID to receive approval_resolved SSE event")
+	}
+	if filteredApp, ok := filteredEv.Data.(types.ApprovalRequest); !ok || filteredApp.QueryText != "" {
+		t.Fatalf("expected raw QueryText to be scrubbed from SSE approval_resolved, got %+v", filteredEv.Data)
+	}
+	unrelated := types.Principal{
+		Kind: types.PrincipalHuman,
+		ID:   "usr_unrelated",
+		Roles: []types.RoleBinding{{
+			Role:      types.RoleApprover,
+			ScopeType: types.ScopeSystem,
+			ScopeID:   "sys_other",
+		}},
+	}
+	if _, ok := svc.filterEventForPrincipal(unrelated, ev); ok {
+		t.Fatalf("expected unrelated approver not to receive approval_resolved SSE event")
+	}
 }

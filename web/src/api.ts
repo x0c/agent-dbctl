@@ -86,6 +86,7 @@ export interface APITokenRecord {
   owner_email?: string
   name: string
   token_prefix: string
+  principal_kind?: 'human' | 'agent_token'
   role_ceiling: Role
   allowed_systems?: string[]
   allowed_envs?: string[]
@@ -194,6 +195,8 @@ export interface EnvironmentRecord {
 export interface NetworkProfileRecord {
   id: string
   name: string
+  scope_type?: 'global' | 'system'
+  scope_id?: string
   mode: 'direct' | 'ssh_tunnel' | 'socks5' | 'http_proxy'
   proxy_url?: string
   bastion_host?: string
@@ -207,6 +210,8 @@ export interface NetworkProfileRecord {
 export interface CredentialProfileRecord {
   id: string
   name: string
+  scope_type?: 'global' | 'system'
+  scope_id?: string
   kind: 'keychain' | 'env_ref' | 'exec_provider'
   access_level: 'read_only' | 'read_write'
   username?: string
@@ -237,6 +242,8 @@ export interface ServerCapabilities {
 export interface InstanceRecord {
   id: string
   name: string
+  scope_type?: 'global' | 'system'
+  scope_id?: string
   engine: string
   host: string
   port: number

@@ -18,11 +18,13 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    environment:
+      REDIS_PASSWORD: ${AGENT_DBCTL_REDIS_PASSWORD:-dbctl-local-redis}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -50,7 +52,7 @@ services:
       AGENT_DBCTL_LISTEN_ADDR: ${AGENT_DBCTL_LISTEN_ADDR:-0.0.0.0:8080}
       AGENT_DBCTL_PUBLIC_URL: ${AGENT_DBCTL_PUBLIC_URL:-http://127.0.0.1:8080}
       AGENT_DBCTL_STORE_DSN: "postgres://${POSTGRES_USER:-agentdbctl}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-agentdbctl}?sslmode=disable"
-      AGENT_DBCTL_REDIS_URL: "redis://redis:6379/0"
+      AGENT_DBCTL_REDIS_URL: "${AGENT_DBCTL_REDIS_URL:-redis://:${AGENT_DBCTL_REDIS_PASSWORD:-dbctl-local-redis}@redis:6379/0}"
       AGENT_DBCTL_MASTER_KEY: ${AGENT_DBCTL_MASTER_KEY:?set AGENT_DBCTL_MASTER_KEY in .env}
       AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD: ${AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD:-}
       AGENT_DBCTL_OIDC_SECRET: ${AGENT_DBCTL_OIDC_SECRET:-}

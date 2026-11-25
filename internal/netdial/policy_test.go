@@ -122,14 +122,16 @@ func TestDialPolicyEgressAndSSHGuards(t *testing.T) {
 			t.Fatalf("expected Control to reject %s", addr)
 		}
 	}
-	// Proxy and tunnel paths must reject literal restricted target hosts (e.g. cloud metadata).
+	// Proxy and tunnel paths must reject literal restricted target hosts and local/metadata hostnames.
 	for _, prof := range []*types.NetworkProfile{
 		{Mode: types.NetworkHTTPProxy, ProxyURL: "http://198.51.100.2:3128"},
 		{Mode: types.NetworkSOCKS5, ProxyURL: "socks5://198.51.100.2:1080"},
 		{Mode: types.NetworkSSHTunnel, BastionHost: "198.51.100.2", BastionUser: "ops"},
 	} {
-		if _, err := BuildContextWithPolicy(context.Background(), prof, secrets.ResolvedSecret{Secret: "pass"}, "", "169.254.169.254", pol); err == nil {
-			t.Fatalf("expected %s to reject metadata target 169.254.169.254", prof.Mode)
+		for _, badTarget := range []string{"169.254.169.254", "localhost", "api.localhost", "metadata.google.internal"} {
+			if _, err := BuildContextWithPolicy(context.Background(), prof, secrets.ResolvedSecret{Secret: "pass"}, "", badTarget, pol); err == nil {
+				t.Fatalf("expected %s to reject restricted target %s", prof.Mode, badTarget)
+			}
 		}
 	}
 }

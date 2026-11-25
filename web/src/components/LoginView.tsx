@@ -45,8 +45,13 @@ export function LoginView({
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(oidcError)
 
+  const returnParams = new URLSearchParams(window.location.search)
+  returnParams.delete('error')
+  returnParams.delete('logged_out')
+  returnParams.delete('local')
+  const cleanSearch = returnParams.toString()
   const oidcHref = `/api/v1/auth/oidc/login?return_to=${encodeURIComponent(
-    `${window.location.pathname}${window.location.search}`,
+    `${window.location.pathname}${cleanSearch ? `?${cleanSearch}` : ''}`,
   )}`
 
   const willAutoRedirect = oidcEnabled && shouldAutoRedirectOIDC()

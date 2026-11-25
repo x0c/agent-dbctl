@@ -600,15 +600,28 @@ func newLogoutCmd(ioCtx func() IOContext, exitCode *int) *cobra.Command {
 				*exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, "logout applies only to remote server contexts", "", nil, nil, types.Meta{})
 				return nil
 			}
+			serverRevoked := false
+			if tok := resolveRemoteToken(paths, ctxCfg); tok != "" {
+				if client, cErr := daemon.NewRemoteClient(ctxCfg, tok); cErr == nil {
+					var logoutRes struct {
+						Revoked bool `json:"revoked"`
+					}
+					if lErr := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/auth/logout", map[string]any{}, &logoutRes); lErr == nil {
+						serverRevoked = logoutRes.Revoked
+					} else if !ic.JSONMode {
+						_, _ = fmt.Fprintf(ic.Stderr, "Warning: server session revocation failed (%v); clearing local credential anyway.\n", lErr)
+					}
+				}
+			}
 			if err := secrets.NewStore(paths).Delete(cmd.Context(), "ctx-token:"+ctxCfg.Name); err != nil && !errors.Is(err, secrets.ErrNotFound) {
 				*exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
 				return nil
 			}
 			if ic.JSONMode {
-				*exitCode = ic.WriteSuccess(map[string]any{"logged_out": true, "context": ctxCfg.Name}, types.Meta{})
+				*exitCode = ic.WriteSuccess(map[string]any{"logged_out": true, "context": ctxCfg.Name, "server_revoked": serverRevoked}, types.Meta{})
 				return nil
 			}
-			_, _ = fmt.Fprintf(ic.Stdout, "Cleared saved credentials for context %q\n", ctxCfg.Name)
+			_, _ = fmt.Fprintf(ic.Stdout, "Cleared saved credentials for context %q (server_revoked=%v)\n", ctxCfg.Name, serverRevoked)
 			return nil
 		},
 	}

@@ -12,6 +12,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
   MobileTabBar,
+  Notice,
+  Panel,
   SideNav,
   SideNavItem,
   SideNavSection,
@@ -144,16 +146,25 @@ function parseDeepLink(): {
   return { tab: 'approvals', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null, deviceAuth: false, deviceUserCode: null }
 }
 
+function loadInitialCachedCatalog(): DisplayCatalog {
+  const srv = loadCachedCatalog('server')
+  if (srv.environments.length > 0) {
+    return srv
+  }
+  return loadCachedCatalog('local')
+}
+
 export function App() {
   const { locale, setLocale, t } = useI18n()
   const initialLink = parseDeepLink()
   const [tab, setTab] = useState<Tab>(initialLink.tab)
-  const [catalog, setCatalog] = useState<DisplayCatalog>(() => loadCachedCatalog())
+  const [catalog, setCatalog] = useState<DisplayCatalog>(() => loadInitialCachedCatalog())
   const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null)
   const [authState, setAuthState] = useState<'checking' | 'authenticated' | 'unauthenticated'>(() =>
-    loadCachedCatalog().environments.length > 0 ? 'authenticated' : 'checking',
+    loadInitialCachedCatalog().environments.length > 0 ? 'authenticated' : 'checking',
   )
   const [authInfo, setAuthInfo] = useState<PublicAuthInfo | null>(null)
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null)
   const [pendingCount, setPendingCount] = useState<number>(0)
   const [cmdOpen, setCmdOpen] = useState(false)
   const [deviceViewOpen, setDeviceViewOpen] = useState(initialLink.deviceAuth)
@@ -162,6 +173,7 @@ export function App() {
     clearCachedCatalog()
     setCatalog(EMPTY_CATALOG)
     setBootstrap(null)
+    setBootstrapError(null)
     if (info) {
       setAuthInfo(info)
     }
@@ -179,6 +191,7 @@ export function App() {
       }
       setAuthState('authenticated')
       setAuthInfo(null)
+      setBootstrapError(null)
       setBootstrap(data)
       setPendingCount(data.pending_approval_count ?? 0)
       if (data.display_catalog) {
@@ -193,7 +206,7 @@ export function App() {
         }
         return
       }
-      // Keep last-known-good offline cached display catalog.
+      setBootstrapError(e instanceof Error && e.message ? e.message : t('app.bootstrapFailed'))
     }
   }
 
@@ -226,7 +239,19 @@ export function App() {
   }
 
   if (authState === 'checking') {
-    return <div className="min-h-svh bg-background" />
+    if (!bootstrapError) {
+      return <div className="min-h-svh bg-background" />
+    }
+    return (
+      <div className="min-h-svh bg-background text-foreground flex items-center justify-center px-4">
+        <Panel className="w-full max-w-md space-y-4 p-6">
+          <Notice tone="error">{bootstrapError}</Notice>
+          <Button type="button" onClick={() => { setBootstrapError(null); void refreshBootstrap() }}>
+            {t('common.retry')}
+          </Button>
+        </Panel>
+      </div>
+    )
   }
 
   if (authState === 'unauthenticated') {
@@ -450,10 +475,19 @@ export function App() {
         }
       >
         {!bootstrap ? (
-          <div className="space-y-3" aria-busy="true">
-            <div className="h-7 w-44 rounded-md bg-muted/60" />
-            <div className="h-28 rounded-xl border border-border/60 bg-card/50" />
-          </div>
+          bootstrapError ? (
+            <Panel className="max-w-lg space-y-3 p-5">
+              <Notice tone="error">{bootstrapError}</Notice>
+              <Button type="button" size="sm" onClick={() => { setBootstrapError(null); void refreshBootstrap() }}>
+                {t('common.retry')}
+              </Button>
+            </Panel>
+          ) : (
+            <div className="space-y-3" aria-busy="true">
+              <div className="h-7 w-44 rounded-md bg-muted/60" />
+              <div className="h-28 rounded-xl border border-border/60 bg-card/50" />
+            </div>
+          )
         ) : (
           <>
             {tab === 'approvals' && (
@@ -469,6 +503,7 @@ export function App() {
             {tab === 'catalog' && (
               <CatalogTab
                 catalog={catalog}
+                currentUser={bootstrap.current_user}
                 onRefreshBootstrap={refreshBootstrap}
                 initialSubTab={initialLink.catalogSubTab}
                 deepLinkCredential={initialLink.credentialId}

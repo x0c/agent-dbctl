@@ -173,7 +173,7 @@ func BuildContextWithPolicy(ctx context.Context, np *types.NetworkProfile, basti
 		if err := checkDialHostPolicy(ctx, u.Hostname(), pol); err != nil {
 			return DialResult{}, err
 		}
-		if err := checkTargetLiteralPolicy(targetHost, pol); err != nil {
+		if err := checkTargetHostPolicy(ctx, targetHost, pol); err != nil {
 			return DialResult{}, err
 		}
 		var auth *proxy.Auth
@@ -208,12 +208,12 @@ func BuildContextWithPolicy(ctx context.Context, np *types.NetworkProfile, basti
 		if err := checkDialHostPolicy(ctx, u.Hostname(), pol); err != nil {
 			return DialResult{}, err
 		}
-		if err := checkTargetLiteralPolicy(targetHost, pol); err != nil {
+		if err := checkTargetHostPolicy(ctx, targetHost, pol); err != nil {
 			return DialResult{}, err
 		}
 		return DialResult{
 			DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
-				if err := checkTargetLiteralPolicy(addr, pol); err != nil {
+				if err := checkTargetHostPolicy(dctx, addr, pol); err != nil {
 					return nil, err
 				}
 				return dialHTTPConnectWithDialer(dctx, u, addr, d)
@@ -230,7 +230,7 @@ func BuildContextWithPolicy(ctx context.Context, np *types.NetworkProfile, basti
 		if err := checkDialHostPolicy(ctx, np.BastionHost, pol); err != nil {
 			return DialResult{}, err
 		}
-		if err := checkTargetLiteralPolicy(targetHost, pol); err != nil {
+		if err := checkTargetHostPolicy(ctx, targetHost, pol); err != nil {
 			return DialResult{}, err
 		}
 		return buildSSHTunnelWithDialer(ctx, np, bastionCred, tlsMode, tlsCfg, d)
@@ -240,7 +240,26 @@ func BuildContextWithPolicy(ctx context.Context, np *types.NetworkProfile, basti
 	}
 }
 
-func checkTargetLiteralPolicy(hostOrAddr string, pol DialPolicy) error {
+func isBlockedEgressHostname(host string) bool {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if h == "" {
+		return false
+	}
+	if h == "localhost" ||
+		strings.HasSuffix(h, ".localhost") ||
+		h == "localhost.localdomain" ||
+		h == "ip6-localhost" ||
+		h == "ip6-loopback" ||
+		h == "metadata.google.internal" ||
+		h == "metadata.goog" ||
+		h == "metadata.azure.internal" ||
+		h == "instance-data" {
+		return true
+	}
+	return false
+}
+
+func checkTargetHostPolicy(ctx context.Context, hostOrAddr string, pol DialPolicy) error {
 	if !pol.EnforceEgressGuard || strings.TrimSpace(hostOrAddr) == "" {
 		return nil
 	}
@@ -248,11 +267,26 @@ func checkTargetLiteralPolicy(hostOrAddr string, pol DialPolicy) error {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
+	host = strings.Trim(host, "[]")
 	if ip, err := parseNetIPAddress(host); err == nil {
 		return pol.CheckIP(ip)
 	}
 	if strings.Contains(host, "%") {
 		return fmt.Errorf("egress blocked: scoped target host %q", hostOrAddr)
+	}
+	if isBlockedEgressHostname(host) {
+		return fmt.Errorf("egress blocked: restricted target host %q", hostOrAddr)
+	}
+	// If the control plane can resolve the target host, reject restricted IPs early;
+	// unresolvable private names remain permitted for proxy/bastion-side resolution.
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if ips, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host); err == nil {
+		for _, ip := range ips {
+			if err := pol.CheckIP(ip.IP); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -290,7 +324,7 @@ func (p *TunnelPool) BuildContextWithPolicy(ctx context.Context, np *types.Netwo
 	if err := checkDialHostPolicy(ctx, np.BastionHost, pol); err != nil {
 		return DialResult{}, err
 	}
-	if err := checkTargetLiteralPolicy(targetHost, pol); err != nil {
+	if err := checkTargetHostPolicy(ctx, targetHost, pol); err != nil {
 		return DialResult{}, err
 	}
 	return p.buildContextWithDialer(ctx, np, bastionCred, instanceTLSMode, targetHost, pol.NewDialer())

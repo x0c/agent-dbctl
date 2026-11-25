@@ -298,7 +298,7 @@ func (s *Service) invalidateLocalPools(kind, id string) {
 			s.connPool.InvalidateTarget(id)
 		case "instance":
 			s.connPool.InvalidateInstance(id)
-		case "network":
+		case "network", "network_profile":
 			s.connPool.InvalidateNetwork(id)
 		case "credential":
 			s.connPool.InvalidateCredential(id)
@@ -307,7 +307,7 @@ func (s *Service) invalidateLocalPools(kind, id string) {
 		}
 	}
 	if s.tunnels != nil {
-		if kind == "network" && id != "" {
+		if (kind == "network" || kind == "network_profile") && id != "" {
 			s.tunnels.InvalidateProfile(id)
 		} else if kind == "topology" || kind == "" || kind == "credential" {
 			s.tunnels.InvalidateAll()
@@ -419,11 +419,20 @@ func (s *Service) filterEventForPrincipal(p types.Principal, ev Event) (Event, b
 		} else if len(ev.RawData) > 0 {
 			_ = json.Unmarshal(ev.RawData, &app)
 		}
-		if app.ID != "" && rbac.EffectiveRoleForScope(p, rbac.ResourceScope{
-			SystemSlug:      app.SystemSlug,
-			EnvironmentCode: app.EnvironmentCode,
-		}) == "" {
-			return Event{}, false
+		if app.ID != "" && (app.PrincipalID == "" || app.PrincipalID != p.ID) {
+			sysID := ""
+			if app.SystemSlug != "" {
+				if sys, err := s.store.ResolveSystem(context.Background(), app.SystemSlug); err == nil {
+					sysID = sys.ID
+				}
+			}
+			if rbac.EffectiveRoleForScope(p, rbac.ResourceScope{
+				SystemID:        sysID,
+				SystemSlug:      app.SystemSlug,
+				EnvironmentCode: app.EnvironmentCode,
+			}) == "" {
+				return Event{}, false
+			}
 		}
 		app.QueryText = ""
 		ev.Data = app
@@ -1184,7 +1193,14 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 		if !s.goBackground(func(context.Context) {
 			s.driveApprovalLifecycle(op, detail, eval, app.ID, req.MaxRows, req.MaxBytes, req.TimeoutSec)
 		}) {
-			s.driveApprovalLifecycle(op, detail, eval, app.ID, req.MaxRows, req.MaxBytes, req.TimeoutSec)
+			_, _ = s.approvals.Cancel(ctx, app.ID, "system")
+			s.clearOpWaiter(op.ID)
+			op.Status = types.OpCancelled
+			op.ErrorCode = types.ErrCodeDaemonUnavailable
+			op.ErrorMessage = "daemon is shutting down"
+			op.CompletedAtUTC = time.Now().UTC().Format(time.RFC3339Nano)
+			op, _ = s.store.UpdateOperation(ctx, actor, "operation.cancelled", op)
+			return s.responseFromOperation(op, eval), nil
 		}
 
 		if !req.Wait {

@@ -421,7 +421,13 @@ func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
 			if msg == "" {
 				msg = oidcErr
 			}
-			http.Redirect(w, r, "/?error="+url.QueryEscape(msg), http.StatusFound)
+			returnTo := "/"
+			if stateRaw := strings.TrimSpace(r.URL.Query().Get("state")); stateRaw != "" {
+				if st, stErr := svc.Store().ConsumeOIDCAuthState(r.Context(), auth.HashToken(stateRaw)); stErr == nil {
+					returnTo = sanitizeReturnTo(st.ReturnTo)
+				}
+			}
+			http.Redirect(w, r, appendQueryParam(returnTo, "error", msg), http.StatusFound)
 			return
 		}
 		stateRaw := r.URL.Query().Get("state")
@@ -836,6 +842,32 @@ func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
 	mux.HandleFunc("GET /rpc/v1/tokens", handleTokenList)
 	mux.HandleFunc("POST /rpc/v1/tokens", handleTokenCreate)
 	mux.HandleFunc("DELETE /rpc/v1/tokens/{id}", handleTokenDelete)
+	mux.HandleFunc("POST /rpc/v1/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		p := rbac.PrincipalFromContext(r.Context())
+		rawTok := extractBearerToken(r)
+		if rawTok == "" {
+			writeJSONResp(w, http.StatusOK, map[string]bool{"revoked": false})
+			return
+		}
+		tok, _, err := svc.Store().LookupAPITokenByHash(r.Context(), auth.HashToken(rawTok))
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeJSONResp(w, http.StatusOK, map[string]bool{"revoked": false})
+				return
+			}
+			writeStoreErr(w, err)
+			return
+		}
+		if err := svc.Store().RevokeAPIToken(r.Context(), p.Subject, tok.ID, ""); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeJSONResp(w, http.StatusOK, map[string]bool{"revoked": false})
+				return
+			}
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]bool{"revoked": true})
+	})
 
 	// External IM / Ticket Webhook Interactive Callback (HMAC-SHA256 + anti-replay nonce)
 	mux.HandleFunc("POST /hooks/v1/approvals/{provider}/callback", func(w http.ResponseWriter, r *http.Request) {
@@ -1090,6 +1122,25 @@ func sanitizeReturnTo(raw string) string {
 		return "/"
 	}
 	return trimmed
+}
+
+func appendQueryParam(rawPath, key, val string) string {
+	u, err := url.Parse(rawPath)
+	if err != nil {
+		return "/?" + url.QueryEscape(key) + "=" + url.QueryEscape(val)
+	}
+	q := u.Query()
+	q.Set(key, val)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func extractBearerToken(r *http.Request) string {
+	hdr := strings.TrimSpace(r.Header.Get("Authorization"))
+	if !strings.HasPrefix(strings.ToLower(hdr), "bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(hdr[7:])
 }
 
 // ServerSecurityMiddleware enforces Host allowlists, AuthN (Bearer token or DB Web session), and CSRF for server mode.
