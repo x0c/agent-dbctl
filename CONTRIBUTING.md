@@ -20,6 +20,8 @@ govulncheck ./...
 
 Do not include credentials, private network addresses, or personal home-directory paths anywhere in source files, tests, or screenshots.
 
+> **macOS install note**: `make install-local` currently copies directly over `~/.local/bin/agent-dbctl`; on Apple Silicon macOS, stop a running daemon first or stage cleanly (`cp ... ~/.local/bin/agent-dbctl.tmp && chmod 755 ... && mv -f ... ~/.local/bin/agent-dbctl`) to avoid in-place Mach-O signature invalidation (`SIGKILL` / exit 137). Follow-up: switch `Makefile`'s `install-local` recipe to atomic replacement.
+
 ## Local Release Packaging
 
 Release packaging works locally without depending on CI queues:

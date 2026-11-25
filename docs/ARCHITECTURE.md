@@ -49,7 +49,7 @@ Enterprise environments involve multiple business systems, shared jump hosts, pr
 
 1. **System (`systems`)**:
    - Logical business system (`id`, `slug`, `name`, `owner`, `description`, `tags`, `workspace_paths`).
-   - `workspace_paths` binds local repository paths (e.g. `~/Codes/order-core`) to the system so `agent-dbctl db list` automatically prioritizes databases belonging to or linked with the agent's current working directory.
+   - `workspace_paths` binds local repository paths (e.g. `~/Codes/order-core`, with `~/` expanded against the active home directory) to the system so `agent-dbctl db list` automatically prioritizes databases belonging to or linked with the agent's current working directory.
 2. **Environment (`environments`)**:
    - Classifications such as `dev`, `staging`, `prod`, each carrying `safety_tier` (`yolo` | `guarded` | `strict`), server-driven localized labels (`en`, `zh`), `#RRGGBB` display color, display order, and `default_policy_id`.
 3. **NetworkProfile (`network_profiles`) & CredentialProfile (`credential_profiles`)**:
@@ -57,7 +57,7 @@ Enterprise environments involve multiple business systems, shared jump hosts, pr
    - **CredentialProfile**: Reusable auth definition (`keychain`, `env_ref`, `exec_provider`), `access_level` (`read_only` | `read_write`). Actual secrets live strictly in the OS Keychain (macOS `security -i` over stdin), env vars, or external secret-manager commands—never in SQLite or CLI output.
 4. **Instance (`instances`) & Target (`targets`)**:
    - **Instance**: Physical/logical endpoint (`engine`, `host`, `port`, `role`: `primary` | `replica` | `standalone`, `primary_instance_id`, `network_profile_id`). Supports live database/schema discovery (`POST /api/v1/instances/{id}/discover`).
-   - **Target**: Logical addressable target (`ref` e.g. `order-core/prod/orders`, short `alias` e.g. `prod-orders`, `owner_system_id`, many-to-many `linked_system_ids`, `instance_id`, `database_name`, `ro_credential_id`, `rw_credential_id`, `policy_override_id`, `status`: `active` | `maintenance` | `disabled`).
+   - **Target**: Logical addressable target (`ref` e.g. `order-core/prod/orders`, short `alias` e.g. `prod-orders`, `owner_system_id`, many-to-many `linked_system_ids`, `instance_id`, `database_name`, `ro_credential_id`, `rw_credential_id`, `policy_override_id`, `status`: `active` | `maintenance` | `disabled`). Supports concurrent fleet connectivity probing (`agent-dbctl db test --all` / `POST /api/v1/targets/test-all` via bounded 8-worker `Service.PingTargets`).
 
 ### Sanitized Topology Portability
 
@@ -127,7 +127,7 @@ Approval workflow is decoupled behind `internal/approval.Provider`:
 - **SQLite WAL + Hash Chain**: `~/.config/agent-dbctl/agent-dbctl.db` (dir `0700`, file `0600`) enables `PRAGMA journal_mode=WAL` and `busy_timeout=5000`, verified via readback on open. SQLite triggers forbid `UPDATE` and `DELETE` on `audit_logs`. Each audit row chains `prev_hash` + `entry_hash` (SHA-256) and records `actor`, `action`, `target_id`, `operation_id`, `payload_json`, and `created_at_utc`.
 - **In-Memory `ResultSlot`**: Query rows are streamed up to `max_rows` / `max_bytes` on complete row boundaries, stored in memory with wall-clock TTL (`time.Now().Round(0)`), and never dumped into `audit_logs`.
 - **Same-Origin Web Guard**: Mutating local HTTP endpoints validate `Origin` when present and non-`"null"`, falling back to `Sec-Fetch-Site: same-origin` or same-origin `Referer` when `Origin` is absent or `"null"` (Safari form compatibility). Approvals additionally require the one-time `approval_token` or active UI session token.
-- **Zero-External-Dependency Embedded Web Console**: `web/` uses only public npm packages (`react`, `react-dom`, `lucide-react`, Tailwind CSS v4) with local self-contained UI primitives in `web/src/ui/` bundled directly via `go:embed` (`internal/webui`), requiring no private registries or runtime CDNs.
+- **Zero-Runtime-CDN Embedded Web Console**: `web/` bundles React, Lucide icons, Tailwind CSS v4, and `@x0c/ui` (sourced from its public GitHub Release tarball with lockfile integrity) via Vite 8 Rolldown vendor `codeSplitting` chunks (`web/vite.config.ts`) and embeds the compiled static assets directly via `go:embed` (`internal/webui`), requiring no private registries or runtime CDNs.
 
 ---
 
