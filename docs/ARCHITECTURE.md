@@ -92,14 +92,14 @@ For `keychain` credentials without a stored secret, agents can create the catalo
   - **Dameng DM8**: Uses pure-Go `gitee.com/chunanyong/dm` via bounded slot-pooled `RegisterDialContext` (bridging `DialContext` and `TLSConfig`, keeping raw credentials with explicit query parameters, and retrying once with uppercased `DatabaseName` when case-sensitive `SET SCHEMA` fails with `[-2103]` invalid schema while preserving valid quoted lowercase schemas), enforces read-only sessions via `SP_SET_SESSION_READONLY(1)` / `BeginTx(&sql.TxOptions{ReadOnly: true})` alongside fail-closed driver checks, probes `V$VERSION`, lists schemas via `SYS.SYSOBJECTS`/`ALL_USERS`, introspects `ALL_TABLES`/`ALL_VIEWS`/`ALL_SYNONYMS` (including synonym fallback on `DescribeTable`), and runs read-only-safe `EXPLAIN <sql>` via `sql.Conn.Raw` reading `DmConnection.lastExecInfo.explain` (because `EXPLAIN FOR` fails with `[-6506]: Readonly transaction.` under `SP_SET_SESSION_READONLY(1)` and `##PLAN_TABLE` is absent), falling back to multi-column `EXPLAIN FOR` / text `EXPLAIN` `QueryContext` to detect `CSCN2`/`CSCN`/`SSCN` full scans.
   - **TDengine**: Uses pure-Go `net/http` over `DialContext`/`TLSConfig` against `taosAdapter` (`/rest/sql` and `/rest/sql/<db>`, port `6041`) with Basic or `Taosd` token auth, probes `SELECT SERVER_VERSION()`, lists databases via `SHOW DATABASES`, introspects `SHOW TABLES` / `DESCRIBE <table>`, and preflights reads via `EXPLAIN <sql>`.
 
-### Connection Pooling & Dialect Capabilities (Core Implemented; Daemon Wiring Pending)
+### Connection Pooling & Dialect Capabilities
 
 1. **Implemented Primitives (Library & Driver Layer)**:
    - `internal/netdial.TunnelPool`: Keepalive-monitored (`keepalive@openssh.com` with bounded timer) `*ssh.Client` pool keyed by redacted `(network_profile_id, bastion_host, port, user, strict_host_key, sha256(secret))` fingerprint, single-flight dial deduplication, idle TTL eviction, automatic reconnect on dead transport, and `InvalidateProfile` / `InvalidateAll`.
    - `internal/driver.ConnPool`: Read-only `driver.Conn` pool with unconditional write bypass (`!ReadOnly`), SQLite `:memory:` bypass, shorter `ExecProviderMaxAge` (`2m` default; `< 0` disables) for `exec_provider` tokens, `SessionResetter` validation before reuse, permanent poison+discard on `CancelAndDiscard()` or cancelled contexts, `HealthCheckAfter` idle probing, and target/instance/network/credential invalidation.
    - `internal/driver.DetectServerCapabilities`, `types.ServerCapabilities`, `PingResult.Dialect` / `Capabilities`, and `driver.DialectAwareConn` across all 13 built-in drivers.
-2. **Remaining Integration (Pending Daemon Wiring)**:
-   - Wire `TunnelPool`, `ConnPool`, catalog-mutation invalidation hooks, and cached per-instance `ServerCapabilities` into `internal/daemon/service.go` (`openDriverConn`, `PingTarget`, `PingInstance`, `Shutdown`) and `internal/daemon/http_server.go` (deferred until active concurrent catalog/policy work releases those files).
+2. **Daemon Wiring**:
+   - `Service` integrates `TunnelPool` and `ConnPool` with catalog-mutation invalidation hooks and cached per-instance `ServerCapabilities` updates (`Shutdown()` drains both pools cleanly).
 
 ### Risk Classification, Normalized Context & Preflight
 
@@ -149,3 +149,46 @@ Approval workflow is decoupled behind `internal/approval.Provider`:
 - **Canonical Skill**: Embedded from `skills/agent-dbctl/SKILL.md` (`cmd/agent-dbctl/skill.md`, verified identical in tests).
 - **Safe Silent Sync**: On normal CLI invocations, `PersistentPreRun` performs a fast hash + target digest check against `<config_home>/skills/registrations.json`. It installs or updates only installed agent skill roots (`~/.claude/skills`, `~/.codex/skills`, `~/.cursor/skills`, `~/.config/opencode/skills`, `~/.agents/skills`, etc.), deduplicated by physical symlink resolution so shared symlinked skill roots receive a single copy.
 - **Zero Interference**: Silent auto-sync never writes to stdout or stderr, acquires a cross-platform lock file (`O_CREATE|O_EXCL`), skips symlinks and locally edited files (preserving user modifications unless `--force`), and honors `AGENT_DBCTL_NO_SKILL_SYNC=1`, `AGENT_DBCTL_SKILLS_AUTO=0`, and `CI=true`.
+
+---
+
+## 8. Dual-Mode Client/Server Architecture (`local` vs `serve` + `remote`)
+
+`agent-dbctl` ships as a single binary supporting both zero-config **Local Mode** (default) and centralized enterprise **Client/Server Mode** (`agent-dbctl serve` + remote CLI contexts) sharing one `Service` core:
+
+```text
+Local Mode (default):
+  CLI ──[Unix Socket / 0600 Loopback]──▶ Local Daemon (local-owner, SQLite WAL, OS Keychain)
+                                           └── Embedded Web Console (127.0.0.1)
+
+Remote C/S Mode:
+  Agent/Dev CLI ──[HTTPS + Bearer/OIDC + optional mTLS]──┐
+                                                         ▼
+  Human Browser ──[HTTPS + OIDC/Session + CSRF]────────▶ Reverse Proxy ──▶ agent-dbctl serve (1..N)
+                                                                             ├── AuthN & RBAC Middleware
+                                                                             ├── Encrypted Vault / Allowed Exec/Env
+                                                                             ├── TunnelPool + ConnPool
+                                                                             └── Repository (SQLite WAL | PostgreSQL)
+                                                                                   + ResultSlot / PubSub (Memory | PG | Redis)
+```
+
+### Context & Transport Separation
+
+- **Named Contexts (`~/.config/agent-dbctl/contexts.yaml`, `0600`)**: Holds `current_context` (`local` default or named remote contexts with `endpoint`, `ca_cert_file`, `client_cert_file`, `client_key_file`, `auth_mode`, and `insecure_skip_tls_verify`). Remote tokens live in OS Keychain / `0600` secret storage under `ctx:<name>`, never inside `contexts.yaml`.
+- **HTTPS Enforcement**: Non-loopback remote endpoints strictly require `https://`. Environment overrides (`AGENT_DBCTL_CONTEXT`, `AGENT_DBCTL_ENDPOINT`, `AGENT_DBCTL_TOKEN`) allow headless CI/agent containers to connect without modifying `contexts.yaml`.
+- **Cross-Machine Workspace Matching**: Remote clients forward local `cwd` and normalized `git_remotes`; remote servers rank targets primarily by `System.GitRemotes` across developer workstations.
+
+### Unified Principal, AuthN & Four-Scope RBAC
+
+- **Unified `Principal`**: Every request resolves to a `Principal` (`local_owner`, `human`, or `agent_token`) carrying `ID`, `Subject` (`user:<email>` or `agent:<owner>:<token_name>`), `OwnerUserID`, `Roles`, and token scope ceilings, replacing static `"agent-cli"` / `"web-admin"` strings in `operations`, `approvals`, and `audit_logs`.
+- **Web Authentication**: Supports configurable OIDC (Authorization Code + PKCE) and Argon2id local username/password sessions persisted in `web_sessions` (`Secure; HttpOnly; SameSite=Lax` cookies + per-session CSRF token). `WebSecurityMiddleware` validates configured `PublicURL`/`AllowedHosts` and strict same-origin headers in server mode while keeping loopback enforcement in local mode.
+- **CLI / Agent Authentication**: Supports OIDC Device Flow (`agent-dbctl login`, RFC 8628) and scoped revocable API Tokens (`adb_live_<prefix>_<secret>`, stored as SHA-256 hashes in `api_tokens`).
+- **Role Matrix (`platform_admin`, `system_admin`, `approver`, `developer`, `viewer`)**: Scoped across `global`, `system`, and `env`. RBAC composes orthogonally with the 4-level monotonic Policy Engine and RiskPattern rules (strictest decision wins):
+  - **Human-Only Approval Invariant**: `POST /api/v1/approvals/{id}/approve|reject` requires `Principal.Kind` to be `human` or `local_owner` plus `approver` RBAC on the target's `System` and `Environment`—never `agent_token`.
+  - **Four-Eyes Separation (`forbid_self_approval`)**: Enabled by default in server mode so an approver cannot approve operations initiated by themselves or by an `agent_token` they own.
+
+### Server-Side Secrets & Storage Dual Backend
+
+- **Envelope-Encrypted Server Vault (`EncryptedStore`)**: Server mode encrypts stored database/bastion secrets with per-record 256-bit DEKs (AES-256-GCM) wrapped by an external KEK (`AGENT_DBCTL_MASTER_KEY` or key file, supporting `key_version` rotation), persisted either in `encrypted_secrets` (DB) or an encrypted file store.
+- **Server RCE / Env-Leak Guardrail**: In server mode, `exec_provider` and `env_ref` credentials can only be created by `platform_admin` and must match configured `allowed_exec_prefixes` / `allowed_env_prefixes` allowlists; non-admin `system_admin` users manage vault-encrypted credentials only.
+- **Dual Repository (`sqlite` | `postgres`)**: `internal/store.Repository` supports SQLite WAL (local & single-node server) and PostgreSQL (`pgx/v5`) for multi-replica deployments. PostgreSQL serializes `audit_logs` hash-chain appends via `SELECT ... FOR UPDATE` on `audit_chain_head` in the same transaction, enforces `BEFORE UPDATE OR DELETE` immutability triggers, and coordinates cross-replica approval wakeups, operation cancellations, and SSE fan-out via `EventBus` (`memory` | `postgres` `LISTEN/NOTIFY` | `redis`) and `ResultSlot` (`memory` | `redis`), with `owner_node_id` + `lease_expires_at_utc` preventing multi-node startup recovery races.

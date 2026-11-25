@@ -126,6 +126,12 @@ agent-dbctl doctor [--live]
 agent-dbctl describe [command...]
 agent-dbctl version
 agent-dbctl capabilities
+agent-dbctl serve [--config <path>] [--listen <addr>] [--public-url <url>]
+agent-dbctl context list | show | add <name> --endpoint <url> [--ca-cert <path>] [--client-cert <path> --client-key <path>] [--auth-mode oidc_device|bearer_token] | use <name> | remove <name>
+agent-dbctl login [--context <name>] [--token-stdin | --token-env <var>]
+agent-dbctl logout [--context <name>]
+agent-dbctl whoami
+agent-dbctl token list | create --name <name> [--role developer|viewer|system_admin] [--system <slug>...] [--env <code...>] [--read-only] [--ttl <dur>] | revoke <id_or_name>
 agent-dbctl skill install [--dry-run] [--force] [--runtime <name>]
 agent-dbctl skill status [--runtime <name>]
 agent-dbctl skill uninstall [--dry-run] [--runtime <name>]
@@ -137,7 +143,8 @@ agent-dbctl skill print
 - `--json`: Force JSON envelope output (automatic when stdout is non-TTY).
 - `--no-color`: Disable ANSI colors (also honors `NO_COLOR` and `TERM=dumb`).
 - `--no-input` / `--non-interactive`: Disable interactive prompts (automatic when stdin/stdout is non-TTY).
-- `--session <name>`: Select isolated daemon session (default `default`, or `AGENT_DBCTL_SESSION`).
+- `--session <name>`: Select isolated local daemon session (default `default`, or `AGENT_DBCTL_SESSION`).
+- `--context <name>`: Select client context (`local` or configured remote context, or `AGENT_DBCTL_CONTEXT`).
 
 ## 4. Safety & Behavioral Guarantees
 
@@ -178,3 +185,19 @@ agent-dbctl skill print
 | `AGENT_DBCTL_WEBHOOK_URL` | Enable built-in `webhook` approval provider pointing at an external approval endpoint (`https://`, or `http://` on loopback only) |
 | `AGENT_DBCTL_WEBHOOK_SECRET` | Optional HMAC-SHA256 signing secret for `X-Agent-DBCTL-Signature` headers on webhook approval notifications |
 | `AGENT_DBCTL_WEBHOOK_TIMEOUT` | Optional webhook HTTP timeout duration (e.g. `10s`; default `5s`, capped at `30s`) |
+| `AGENT_DBCTL_CONTEXT` | Override active client context (`local` or a named remote context from `contexts.yaml`) |
+| `AGENT_DBCTL_ENDPOINT` | Override remote server HTTPS URL directly for headless CI/agent environments |
+| `AGENT_DBCTL_TOKEN` | Bearer token for `AGENT_DBCTL_ENDPOINT` or remote contexts without interactive `login` |
+| `AGENT_DBCTL_SERVER_CONFIG` | Path to server YAML configuration for `agent-dbctl serve` |
+| `AGENT_DBCTL_STORE_DSN` | Database DSN for server storage when `storage.driver: postgres` |
+| `AGENT_DBCTL_MASTER_KEY` | Base64 or hex 32-byte KEK for server-side envelope-encrypted credential storage |
+| `AGENT_DBCTL_REDIS_URL` | Optional Redis connection URL for multi-replica `ResultSlot` and `EventBus` |
+
+## 6. Remote Context Behavior
+
+When targeting a remote context (`mode: remote`):
+
+1. **No Local Daemon Spawn**: `daemon start|stop|restart` return exit `2` (`invalid_usage` / `unsupported_in_remote_mode`), and `audit list|export` query `/rpc/v1/audit` directly without local SQLite fallback.
+2. **HTTPS Transport & Auth**: Non-loopback endpoints require `https://` and attach `Authorization: Bearer <token>` (from Keychain/`0600` credential store or `AGENT_DBCTL_TOKEN`), supporting custom CA and mTLS client certificates.
+3. **Chunked Long-Poll Wait**: `op wait` uses bounded server-side wait intervals (`/rpc/v1/ops/{id}/wait?timeout=25s`) in a loop until terminal state or overall client timeout, avoiding reverse-proxy gateway timeouts.
+4. **Remote Web URL**: `ui open` and `--open-secret` use the server's configured `public_url` rather than `127.0.0.1` and never launch a browser on the server host.

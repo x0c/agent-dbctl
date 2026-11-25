@@ -10,6 +10,7 @@ import (
 	"github.com/x0c/agent-dbctl/internal/classify"
 	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/policy"
+	"github.com/x0c/agent-dbctl/internal/rbac"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
 
@@ -101,6 +102,8 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string, g
 	}
 
 	normRemotes := config.NormalizeGitRemotes(gitRemotes)
+	allowLocalPathMatch := !s.IsServerMode()
+	p := rbac.PrincipalFromContext(ctx)
 	type rankedTarget struct {
 		detail types.TargetDetail
 		rank   int
@@ -114,7 +117,7 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string, g
 			sysCopy := sys
 			ownerPtr = &sysCopy
 			d.OwnerSystem = ownerPtr
-			if matchesWorkspace(workspaceCWD, sys.WorkspacePaths) {
+			if allowLocalPathMatch && matchesWorkspace(workspaceCWD, sys.WorkspacePaths) {
 				d.WorkspaceMatch = true
 				rank = 2
 			} else if matchesGitRemotes(normRemotes, sys.GitRemotes) {
@@ -125,7 +128,7 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string, g
 		for _, lid := range t.LinkedSystemIDs {
 			if lsys, ok := sysMap[lid]; ok {
 				d.LinkedSystems = append(d.LinkedSystems, lsys)
-				if matchesWorkspace(workspaceCWD, lsys.WorkspacePaths) {
+				if allowLocalPathMatch && matchesWorkspace(workspaceCWD, lsys.WorkspacePaths) {
 					d.WorkspaceMatch = true
 					if rank < 2 {
 						rank = 2
@@ -174,6 +177,9 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string, g
 				fam = drv.Metadata().Family
 			}
 			d.EffectivePolicy.PatternRules = policy.ResolveEffectivePatternRulesWithSystems(envPtr, ownerPtr, d.LinkedSystems, t, eng, fam, patternRules)
+		}
+		if s.IsServerMode() && !rbac.CanViewTarget(p, d) {
+			continue
 		}
 		ranked = append(ranked, rankedTarget{detail: d, rank: rank})
 	}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/policy"
+	"github.com/x0c/agent-dbctl/internal/rbac"
 	"github.com/x0c/agent-dbctl/internal/store"
 	"github.com/x0c/agent-dbctl/internal/types"
 	"gopkg.in/yaml.v3"
@@ -35,12 +36,23 @@ type DaemonMeta struct {
 // NewRPCHandler creates the CLI-facing control RPC handler (full catalog/policy automation, human-only approvals).
 func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 	mux := http.NewServeMux()
+	registerRPCRoutes(mux, svc, shutdownFn)
+	return mux
+}
 
+func registerRPCRoutes(mux *http.ServeMux, svc *Service, shutdownFn func()) {
 	mux.HandleFunc("GET /rpc/v1/identity", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSONResp(w, http.StatusOK, svc.Identity())
 	})
 
 	mux.HandleFunc("POST /rpc/v1/shutdown", func(w http.ResponseWriter, _ *http.Request) {
+		if svc.IsServerMode() {
+			writeJSONResp(w, http.StatusForbidden, map[string]any{
+				"code":  types.ErrCodeForbidden,
+				"error": "remote shutdown via RPC is disabled in server mode",
+			})
+			return
+		}
 		writeJSONResp(w, http.StatusOK, map[string]bool{"stopping": true})
 		if shutdownFn != nil {
 			go shutdownFn()
@@ -111,11 +123,21 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		p := rbac.PrincipalFromContext(r.Context())
 		if req.All {
 			items, _, _, err := svc.ListTargetsFiltered(r.Context(), req.Filter)
 			if err != nil {
 				writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 				return
+			}
+			if svc.IsServerMode() {
+				allowed := make([]types.TargetDetail, 0, len(items))
+				for _, it := range items {
+					if rbac.Authorize(p, rbac.ActionDBTest, scopeForTarget(it)) == nil {
+						allowed = append(allowed, it)
+					}
+				}
+				items = allowed
 			}
 			results := svc.PingTargets(r.Context(), items)
 			writeJSONResp(w, http.StatusOK, map[string]any{"results": results})
@@ -125,6 +147,12 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		if err != nil {
 			writeLookupErr(w, err)
 			return
+		}
+		if svc.IsServerMode() {
+			if authErr := rbac.Authorize(p, rbac.ActionDBTest, scopeForTarget(d)); authErr != nil {
+				writeRPCStoreErr(w, authErr)
+				return
+			}
 		}
 		res := svc.PingTarget(r.Context(), d)
 		writeJSONResp(w, http.StatusOK, map[string]any{"results": []types.PingResult{res}})
@@ -175,31 +203,45 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if svc.IsServerMode() {
+			items = filterOperationsForPrincipal(rbac.PrincipalFromContext(r.Context()), items)
+		}
 		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
 	})
 
 	mux.HandleFunc("GET /rpc/v1/ops/{id}/wait", func(w http.ResponseWriter, r *http.Request) {
 		timeoutSec := 120
-		if raw := strings.TrimSpace(r.URL.Query().Get("timeout_sec")); raw != "" {
+		if svc.IsServerMode() {
+			timeoutSec = 25
+		}
+		raw := strings.TrimSpace(r.URL.Query().Get("timeout_sec"))
+		if raw == "" {
+			raw = strings.TrimSpace(r.URL.Query().Get("timeout"))
+		}
+		if raw != "" {
 			if n, err := strconv.Atoi(raw); err == nil && n > 0 {
 				timeoutSec = n
-				if timeoutSec > 600 {
-					timeoutSec = 600
+				maxCap := 600
+				if svc.IsServerMode() {
+					maxCap = 25
+				}
+				if timeoutSec > maxCap {
+					timeoutSec = maxCap
 				}
 			}
 		}
 		resp, err := svc.WaitForOperation(r.Context(), r.PathValue("id"), time.Duration(timeoutSec)*time.Second)
 		if err != nil {
-			writeStoreErr(w, err)
+			writeRPCStoreErr(w, err)
 			return
 		}
 		writeJSONResp(w, http.StatusOK, resp)
 	})
 
 	mux.HandleFunc("POST /rpc/v1/ops/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
-		resp, err := svc.CancelOperationAndWait(r.Context(), r.PathValue("id"), "agent-cli")
+		resp, err := svc.CancelOperationAndWait(r.Context(), r.PathValue("id"), svc.effectiveActor(r.Context(), "agent-cli"))
 		if err != nil {
-			writeStoreErr(w, err)
+			writeRPCStoreErr(w, err)
 			return
 		}
 		writeJSONResp(w, http.StatusOK, resp)
@@ -236,11 +278,20 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		truncated := offset+len(items) < total
+		if svc.IsServerMode() {
+			p := rbac.PrincipalFromContext(r.Context())
+			if !rbac.IsPlatformAdmin(p) {
+				items = filterAuditForPrincipal(r.Context(), svc, p, items)
+				total = len(items)
+				truncated = false
+			}
+		}
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"items":         items,
 			"total_matched": total,
 			"returned":      len(items),
-			"truncated":     offset+len(items) < total,
+			"truncated":     truncated,
 			"limit":         limit,
 			"offset":        offset,
 		})
@@ -263,7 +314,13 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		})
 	})
 
-	mux.HandleFunc("POST /rpc/v1/plugins/reload", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /rpc/v1/plugins/reload", func(w http.ResponseWriter, r *http.Request) {
+		if svc.IsServerMode() {
+			if err := rbac.Authorize(rbac.PrincipalFromContext(r.Context()), rbac.ActionPluginManage, rbac.ResourceScope{}); err != nil {
+				writeRPCStoreErr(w, err)
+				return
+			}
+		}
 		items, err := svc.Plugins().Reload()
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
@@ -273,6 +330,12 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 	})
 
 	mux.HandleFunc("POST /rpc/v1/audit/verify", func(w http.ResponseWriter, r *http.Request) {
+		if svc.IsServerMode() {
+			if err := rbac.Authorize(rbac.PrincipalFromContext(r.Context()), rbac.ActionAuditVerify, rbac.ResourceScope{}); err != nil {
+				writeRPCStoreErr(w, err)
+				return
+			}
+		}
 		res, err := svc.Store().VerifyAuditChain(r.Context())
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
@@ -287,6 +350,9 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if svc.IsServerMode() {
+			items = filterSystemsForPrincipal(rbac.PrincipalFromContext(r.Context()), items)
 		}
 		if items == nil {
 			items = []types.System{}
@@ -303,7 +369,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeRPCInvalidErr(w, err.Error())
 			return
 		}
-		res, err := svc.AdminUpsertSystem(r.Context(), req.Actor, req.System, req.DryRun)
+		res, err := svc.AdminUpsertSystem(r.Context(), svc.effectiveActor(r.Context(), req.Actor), req.System, req.DryRun)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -311,7 +377,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		writeJSONResp(w, http.StatusOK, res)
 	})
 	mux.HandleFunc("DELETE /rpc/v1/systems/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.AdminDeleteSystem(r.Context(), "agent-cli", r.PathValue("id")); err != nil {
+		if err := svc.AdminDeleteSystem(r.Context(), svc.effectiveActor(r.Context(), "agent-cli"), r.PathValue("id")); err != nil {
 			writeRPCStoreErr(w, err)
 			return
 		}
@@ -340,7 +406,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeRPCInvalidErr(w, err.Error())
 			return
 		}
-		res, err := svc.AdminUpsertEnvironment(r.Context(), req.Actor, req.Environment, req.DryRun)
+		res, err := svc.AdminUpsertEnvironment(r.Context(), svc.effectiveActor(r.Context(), req.Actor), req.Environment, req.DryRun)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -348,7 +414,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		writeJSONResp(w, http.StatusOK, res)
 	})
 	mux.HandleFunc("DELETE /rpc/v1/environments/{code...}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.AdminDeleteEnvironment(r.Context(), "agent-cli", r.PathValue("code")); err != nil {
+		if err := svc.AdminDeleteEnvironment(r.Context(), svc.effectiveActor(r.Context(), "agent-cli"), r.PathValue("code")); err != nil {
 			writeRPCStoreErr(w, err)
 			return
 		}
@@ -361,6 +427,11 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if svc.IsServerMode() {
+			items = filterScopedProfiles(rbac.PrincipalFromContext(r.Context()), items, func(np types.NetworkProfile) (string, string) {
+				return np.ScopeType, np.ScopeID
+			})
 		}
 		if items == nil {
 			items = []types.NetworkProfile{}
@@ -377,7 +448,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeRPCInvalidErr(w, err.Error())
 			return
 		}
-		res, err := svc.AdminUpsertNetworkProfile(r.Context(), req.Actor, req.NetworkProfile, req.DryRun)
+		res, err := svc.AdminUpsertNetworkProfile(r.Context(), svc.effectiveActor(r.Context(), req.Actor), req.NetworkProfile, req.DryRun)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -385,7 +456,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		writeJSONResp(w, http.StatusOK, res)
 	})
 	mux.HandleFunc("DELETE /rpc/v1/network-profiles/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.AdminDeleteNetworkProfile(r.Context(), "agent-cli", r.PathValue("id")); err != nil {
+		if err := svc.AdminDeleteNetworkProfile(r.Context(), svc.effectiveActor(r.Context(), "agent-cli"), r.PathValue("id")); err != nil {
 			writeRPCStoreErr(w, err)
 			return
 		}
@@ -398,6 +469,11 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if svc.IsServerMode() {
+			items = filterScopedProfiles(rbac.PrincipalFromContext(r.Context()), items, func(cp types.CredentialProfile) (string, string) {
+				return cp.ScopeType, cp.ScopeID
+			})
 		}
 		if items == nil {
 			items = []types.CredentialProfile{}
@@ -413,7 +489,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeRPCInvalidErr(w, err.Error())
 			return
 		}
-		res, err := svc.AdminUpsertCredentialProfile(r.Context(), "agent-cli", req)
+		res, err := svc.AdminUpsertCredentialProfile(r.Context(), svc.effectiveActor(r.Context(), "agent-cli"), req)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -421,7 +497,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		writeJSONResp(w, http.StatusOK, res)
 	})
 	mux.HandleFunc("DELETE /rpc/v1/credentials/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.AdminDeleteCredentialProfile(r.Context(), "agent-cli", r.PathValue("id")); err != nil {
+		if err := svc.AdminDeleteCredentialProfile(r.Context(), svc.effectiveActor(r.Context(), "agent-cli"), r.PathValue("id")); err != nil {
 			writeRPCStoreErr(w, err)
 			return
 		}
@@ -434,6 +510,11 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if svc.IsServerMode() {
+			items = filterScopedProfiles(rbac.PrincipalFromContext(r.Context()), items, func(inst types.Instance) (string, string) {
+				return inst.ScopeType, inst.ScopeID
+			})
 		}
 		if items == nil {
 			items = []types.Instance{}
@@ -450,7 +531,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeRPCInvalidErr(w, err.Error())
 			return
 		}
-		res, err := svc.AdminUpsertInstance(r.Context(), req.Actor, req.Instance, req.DryRun)
+		res, err := svc.AdminUpsertInstance(r.Context(), svc.effectiveActor(r.Context(), req.Actor), req.Instance, req.DryRun)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -458,7 +539,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		writeJSONResp(w, http.StatusOK, res)
 	})
 	mux.HandleFunc("DELETE /rpc/v1/instances/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.AdminDeleteInstance(r.Context(), "agent-cli", r.PathValue("id")); err != nil {
+		if err := svc.AdminDeleteInstance(r.Context(), svc.effectiveActor(r.Context(), "agent-cli"), r.PathValue("id")); err != nil {
 			writeRPCStoreErr(w, err)
 			return
 		}
@@ -505,7 +586,11 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeRPCInvalidErr(w, err.Error())
 			return
 		}
-		res, err := svc.AdminAddDatabase(r.Context(), "agent-cli", req)
+		if svc.IsServerMode() && strings.TrimSpace(req.WorkspaceCWD) != "" {
+			writeRPCInvalidErr(w, "workspace_cwd is not accepted in server mode; pass explicit --system instead")
+			return
+		}
+		res, err := svc.AdminAddDatabase(r.Context(), svc.effectiveActor(r.Context(), "agent-cli"), req)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -523,13 +608,14 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeRPCInvalidErr(w, err.Error())
 			return
 		}
-		res, err := svc.AdminUpsertTarget(r.Context(), req.Actor, req.Target, req.DryRun)
+		actor := svc.effectiveActor(r.Context(), req.Actor)
+		res, err := svc.AdminUpsertTarget(r.Context(), actor, req.Target, req.DryRun)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
 		}
 		if req.ScanReadMode != nil && *req.ScanReadMode != "" {
-			if _, pErr := svc.AdminSetTargetScanReadMode(r.Context(), req.Actor, firstNonEmpty(res.Item.ID, res.Item.Ref), *req.ScanReadMode, req.DryRun); pErr != nil {
+			if _, pErr := svc.AdminSetTargetScanReadMode(r.Context(), actor, firstNonEmpty(res.Item.ID, res.Item.Ref), *req.ScanReadMode, req.DryRun); pErr != nil {
 				writeRPCStoreErr(w, pErr)
 				return
 			}
@@ -537,7 +623,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		writeJSONResp(w, http.StatusOK, res)
 	})
 	mux.HandleFunc("DELETE /rpc/v1/targets/{id...}", func(w http.ResponseWriter, r *http.Request) {
-		res, err := svc.AdminDeleteTarget(r.Context(), "agent-cli", r.PathValue("id"))
+		res, err := svc.AdminDeleteTarget(r.Context(), svc.effectiveActor(r.Context(), "agent-cli"), r.PathValue("id"))
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -547,7 +633,13 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 
 	// Topology Export / Apply
 	mux.HandleFunc("GET /rpc/v1/topology", func(w http.ResponseWriter, r *http.Request) {
-		b, err := svc.Store().ExportTopology(r.Context())
+		if svc.IsServerMode() {
+			if err := rbac.Authorize(rbac.PrincipalFromContext(r.Context()), rbac.ActionTopologyRead, rbac.ResourceScope{}); err != nil {
+				writeRPCStoreErr(w, err)
+				return
+			}
+		}
+		b, err := svc.ExportTopologyForPrincipal(r.Context())
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -585,7 +677,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			}
 		}
 		dryRun := r.URL.Query().Get("dry_run") == "1" || strings.EqualFold(r.URL.Query().Get("dry_run"), "true")
-		res, err := svc.AdminApplyTopology(r.Context(), "agent-cli", bundle, dryRun)
+		res, err := svc.AdminApplyTopology(r.Context(), svc.effectiveActor(r.Context(), "agent-cli"), bundle, dryRun)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -612,7 +704,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeRPCInvalidErr(w, err.Error())
 			return
 		}
-		res, err := svc.AdminUpdateGlobalSecurity(r.Context(), req.Actor, req.Config, req.DryRun)
+		res, err := svc.AdminUpdateGlobalSecurity(r.Context(), svc.effectiveActor(r.Context(), req.Actor), req.Config, req.DryRun)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -624,6 +716,9 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if svc.IsServerMode() {
+			items = filterPoliciesForPrincipal(r.Context(), svc, rbac.PrincipalFromContext(r.Context()), items)
 		}
 		if items == nil {
 			items = []types.PolicyRuleSet{}
@@ -640,7 +735,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeRPCInvalidErr(w, err.Error())
 			return
 		}
-		res, err := svc.AdminUpsertPolicy(r.Context(), req.Actor, req.Policy, req.DryRun)
+		res, err := svc.AdminUpsertPolicy(r.Context(), svc.effectiveActor(r.Context(), req.Actor), req.Policy, req.DryRun)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -648,7 +743,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		writeJSONResp(w, http.StatusOK, res)
 	})
 	mux.HandleFunc("DELETE /rpc/v1/policies/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.AdminDeletePolicy(r.Context(), "agent-cli", r.PathValue("id")); err != nil {
+		if err := svc.AdminDeletePolicy(r.Context(), svc.effectiveActor(r.Context(), "agent-cli"), r.PathValue("id")); err != nil {
 			writeRPCStoreErr(w, err)
 			return
 		}
@@ -660,6 +755,9 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if svc.IsServerMode() {
+			items = filterRiskPatternsForPrincipal(r.Context(), svc, rbac.PrincipalFromContext(r.Context()), items)
 		}
 		if items == nil {
 			items = []types.RiskPatternRule{}
@@ -679,7 +777,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeRPCInvalidErr(w, err.Error())
 			return
 		}
-		res, err := svc.AdminUpsertRiskPattern(r.Context(), req.Actor, req.Rule, req.DryRun)
+		res, err := svc.AdminUpsertRiskPattern(r.Context(), svc.effectiveActor(r.Context(), req.Actor), req.Rule, req.DryRun)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -688,7 +786,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 	})
 	mux.HandleFunc("DELETE /rpc/v1/risk-patterns/{id}", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		if err := svc.AdminDeleteRiskPattern(r.Context(), "agent-cli", r.PathValue("id"), q.Get("scope_type"), q.Get("scope_id")); err != nil {
+		if err := svc.AdminDeleteRiskPattern(r.Context(), svc.effectiveActor(r.Context(), "agent-cli"), r.PathValue("id"), q.Get("scope_type"), q.Get("scope_id")); err != nil {
 			writeRPCStoreErr(w, err)
 			return
 		}
@@ -702,7 +800,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			Actor     string `json:"actor"`
 		}
 		_ = decodeJSONBody(r, &req)
-		res, err := svc.AdminInstallRulePack(r.Context(), req.Actor, r.PathValue("id"), req.ScopeType, req.ScopeID, req.DryRun)
+		res, err := svc.AdminInstallRulePack(r.Context(), svc.effectiveActor(r.Context(), req.Actor), r.PathValue("id"), req.ScopeType, req.ScopeID, req.DryRun)
 		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
@@ -733,6 +831,9 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if svc.IsServerMode() {
+			items = filterApprovalsForPrincipal(r.Context(), svc, rbac.PrincipalFromContext(r.Context()), items)
+		}
 		if items == nil {
 			items = []types.ApprovalRequest{}
 		}
@@ -744,10 +845,20 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeRPCStoreErr(w, err)
 			return
 		}
+		if svc.IsServerMode() {
+			p := rbac.PrincipalFromContext(r.Context())
+			filtered := filterApprovalsForPrincipal(r.Context(), svc, p, []types.ApprovalRequest{app})
+			if len(filtered) == 0 {
+				writeJSONResp(w, http.StatusForbidden, map[string]any{
+					"code":  types.ErrCodeForbidden,
+					"error": "forbidden: approval is outside your authorized scope",
+				})
+				return
+			}
+			app = filtered[0]
+		}
 		writeJSONResp(w, http.StatusOK, app)
 	})
-
-	return mux
 }
 
 func writeRPCInvalidErr(w http.ResponseWriter, msg string) {
@@ -764,6 +875,16 @@ func writeRPCStoreErr(w http.ResponseWriter, err error) {
 		return
 	}
 	switch {
+	case storeErrIsForbidden(err):
+		writeJSONResp(w, http.StatusForbidden, map[string]any{
+			"code":  types.ErrCodeForbidden,
+			"error": err.Error(),
+		})
+	case storeErrIsUnauthorized(err):
+		writeJSONResp(w, http.StatusUnauthorized, map[string]any{
+			"code":  types.ErrCodeAuthRequired,
+			"error": err.Error(),
+		})
 	case storeErrIsNotFound(err):
 		writeJSONResp(w, http.StatusNotFound, map[string]any{
 			"code":  types.ErrCodeNotFound,
@@ -782,6 +903,14 @@ func writeRPCStoreErr(w http.ResponseWriter, err error) {
 	}
 }
 
+func storeErrIsForbidden(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "forbidden")
+}
+
+func storeErrIsUnauthorized(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unauthorized")
+}
+
 func storeErrIsNotFound(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), store.ErrNotFound.Error())
 }
@@ -798,7 +927,9 @@ func writeLookupErr(w http.ResponseWriter, err error) {
 			status = http.StatusNotFound
 		case types.ErrCodeAmbiguousTarget:
 			status = http.StatusConflict
-		case types.ErrCodePolicyDenied, types.ErrCodeTargetMaintenance:
+		case types.ErrCodeAuthRequired:
+			status = http.StatusUnauthorized
+		case types.ErrCodePolicyDenied, types.ErrCodeTargetMaintenance, types.ErrCodeForbidden:
 			status = http.StatusForbidden
 		case types.ErrCodeDriverError:
 			status = http.StatusBadGateway
@@ -817,11 +948,18 @@ func writeLookupErr(w http.ResponseWriter, err error) {
 	writeHTTPErr(w, http.StatusBadRequest, err.Error())
 }
 
-// Client talks to the local daemon over Unix Socket (Unix) or loopback token TCP (Windows).
+// Client talks to either the local daemon or a remote C/S server.
 type Client struct {
-	httpClient *http.Client
-	baseURL    string
-	token      string
+	httpClient  *http.Client
+	baseURL     string
+	token       string
+	bearerToken string
+	remote      bool
+}
+
+// IsRemote reports whether this client targets a remote server context.
+func (c *Client) IsRemote() bool {
+	return c != nil && c.remote
 }
 
 // LookupError mirrors TargetLookupError across the RPC boundary.
@@ -926,6 +1064,9 @@ func (c *Client) DoRaw(ctx context.Context, method, path, contentType string, ra
 	if c.token != "" {
 		req.Header.Set("X-Agent-DBCTL-Token", c.token)
 	}
+	if c.bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -941,10 +1082,26 @@ func (c *Client) DoRaw(ctx context.Context, method, path, contentType string, ra
 			return nil, &le
 		}
 		var errMap map[string]string
+		msg := strings.TrimSpace(string(raw))
 		if json.Unmarshal(raw, &errMap) == nil && errMap["error"] != "" {
-			return nil, fmt.Errorf("%s", errMap["error"])
+			msg = errMap["error"]
 		}
-		return nil, fmt.Errorf("daemon RPC HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		switch resp.StatusCode {
+		case http.StatusUnauthorized:
+			if msg == "" {
+				msg = "authentication required"
+			}
+			return nil, &LookupError{Code: types.ErrCodeAuthRequired, Message: msg}
+		case http.StatusForbidden:
+			if msg == "" {
+				msg = "forbidden"
+			}
+			return nil, &LookupError{Code: types.ErrCodeForbidden, Message: msg}
+		}
+		if msg != "" {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		return nil, fmt.Errorf("daemon RPC HTTP %d", resp.StatusCode)
 	}
 	return raw, nil
 }

@@ -42,6 +42,7 @@ type GlobalSecurityConfig struct {
 	DefaultApprovalProvider   string `json:"default_approval_provider"`
 	RedactAuditLiterals       bool   `json:"redact_audit_literals"`
 	RequireReasonForApproval  bool   `json:"require_reason_for_approval"`
+	ForbidSelfApproval        bool   `json:"forbid_self_approval"`
 	UpdatedAtUTC              string `json:"updated_at_utc"`
 }
 

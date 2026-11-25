@@ -14,7 +14,7 @@ import (
 
 // ListRiskPatternRules returns all configured custom/preset high-risk pattern rules.
 func (s *Store) ListRiskPatternRules(ctx context.Context) ([]types.RiskPatternRule, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.dbQuery(ctx, `
 		SELECT id, name, description, scope_type, scope_id, enabled, builtin_pack,
 			engines_json, families_json, action, confirm_title, confirm_message,
 			approval_provider, condition_json, priority, created_at_utc, updated_at_utc
@@ -66,7 +66,7 @@ func (s *Store) upsertRiskPatternRuleTx(ctx context.Context, tx *sql.Tx, actor s
 	if r.ScopeType == "global" {
 		r.ScopeID = "global"
 	} else {
-		r.ScopeID = canonicalizeScopeIDTx(ctx, tx, r.ScopeType, r.ScopeID)
+		r.ScopeID = s.canonicalizeScopeIDTx(ctx, tx, r.ScopeType, r.ScopeID)
 	}
 	if err := policy.ValidateRiskPatternRule(r); err != nil {
 		return r, err
@@ -76,7 +76,7 @@ func (s *Store) upsertRiskPatternRuleTx(ctx context.Context, tx *sql.Tx, actor s
 	}
 
 	var existingCreated string
-	err := tx.QueryRowContext(ctx, `SELECT created_at_utc FROM risk_pattern_rules WHERE id = ?`, r.ID).Scan(&existingCreated)
+	err := s.txQueryRow(ctx, tx, `SELECT created_at_utc FROM risk_pattern_rules WHERE id = ?`, r.ID).Scan(&existingCreated)
 	action := "risk_pattern.create"
 	if err == nil {
 		action = "risk_pattern.update"
@@ -98,7 +98,7 @@ func (s *Store) upsertRiskPatternRuleTx(ctx context.Context, tx *sql.Tx, actor s
 	familiesJSON, _ := json.Marshal(r.Families)
 	condJSON, _ := json.Marshal(r.Condition)
 
-	_, err = tx.ExecContext(ctx, `
+	_, err = s.txExec(ctx, tx, `
 		INSERT INTO risk_pattern_rules(
 			id, name, description, scope_type, scope_id, enabled, builtin_pack,
 			engines_json, families_json, action, confirm_title, confirm_message,
@@ -124,7 +124,7 @@ func (s *Store) upsertRiskPatternRuleTx(ctx context.Context, tx *sql.Tx, actor s
 		string(enginesJSON), string(familiesJSON), string(r.Action), r.ConfirmTitle, r.ConfirmMessage,
 		r.ApprovalProvider, string(condJSON), r.Priority, r.CreatedAtUTC, r.UpdatedAtUTC)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if isUniqueErr(err) {
 			return r, fmt.Errorf("%w: duplicate pattern rule %q in scope %s:%s", ErrConflict, r.Name, r.ScopeType, r.ScopeID)
 		}
 		return r, err
@@ -138,7 +138,7 @@ func (s *Store) upsertRiskPatternRuleTx(ctx context.Context, tx *sql.Tx, actor s
 // DeleteRiskPatternRule removes a custom pattern rule and writes an audit record in the same tx.
 func (s *Store) DeleteRiskPatternRule(ctx context.Context, actor, id string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `DELETE FROM risk_pattern_rules WHERE id = ?`, id)
+		res, err := s.txExec(ctx, tx, `DELETE FROM risk_pattern_rules WHERE id = ?`, id)
 		if err != nil {
 			return err
 		}
@@ -170,13 +170,13 @@ func (s *Store) InstallBuiltinRulePack(ctx context.Context, actor, packID, scope
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
 		canonicalScopeID := scopeID
 		if scopeType != "global" {
-			canonicalScopeID = canonicalizeScopeIDTx(ctx, tx, scopeType, scopeID)
+			canonicalScopeID = s.canonicalizeScopeIDTx(ctx, tx, scopeType, scopeID)
 		}
 		for _, tmpl := range pack.Rules {
 			tmpl.ScopeType = scopeType
 			tmpl.ScopeID = canonicalScopeID
 			var existingID string
-			err := tx.QueryRowContext(ctx, `SELECT id FROM risk_pattern_rules WHERE scope_type = ? AND scope_id = ? AND name = ?`,
+			err := s.txQueryRow(ctx, tx, `SELECT id FROM risk_pattern_rules WHERE scope_type = ? AND scope_id = ? AND name = ?`,
 				scopeType, canonicalScopeID, tmpl.Name).Scan(&existingID)
 			if err == nil {
 				tmpl.ID = existingID

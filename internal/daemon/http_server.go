@@ -15,7 +15,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/x0c/agent-dbctl/internal/auth"
 	"github.com/x0c/agent-dbctl/internal/policy"
+	"github.com/x0c/agent-dbctl/internal/rbac"
 	"github.com/x0c/agent-dbctl/internal/store"
 	"github.com/x0c/agent-dbctl/internal/types"
 	"github.com/x0c/agent-dbctl/internal/webui"
@@ -29,13 +31,18 @@ const (
 // NewWebHandler builds the local HTTP + SSE router for the embedded Web Console.
 func NewWebHandler(svc *Service) http.Handler {
 	mux := http.NewServeMux()
+	registerWebAPIRoutes(mux, svc)
+	return WebSecurityMiddleware(svc, mux)
+}
+
+func registerWebAPIRoutes(mux *http.ServeMux, svc *Service) {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSONResp(w, http.StatusOK, map[string]string{"status": "running"})
 	})
 
-	// Bootstrap & server-driven display catalogs (also issues per-daemon HttpOnly session cookie + CSRF token).
+	// Bootstrap & server-driven display catalogs.
 	mux.HandleFunc("GET /api/v1/bootstrap", func(w http.ResponseWriter, r *http.Request) {
-		if !isSafeBootstrapRequest(r) {
+		if !svc.IsServerMode() && !isSafeBootstrapRequest(r) {
 			writeHTTPErr(w, http.StatusForbidden, "cross-origin bootstrap blocked")
 			return
 		}
@@ -50,6 +57,40 @@ func NewWebHandler(svc *Service) http.Handler {
 			return
 		}
 		pending, _ := svc.Store().ListApprovals(r.Context(), string(types.ApprovalPending), 200)
+		p := rbac.PrincipalFromContext(r.Context())
+		if svc.IsServerMode() {
+			pending = filterApprovalsForPrincipal(r.Context(), svc, p, pending)
+			csrf := ""
+			if c, err := r.Cookie(uiSessionCookieName); err == nil && c != nil && c.Value != "" {
+				csrf = serverCSRFForSession(svc, auth.HashToken(c.Value))
+			}
+			isAdmin := rbac.IsPlatformAdmin(p)
+			authInfo := publicAuthInfo(svc, true)
+			writeJSONResp(w, http.StatusOK, map[string]any{
+				"mode":                   types.ModeServer,
+				"authenticated":          true,
+				"auth_methods":           authInfo.AuthMethods,
+				"oidc_enabled":           authInfo.OIDCEnabled,
+				"local_enabled":          authInfo.LocalEnabled,
+				"identity":               svc.Identity(),
+				"display_catalog":        cat,
+				"global_security":        sec,
+				"pending_approval_count": len(pending),
+				"secret_backend":         svc.Secrets().Name(),
+				"ui_csrf_token":          csrf,
+				"current_user": types.AuthBootstrapUser{
+					ID:              p.ID,
+					Email:           p.Email,
+					DisplayName:     p.DisplayName,
+					Roles:           p.Roles,
+					IsPlatformAdmin: isAdmin,
+					CanManageUsers:  isAdmin,
+					CanEditSecurity: isAdmin,
+				},
+			})
+			return
+		}
+
 		http.SetCookie(w, &http.Cookie{
 			Name:     uiSessionCookieName,
 			Value:    svc.UISessionToken(),
@@ -58,6 +99,8 @@ func NewWebHandler(svc *Service) http.Handler {
 			SameSite: http.SameSiteStrictMode,
 		})
 		writeJSONResp(w, http.StatusOK, map[string]any{
+			"mode":                   types.ModeLocal,
+			"authenticated":          true,
 			"identity":               svc.Identity(),
 			"display_catalog":        cat,
 			"global_security":        sec,
@@ -77,8 +120,8 @@ func NewWebHandler(svc *Service) http.Handler {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		ch := svc.subscribeSSE()
-		defer svc.unsubscribeSSE(ch)
+		sub := svc.subscribeSSE(rbac.PrincipalFromContext(r.Context()))
+		defer svc.unsubscribeSSE(sub)
 
 		_, _ = fmt.Fprintf(w, "event: ready\ndata: {}\n\n")
 		flusher.Flush()
@@ -94,7 +137,7 @@ func NewWebHandler(svc *Service) http.Handler {
 			case <-keepAlive.C:
 				_, _ = fmt.Fprintf(w, ": ping\n\n")
 				flusher.Flush()
-			case ev, open := <-ch:
+			case ev, open := <-sub.ch:
 				if !open {
 					return
 				}
@@ -112,6 +155,9 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if svc.IsServerMode() {
+			items = filterSystemsForPrincipal(rbac.PrincipalFromContext(r.Context()), items)
+		}
 		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
 	})
 	mux.HandleFunc("POST /api/v1/systems", func(w http.ResponseWriter, r *http.Request) {
@@ -120,15 +166,15 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		saved, err := svc.Store().UpsertSystem(r.Context(), "web-admin", body)
+		res, err := svc.AdminUpsertSystem(r.Context(), svc.effectiveActor(r.Context(), ""), body, false)
 		if err != nil {
 			writeStoreErr(w, err)
 			return
 		}
-		writeJSONResp(w, http.StatusOK, saved)
+		writeJSONResp(w, http.StatusOK, res.Item)
 	})
 	mux.HandleFunc("DELETE /api/v1/systems/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.Store().DeleteSystem(r.Context(), "web-admin", r.PathValue("id")); err != nil {
+		if err := svc.AdminDeleteSystem(r.Context(), svc.effectiveActor(r.Context(), ""), r.PathValue("id")); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
@@ -150,15 +196,15 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		saved, err := svc.Store().UpsertEnvironment(r.Context(), "web-admin", body)
+		res, err := svc.AdminUpsertEnvironment(r.Context(), svc.effectiveActor(r.Context(), ""), body, false)
 		if err != nil {
 			writeStoreErr(w, err)
 			return
 		}
-		writeJSONResp(w, http.StatusOK, saved)
+		writeJSONResp(w, http.StatusOK, res.Item)
 	})
 	mux.HandleFunc("DELETE /api/v1/environments/{code...}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.AdminDeleteEnvironment(r.Context(), "web-admin", r.PathValue("code")); err != nil {
+		if err := svc.AdminDeleteEnvironment(r.Context(), svc.effectiveActor(r.Context(), ""), r.PathValue("code")); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
@@ -172,6 +218,9 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if svc.IsServerMode() {
+			items = filterScopedProfiles(rbac.PrincipalFromContext(r.Context()), items, func(x types.NetworkProfile) (string, string) { return x.ScopeType, x.ScopeID })
+		}
 		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
 	})
 	mux.HandleFunc("POST /api/v1/network-profiles", func(w http.ResponseWriter, r *http.Request) {
@@ -180,15 +229,15 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		saved, err := svc.Store().UpsertNetworkProfile(r.Context(), "web-admin", body)
+		res, err := svc.AdminUpsertNetworkProfile(r.Context(), svc.effectiveActor(r.Context(), ""), body, false)
 		if err != nil {
 			writeStoreErr(w, err)
 			return
 		}
-		writeJSONResp(w, http.StatusOK, saved)
+		writeJSONResp(w, http.StatusOK, res.Item)
 	})
 	mux.HandleFunc("DELETE /api/v1/network-profiles/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.Store().DeleteNetworkProfile(r.Context(), "web-admin", r.PathValue("id")); err != nil {
+		if err := svc.AdminDeleteNetworkProfile(r.Context(), svc.effectiveActor(r.Context(), ""), r.PathValue("id")); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
@@ -202,42 +251,38 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if svc.IsServerMode() {
+			items = filterScopedProfiles(rbac.PrincipalFromContext(r.Context()), items, func(x types.CredentialProfile) (string, string) { return x.ScopeType, x.ScopeID })
+		}
 		for i := range items {
 			items[i].HasSecret = svc.hasCredentialSecret(r.Context(), items[i])
 		}
 		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
 	})
 	mux.HandleFunc("POST /api/v1/credentials", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			types.CredentialProfile
-			SecretValue string `json:"secret_value"`
-		}
+		var body CredentialUpsertRequest
 		if err := decodeJSONBody(r, &body); err != nil {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		saved, err := svc.Store().UpsertCredentialProfile(r.Context(), "web-admin", body.CredentialProfile)
+		if body.SecretValue != "" {
+			body.SecretProvided = true
+		}
+		res, err := svc.AdminUpsertCredentialProfile(r.Context(), svc.effectiveActor(r.Context(), ""), body)
 		if err != nil {
 			writeStoreErr(w, err)
 			return
 		}
-		if body.Kind == types.CredKeychain && body.SecretValue != "" {
-			if err := svc.Secrets().Put(r.Context(), "cred:"+saved.ID, body.SecretValue); err != nil {
-				writeHTTPErr(w, http.StatusInternalServerError, "save secret failed: "+err.Error())
-				return
-			}
-		}
-		saved.HasSecret = svc.hasCredentialSecret(r.Context(), saved)
-		svc.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "credential", "id": saved.ID}})
-		writeJSONResp(w, http.StatusOK, saved)
+		svc.InvalidateCatalogPools("credential", res.Item.ID)
+		writeJSONResp(w, http.StatusOK, res.Item)
 	})
 	mux.HandleFunc("DELETE /api/v1/credentials/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if err := svc.Store().DeleteCredentialProfile(r.Context(), "web-admin", id); err != nil {
+		if err := svc.AdminDeleteCredentialProfile(r.Context(), svc.effectiveActor(r.Context(), ""), id); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
-		_ = svc.Secrets().Delete(r.Context(), "cred:"+id)
+		svc.InvalidateCatalogPools("credential", id)
 		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
 	})
 
@@ -248,6 +293,9 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if svc.IsServerMode() {
+			items = filterScopedProfiles(rbac.PrincipalFromContext(r.Context()), items, func(x types.Instance) (string, string) { return x.ScopeType, x.ScopeID })
+		}
 		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
 	})
 	mux.HandleFunc("POST /api/v1/instances", func(w http.ResponseWriter, r *http.Request) {
@@ -256,18 +304,21 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		saved, err := svc.Store().UpsertInstance(r.Context(), "web-admin", body)
+		res, err := svc.AdminUpsertInstance(r.Context(), svc.effectiveActor(r.Context(), ""), body, false)
 		if err != nil {
 			writeStoreErr(w, err)
 			return
 		}
-		writeJSONResp(w, http.StatusOK, saved)
+		svc.InvalidateCatalogPools("instance", res.Item.ID)
+		writeJSONResp(w, http.StatusOK, res.Item)
 	})
 	mux.HandleFunc("DELETE /api/v1/instances/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.Store().DeleteInstance(r.Context(), "web-admin", r.PathValue("id")); err != nil {
+		id := r.PathValue("id")
+		if err := svc.AdminDeleteInstance(r.Context(), svc.effectiveActor(r.Context(), ""), id); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
+		svc.InvalidateCatalogPools("instance", id)
 		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
 	})
 	mux.HandleFunc("POST /api/v1/instances/{id}/test", func(w http.ResponseWriter, r *http.Request) {
@@ -307,7 +358,7 @@ func NewWebHandler(svc *Service) http.Handler {
 		req.NoWorkspace = true
 		req.WorkspaceCWD = ""
 		req.WorkspaceGitRemotes = nil
-		res, err := svc.AdminAddDatabase(r.Context(), "web-admin", req)
+		res, err := svc.AdminAddDatabase(r.Context(), svc.effectiveActor(r.Context(), ""), req)
 		if err != nil {
 			writeStoreErr(w, err)
 			return
@@ -328,18 +379,21 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		saved, err := svc.Store().UpsertTarget(r.Context(), "web-admin", body)
+		res, err := svc.AdminUpsertTarget(r.Context(), svc.effectiveActor(r.Context(), ""), body, false)
 		if err != nil {
 			writeStoreErr(w, err)
 			return
 		}
-		writeJSONResp(w, http.StatusOK, saved)
+		svc.InvalidateCatalogPools("target", res.Item.ID)
+		writeJSONResp(w, http.StatusOK, res.Item)
 	})
 	mux.HandleFunc("DELETE /api/v1/targets/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.Store().DeleteTarget(r.Context(), "web-admin", r.PathValue("id")); err != nil {
+		id := r.PathValue("id")
+		if _, err := svc.AdminDeleteTarget(r.Context(), svc.effectiveActor(r.Context(), ""), id); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
+		svc.InvalidateCatalogPools("target", id)
 		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
 	})
 	mux.HandleFunc("POST /api/v1/targets/{id}/test", func(w http.ResponseWriter, r *http.Request) {
@@ -369,7 +423,10 @@ func NewWebHandler(svc *Service) http.Handler {
 
 	// Topology Export / Import (YAML or JSON, secret-free)
 	mux.HandleFunc("GET /api/v1/topology", func(w http.ResponseWriter, r *http.Request) {
-		b, err := svc.Store().ExportTopology(r.Context())
+		if svc.IsServerMode() && !requireHTTPAction(w, r, rbac.ActionTopologyRead, rbac.ResourceScope{}) {
+			return
+		}
+		b, err := svc.ExportTopologyForPrincipal(r.Context())
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -405,10 +462,11 @@ func NewWebHandler(svc *Service) http.Handler {
 				return
 			}
 		}
-		if err := svc.Store().ImportTopology(r.Context(), "web-admin", bundle); err != nil {
+		if _, err := svc.AdminApplyTopology(r.Context(), svc.effectiveActor(r.Context(), ""), bundle, false); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
+		svc.InvalidateCatalogPools("topology", "")
 		writeJSONResp(w, http.StatusOK, map[string]bool{"imported": true})
 	})
 
@@ -419,6 +477,9 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if svc.IsServerMode() {
+			items = filterPoliciesForPrincipal(r.Context(), svc, rbac.PrincipalFromContext(r.Context()), items)
+		}
 		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
 	})
 	mux.HandleFunc("POST /api/v1/policies", func(w http.ResponseWriter, r *http.Request) {
@@ -427,15 +488,15 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		saved, err := svc.Store().UpsertPolicy(r.Context(), "web-admin", body)
+		res, err := svc.AdminUpsertPolicy(r.Context(), svc.effectiveActor(r.Context(), ""), body, false)
 		if err != nil {
 			writeStoreErr(w, err)
 			return
 		}
-		writeJSONResp(w, http.StatusOK, saved)
+		writeJSONResp(w, http.StatusOK, res.Item)
 	})
 	mux.HandleFunc("DELETE /api/v1/policies/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.Store().DeletePolicy(r.Context(), "web-admin", r.PathValue("id")); err != nil {
+		if err := svc.AdminDeletePolicy(r.Context(), svc.effectiveActor(r.Context(), ""), r.PathValue("id")); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
@@ -455,13 +516,13 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		saved, err := svc.Store().UpdateGlobalSecurityConfig(r.Context(), "web-admin", body)
+		res, err := svc.AdminUpdateGlobalSecurity(r.Context(), svc.effectiveActor(r.Context(), ""), body, false)
 		if err != nil {
-			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			writeStoreErr(w, err)
 			return
 		}
-		svc.broadcast(Event{Type: "security_updated", Data: saved})
-		writeJSONResp(w, http.StatusOK, saved)
+		svc.broadcast(Event{Type: "security_updated", Data: res.Item})
+		writeJSONResp(w, http.StatusOK, res.Item)
 	})
 
 	// Custom High-Risk Pattern Rules & Dry-Run Sandbox
@@ -470,6 +531,9 @@ func NewWebHandler(svc *Service) http.Handler {
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if svc.IsServerMode() {
+			items = filterRiskPatternsForPrincipal(r.Context(), svc, rbac.PrincipalFromContext(r.Context()), items)
 		}
 		writeJSONResp(w, http.StatusOK, map[string]any{
 			"items":         items,
@@ -482,17 +546,17 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		saved, err := svc.Store().UpsertRiskPatternRule(r.Context(), "web-admin", body)
+		res, err := svc.AdminUpsertRiskPattern(r.Context(), svc.effectiveActor(r.Context(), ""), body, false)
 		if err != nil {
 			writeStoreErr(w, err)
 			return
 		}
-		svc.broadcast(Event{Type: "patterns_updated", Data: saved})
-		writeJSONResp(w, http.StatusOK, saved)
+		svc.broadcast(Event{Type: "patterns_updated", Data: res.Item})
+		writeJSONResp(w, http.StatusOK, res.Item)
 	})
 	mux.HandleFunc("DELETE /api/v1/risk-patterns/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if err := svc.Store().DeleteRiskPatternRule(r.Context(), "web-admin", id); err != nil {
+		if err := svc.AdminDeleteRiskPattern(r.Context(), svc.effectiveActor(r.Context(), ""), id, "", ""); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
@@ -505,13 +569,12 @@ func NewWebHandler(svc *Service) http.Handler {
 			ScopeID   string `json:"scope_id"`
 		}
 		_ = decodeJSONBody(r, &body)
-		installed, err := svc.Store().InstallBuiltinRulePack(r.Context(), "web-admin", r.PathValue("id"), body.ScopeType, body.ScopeID)
+		res, err := svc.AdminInstallRulePack(r.Context(), svc.effectiveActor(r.Context(), ""), r.PathValue("id"), body.ScopeType, body.ScopeID, false)
 		if err != nil {
 			writeStoreErr(w, err)
 			return
 		}
-		svc.broadcast(Event{Type: "patterns_updated", Data: map[string]any{"pack_id": r.PathValue("id"), "count": len(installed)}})
-		writeJSONResp(w, http.StatusOK, map[string]any{"items": installed})
+		writeJSONResp(w, http.StatusOK, res)
 	})
 	mux.HandleFunc("POST /api/v1/risk-patterns/test", func(w http.ResponseWriter, r *http.Request) {
 		var body types.PatternTestRequest
@@ -535,6 +598,9 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if svc.IsServerMode() {
+			items = filterApprovalsForPrincipal(r.Context(), svc, rbac.PrincipalFromContext(r.Context()), items)
+		}
 		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
 	})
 	mux.HandleFunc("GET /api/v1/approvals/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -542,6 +608,13 @@ func NewWebHandler(svc *Service) http.Handler {
 		if err != nil {
 			writeStoreErr(w, err)
 			return
+		}
+		if svc.IsServerMode() {
+			p := rbac.PrincipalFromContext(r.Context())
+			if len(filterApprovalsForPrincipal(r.Context(), svc, p, []types.ApprovalRequest{app})) == 0 {
+				writeHTTPErr(w, http.StatusForbidden, "forbidden: approval is outside your authorized scope")
+				return
+			}
 		}
 		writeJSONResp(w, http.StatusOK, app)
 	})
@@ -561,6 +634,9 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if svc.IsServerMode() {
+			items = filterOperationsForPrincipal(rbac.PrincipalFromContext(r.Context()), items)
+		}
 		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
 	})
 	mux.HandleFunc("GET /api/v1/audit", func(w http.ResponseWriter, r *http.Request) {
@@ -571,9 +647,15 @@ func NewWebHandler(svc *Service) http.Handler {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if svc.IsServerMode() {
+			items = filterAuditForPrincipal(r.Context(), svc, rbac.PrincipalFromContext(r.Context()), items)
+		}
 		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
 	})
 	mux.HandleFunc("POST /api/v1/audit/verify", func(w http.ResponseWriter, r *http.Request) {
+		if svc.IsServerMode() && !requireHTTPAction(w, r, rbac.ActionAuditVerify, rbac.ResourceScope{}) {
+			return
+		}
 		res, err := svc.Store().VerifyAuditChain(r.Context())
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
@@ -592,6 +674,9 @@ func NewWebHandler(svc *Service) http.Handler {
 		})
 	})
 	mux.HandleFunc("POST /api/v1/plugins/reload", func(w http.ResponseWriter, r *http.Request) {
+		if svc.IsServerMode() && !requireHTTPAction(w, r, rbac.ActionPluginManage, rbac.ResourceScope{}) {
+			return
+		}
 		items, err := svc.Plugins().Reload()
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
@@ -602,8 +687,6 @@ func NewWebHandler(svc *Service) http.Handler {
 
 	// Embedded TypeScript Web Console SPA fallback.
 	mux.Handle("/", webui.Handler())
-
-	return WebSecurityMiddleware(svc, mux)
 }
 
 func handleApprovalDecision(w http.ResponseWriter, r *http.Request, svc *Service, approve bool) {
@@ -613,11 +696,15 @@ func handleApprovalDecision(w http.ResponseWriter, r *http.Request, svc *Service
 		Token    string `json:"token"`
 	}
 	_ = decodeJSONBody(r, &body)
-	// Require a validated per-daemon session cookie + CSRF token for session-based approval;
-	// otherwise ResolveApproval validates the one-time approval_token from the deep link.
-	trustedUI := hasValidUISession(r, svc)
+	// In local mode, accept either validated UI session+CSRF or one-time approval_token;
+	// in server mode, ServerSecurityMiddleware always enforces authenticated human session+CSRF.
+	trustedUI := svc.IsServerMode() || hasValidUISession(r, svc)
 	app, err := svc.ResolveApproval(r.Context(), r.PathValue("id"), approve, body.Reviewer, body.Note, body.Token, trustedUI)
 	if err != nil {
+		if strings.Contains(err.Error(), "forbidden") {
+			writeHTTPErr(w, http.StatusForbidden, err.Error())
+			return
+		}
 		if strings.Contains(err.Error(), "token") {
 			writeHTTPErr(w, http.StatusForbidden, err.Error())
 			return
@@ -777,6 +864,8 @@ func writeHTTPErr(w http.ResponseWriter, status int, msg string) {
 
 func writeStoreErr(w http.ResponseWriter, err error) {
 	switch {
+	case strings.Contains(err.Error(), "forbidden"):
+		writeHTTPErr(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, store.ErrNotFound):
 		writeHTTPErr(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, store.ErrConflict):

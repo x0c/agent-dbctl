@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,16 +17,34 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/x0c/agent-dbctl/internal/audit"
 	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
 
-// Store manages the transactional SQLite catalog, policy, operations, and hash-chain audit store.
+type pendingAudit struct {
+	actor    string
+	action   string
+	targetID string
+	opID     string
+	payload  string
+	ts       string
+}
+
+type auditBatch struct {
+	items []pendingAudit
+}
+
+// Store manages the transactional SQLite or PostgreSQL catalog, policy, operations, auth, and hash-chain audit store.
 type Store struct {
-	db      *sql.DB
-	dbPath  string
-	writeMu sync.Mutex
+	db        *sql.DB
+	pgPool    *pgxpool.Pool
+	dbPath    string
+	dialect   Dialect
+	writeMu   sync.Mutex
+	batchMu   sync.Mutex
+	txBatches map[*sql.Tx]*auditBatch
 }
 
 // Open initializes the SQLite database with WAL mode verification and migrations.
@@ -69,7 +88,12 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 		}
 	}
 
-	s := &Store{db: db, dbPath: dbPath}
+	s := &Store{
+		db:        db,
+		dbPath:    dbPath,
+		dialect:   DialectSQLite,
+		txBatches: make(map[*sql.Tx]*auditBatch),
+	}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -81,13 +105,20 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 	return s, nil
 }
 
-// Close closes the underlying SQLite pool.
+// Close closes the underlying SQLite or PostgreSQL pool.
 func (s *Store) Close() error {
-	return s.db.Close()
+	err := s.db.Close()
+	if s.pgPool != nil {
+		s.pgPool.Close()
+	}
+	return err
 }
 
-// VerifyWAL returns the live journal_mode read back from SQLite.
+// VerifyWAL returns the live journal_mode read back from SQLite (or "postgres" for PostgreSQL).
 func (s *Store) VerifyWAL(ctx context.Context) (string, error) {
+	if s.isPG() {
+		return "postgres", nil
+	}
 	var mode string
 	if err := s.db.QueryRowContext(ctx, "PRAGMA journal_mode;").Scan(&mode); err != nil {
 		return "", err
@@ -375,8 +406,136 @@ CREATE INDEX IF NOT EXISTS idx_risk_patterns_scope ON risk_pattern_rules(scope_t
 	if err := s.ensureColumnLocked(ctx, "policies", "scan_read_mode", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := s.ensureColumnLocked(ctx, "network_profiles", "scope_type", "TEXT NOT NULL DEFAULT 'global'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumnLocked(ctx, "network_profiles", "scope_id", "TEXT NOT NULL DEFAULT 'global'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumnLocked(ctx, "credential_profiles", "scope_type", "TEXT NOT NULL DEFAULT 'global'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumnLocked(ctx, "credential_profiles", "scope_id", "TEXT NOT NULL DEFAULT 'global'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumnLocked(ctx, "instances", "scope_type", "TEXT NOT NULL DEFAULT 'global'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumnLocked(ctx, "instances", "scope_id", "TEXT NOT NULL DEFAULT 'global'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumnLocked(ctx, "global_security_config", "forbid_self_approval", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
+	for _, col := range []struct{ name, def string }{
+		{"principal_id", "TEXT NOT NULL DEFAULT ''"},
+		{"principal_kind", "TEXT NOT NULL DEFAULT ''"},
+		{"owner_user_id", "TEXT NOT NULL DEFAULT ''"},
+		{"owner_node_id", "TEXT NOT NULL DEFAULT ''"},
+		{"lease_expires_at_utc", "TEXT NOT NULL DEFAULT ''"},
+		{"cancel_requested_at_utc", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.ensureColumnLocked(ctx, "operations", col.name, col.def); err != nil {
+			return err
+		}
+	}
+	if err := s.ensureColumnLocked(ctx, "approvals", "principal_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumnLocked(ctx, "approvals", "reviewer_user_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+
+	const csSchema = `
+CREATE TABLE IF NOT EXISTS users (
+	id TEXT PRIMARY KEY,
+	email TEXT NOT NULL UNIQUE,
+	display_name TEXT NOT NULL DEFAULT '',
+	oidc_issuer TEXT NOT NULL DEFAULT '',
+	oidc_subject TEXT NOT NULL DEFAULT '',
+	password_hash TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT 'active',
+	created_at_utc TEXT NOT NULL,
+	updated_at_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS role_bindings (
+	id TEXT PRIMARY KEY,
+	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	role TEXT NOT NULL,
+	scope_type TEXT NOT NULL,
+	scope_id TEXT NOT NULL DEFAULT '',
+	created_by TEXT NOT NULL DEFAULT '',
+	created_at_utc TEXT NOT NULL,
+	UNIQUE(user_id, role, scope_type, scope_id)
+);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+	id TEXT PRIMARY KEY,
+	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	name TEXT NOT NULL,
+	token_prefix TEXT NOT NULL,
+	token_hash TEXT NOT NULL UNIQUE,
+	role_ceiling TEXT NOT NULL DEFAULT '',
+	allowed_systems_json TEXT NOT NULL DEFAULT '[]',
+	allowed_envs_json TEXT NOT NULL DEFAULT '[]',
+	read_only_forced INTEGER NOT NULL DEFAULT 0,
+	expires_at_utc TEXT NOT NULL DEFAULT '',
+	last_used_at_utc TEXT NOT NULL DEFAULT '',
+	revoked_at_utc TEXT NOT NULL DEFAULT '',
+	created_at_utc TEXT NOT NULL,
+	UNIQUE(user_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS web_sessions (
+	id_hash TEXT PRIMARY KEY,
+	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	csrf_token_hash TEXT NOT NULL,
+	expires_at_utc TEXT NOT NULL,
+	created_at_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oidc_auth_states (
+	state_hash TEXT PRIMARY KEY,
+	nonce TEXT NOT NULL,
+	pkce_verifier TEXT NOT NULL,
+	return_to TEXT NOT NULL DEFAULT '/',
+	expires_at_utc TEXT NOT NULL,
+	created_at_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS encrypted_secrets (
+	secret_key TEXT PRIMARY KEY,
+	key_version INTEGER NOT NULL DEFAULT 1,
+	nonce BLOB NOT NULL,
+	ciphertext BLOB NOT NULL,
+	updated_at_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS webhook_callback_nonces (
+	provider TEXT NOT NULL,
+	event_id TEXT NOT NULL,
+	expires_at_utc TEXT NOT NULL,
+	PRIMARY KEY(provider, event_id)
+);
+
+CREATE TABLE IF NOT EXISTS operation_results (
+	operation_id TEXT PRIMARY KEY,
+	result_json BLOB NOT NULL,
+	expires_at_utc TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operations_lease ON operations(status, lease_expires_at_utc);
+CREATE INDEX IF NOT EXISTS idx_role_bindings_user ON role_bindings(user_id);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
+`
+	if _, err := s.db.ExecContext(ctx, csSchema); err != nil {
+		return fmt.Errorf("apply sqlite c/s schema: %w", err)
+	}
+
 	now := nowUTC()
-	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?)`, now, now, now, now, now); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?), (6, ?)`, now, now, now, now, now, now); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
 	return nil
@@ -416,17 +575,17 @@ func (s *Store) ensureColumnLocked(ctx context.Context, table, column, colDef st
 func (s *Store) seedDefaults(ctx context.Context) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var count int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM global_security_config`).Scan(&count); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM global_security_config`).Scan(&count); err != nil {
 			return err
 		}
 		now := nowUTC()
 		if count == 0 {
-			_, err := tx.ExecContext(ctx, `
+			_, err := s.txExec(ctx, tx, `
 				INSERT INTO global_security_config(
 					id, exec_timeout_sec, approval_timeout_sec, max_rows, max_bytes,
 					explain_max_rows, prod_read_only_freeze, block_multi_statement_in_prod,
-					default_approval_provider, redact_audit_literals, require_reason_for_approval, updated_at_utc
-				) VALUES (1, 15, 120, 200, 262144, 100000, 0, 1, 'local-web', 1, 1, ?)`, now)
+					default_approval_provider, redact_audit_literals, require_reason_for_approval, forbid_self_approval, updated_at_utc
+				) VALUES (1, 15, 120, 200, 262144, 100000, 0, 1, 'local-web', 1, 1, 1, ?)`, now)
 			if err != nil {
 				return err
 			}
@@ -436,7 +595,7 @@ func (s *Store) seedDefaults(ctx context.Context) error {
 		}
 
 		var envCount int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM environments`).Scan(&envCount); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM environments`).Scan(&envCount); err != nil {
 			return err
 		}
 		if envCount == 0 {
@@ -465,7 +624,7 @@ func (s *Store) seedDefaults(ctx context.Context) error {
 			}
 			for _, env := range defaults {
 				labelsJSON, _ := json.Marshal(env.Labels)
-				if _, err := tx.ExecContext(ctx, `
+				if _, err := s.txExec(ctx, tx, `
 					INSERT INTO environments(code, safety_tier, labels_json, color, sort_order, default_policy_id, created_at_utc, updated_at_utc)
 					VALUES (?, ?, ?, ?, ?, '', ?, ?)`,
 					env.Code, string(env.SafetyTier), string(labelsJSON), env.Color, env.SortOrder, now, now); err != nil {
@@ -481,13 +640,34 @@ func (s *Store) seedDefaults(ctx context.Context) error {
 }
 
 func (s *Store) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	if !s.isPG() {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	batch := &auditBatch{}
+	s.batchMu.Lock()
+	if s.txBatches == nil {
+		s.txBatches = make(map[*sql.Tx]*auditBatch)
+	}
+	s.txBatches[tx] = batch
+	s.batchMu.Unlock()
+	defer func() {
+		s.batchMu.Lock()
+		delete(s.txBatches, tx)
+		s.batchMu.Unlock()
+	}()
+
 	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	// Flush all buffered audit entries at the very end of the transaction so
+	// PostgreSQL locks audit_chain_head strictly after business rows (deadlock-free).
+	if err := s.flushAuditBatchTx(ctx, tx, batch); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -505,25 +685,73 @@ func (s *Store) appendAuditTx(ctx context.Context, tx *sql.Tx, actor, action, ta
 	if err != nil {
 		return err
 	}
-
-	var prevSeq int64
-	var prevHash string
-	err = tx.QueryRowContext(ctx, `SELECT seq, entry_hash FROM audit_logs ORDER BY seq DESC LIMIT 1`).Scan(&prevSeq, &prevHash)
-	if err == sql.ErrNoRows {
-		prevSeq = 0
-		prevHash = audit.GenesisPrevHash
-	} else if err != nil {
-		return err
+	item := pendingAudit{
+		actor:    actor,
+		action:   action,
+		targetID: targetID,
+		opID:     opID,
+		payload:  string(payloadBytes),
+		ts:       ts,
 	}
 
-	nextSeq := prevSeq + 1
-	id := newID("aud")
-	entryHash := audit.ComputeEntryHash(nextSeq, prevHash, actor, action, targetID, opID, string(payloadBytes), ts)
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO audit_logs(seq, id, actor, action, target_id, operation_id, payload_json, prev_hash, entry_hash, created_at_utc)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		nextSeq, id, actor, action, targetID, opID, string(payloadBytes), prevHash, entryHash, ts)
-	return err
+	s.batchMu.Lock()
+	batch := s.txBatches[tx]
+	s.batchMu.Unlock()
+	if batch != nil {
+		batch.items = append(batch.items, item)
+		return nil
+	}
+	return s.flushAuditBatchTx(ctx, tx, &auditBatch{items: []pendingAudit{item}})
+}
+
+func (s *Store) flushAuditBatchTx(ctx context.Context, tx *sql.Tx, batch *auditBatch) error {
+	if batch == nil || len(batch.items) == 0 {
+		return nil
+	}
+	var prevSeq int64
+	var prevHash string
+	if s.isPG() {
+		err := s.txQueryRow(ctx, tx, `SELECT last_seq, last_hash FROM audit_chain_head WHERE id = 1 FOR UPDATE`).Scan(&prevSeq, &prevHash)
+		if errors.Is(err, sql.ErrNoRows) {
+			prevSeq = 0
+			prevHash = audit.GenesisPrevHash
+			if _, insErr := s.txExec(ctx, tx, `INSERT INTO audit_chain_head(id, last_seq, last_hash) VALUES (1, 0, ?) ON CONFLICT(id) DO NOTHING`, prevHash); insErr != nil {
+				return insErr
+			}
+		} else if err != nil {
+			return err
+		}
+	} else {
+		err := s.txQueryRow(ctx, tx, `SELECT seq, entry_hash FROM audit_logs ORDER BY seq DESC LIMIT 1`).Scan(&prevSeq, &prevHash)
+		if errors.Is(err, sql.ErrNoRows) {
+			prevSeq = 0
+			prevHash = audit.GenesisPrevHash
+		} else if err != nil {
+			return err
+		}
+	}
+
+	for _, it := range batch.items {
+		nextSeq := prevSeq + 1
+		id := newID("aud")
+		entryHash := audit.ComputeEntryHash(nextSeq, prevHash, it.actor, it.action, it.targetID, it.opID, it.payload, it.ts)
+		if _, err := s.txExec(ctx, tx, `
+			INSERT INTO audit_logs(seq, id, actor, action, target_id, operation_id, payload_json, prev_hash, entry_hash, created_at_utc)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			nextSeq, id, it.actor, it.action, it.targetID, it.opID, it.payload, prevHash, entryHash, it.ts); err != nil {
+			return err
+		}
+		prevSeq = nextSeq
+		prevHash = entryHash
+	}
+
+	if s.isPG() {
+		if _, err := s.txExec(ctx, tx, `UPDATE audit_chain_head SET last_seq = ?, last_hash = ? WHERE id = 1`, prevSeq, prevHash); err != nil {
+			return err
+		}
+	}
+	batch.items = nil
+	return nil
 }
 
 func nowUTC() string {
@@ -531,7 +759,7 @@ func nowUTC() string {
 }
 
 func newID(prefix string) string {
-	var b [8]byte
+	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return prefix + "_" + hex.EncodeToString(b[:])
 }

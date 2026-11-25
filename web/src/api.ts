@@ -38,13 +38,91 @@ export interface GlobalSecurityConfig {
   updated_at_utc?: string
 }
 
+export type Role = 'platform_admin' | 'system_admin' | 'approver' | 'developer' | 'viewer'
+export type ScopeType = 'global' | 'system' | 'env'
+
+export interface RoleBinding {
+  id: string
+  user_id: string
+  role: Role
+  scope_type: ScopeType
+  scope_id?: string
+  created_at_utc?: string
+  created_by?: string
+}
+
+export interface BootstrapUser {
+  id: string
+  email: string
+  display_name: string
+  roles: RoleBinding[]
+  is_platform_admin: boolean
+  can_manage_users: boolean
+  can_edit_security: boolean
+}
+
+export interface PublicAuthInfo {
+  mode: 'local' | 'server'
+  authenticated: boolean
+  auth_methods?: string[]
+  oidc_enabled?: boolean
+  local_enabled?: boolean
+  version?: string
+}
+
+export interface UserRecord {
+  id: string
+  email: string
+  display_name: string
+  oidc_issuer?: string
+  status: string
+  last_login_at_utc?: string
+  created_at_utc: string
+}
+
+export interface APITokenRecord {
+  id: string
+  user_id: string
+  owner_email?: string
+  name: string
+  token_prefix: string
+  role_ceiling: Role
+  allowed_systems?: string[]
+  allowed_envs?: string[]
+  read_only_forced: boolean
+  expires_at_utc?: string
+  revoked_at_utc?: string
+  last_used_at_utc?: string
+  created_at_utc: string
+}
+
+export interface APITokenCreateResponse {
+  token: APITokenRecord
+  secret_token: string
+}
+
 export interface BootstrapPayload {
+  mode?: 'local' | 'server'
+  authenticated?: boolean
+  auth_methods?: string[]
+  oidc_enabled?: boolean
+  local_enabled?: boolean
   identity: DaemonIdentity
   display_catalog: DisplayCatalog
   global_security: GlobalSecurityConfig
   pending_approval_count: number
   secret_backend: string
   ui_csrf_token?: string
+  current_user?: BootstrapUser
+}
+
+export class AuthRequiredError extends Error {
+  authInfo?: PublicAuthInfo
+  constructor(message: string, authInfo?: PublicAuthInfo) {
+    super(message)
+    this.name = 'AuthRequiredError'
+    this.authInfo = authInfo
+  }
 }
 
 export interface DBAddRequest {
@@ -488,6 +566,42 @@ export interface PingResult {
 }
 
 let uiCSRFToken: string | null = null
+let onAuthRequiredHandler: ((authInfo?: PublicAuthInfo) => void) | null = null
+let sharedEventSource: EventSource | null = null
+const eventListeners = new Map<string, Set<() => void>>()
+
+export function setOnAuthRequired(fn: ((authInfo?: PublicAuthInfo) => void) | null): void {
+  onAuthRequiredHandler = fn
+}
+
+export function closeEventStream(): void {
+  if (sharedEventSource) {
+    sharedEventSource.close()
+    sharedEventSource = null
+  }
+}
+
+function ensureEventSource(): EventSource {
+  if (!sharedEventSource || sharedEventSource.readyState === EventSource.CLOSED) {
+    sharedEventSource = new EventSource('/api/v1/events', { withCredentials: true })
+    for (const eventName of eventListeners.keys()) {
+      sharedEventSource.addEventListener(eventName, () => {
+        const set = eventListeners.get(eventName)
+        if (!set) return
+        for (const cb of set) {
+          cb()
+        }
+      })
+    }
+  }
+  return sharedEventSource
+}
+
+function notifyAuthRequired(authInfo?: PublicAuthInfo) {
+  uiCSRFToken = null
+  closeEventStream()
+  onAuthRequiredHandler?.(authInfo)
+}
 
 async function fetchBootstrap(): Promise<BootstrapPayload> {
   const resp = await fetch('/api/v1/bootstrap', { credentials: 'same-origin' })
@@ -499,6 +613,11 @@ async function fetchBootstrap(): Promise<BootstrapPayload> {
     } catch {
       parsed = text
     }
+  }
+  if (resp.status === 401) {
+    const info = (parsed as { auth_info?: PublicAuthInfo })?.auth_info
+    notifyAuthRequired(info)
+    throw new AuthRequiredError('Authentication required', info)
   }
   if (!resp.ok) {
     const errObj = parsed as { error?: string }
@@ -555,6 +674,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       parsed = text
     }
   }
+  if (resp.status === 401) {
+    notifyAuthRequired()
+    throw new AuthRequiredError('Authentication required')
+  }
   if (!resp.ok) {
     const errObj = parsed as { error?: string }
     throw new Error(errObj?.error || `HTTP ${resp.status}`)
@@ -564,6 +687,90 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   bootstrap: () => fetchBootstrap(),
+
+  getAuthConfig: async (): Promise<PublicAuthInfo> => {
+    const resp = await fetch('/api/v1/auth/config', { credentials: 'same-origin' })
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`)
+    }
+    return (await resp.json()) as PublicAuthInfo
+  },
+
+  loginLocal: async (email: string, password: string): Promise<void> => {
+    const resp = await fetch('/api/v1/auth/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    })
+    const parsed = (await resp.json().catch(() => ({}))) as { error?: string; ui_csrf_token?: string }
+    if (!resp.ok) {
+      throw new Error(parsed.error || `HTTP ${resp.status}`)
+    }
+    if (parsed.ui_csrf_token) {
+      uiCSRFToken = parsed.ui_csrf_token
+    }
+  },
+
+  logout: async (): Promise<void> => {
+    await fetch('/api/v1/auth/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => undefined)
+    uiCSRFToken = null
+    closeEventStream()
+  },
+
+  subscribeEvents: (eventNames: string[], listener: () => void): (() => void) => {
+    const attached = new Map<string, EventListener>()
+    const es = ensureEventSource()
+    for (const name of eventNames) {
+      let set = eventListeners.get(name)
+      if (!set) {
+        set = new Set()
+        eventListeners.set(name, set)
+        const dispatch: EventListener = () => {
+          const cur = eventListeners.get(name)
+          if (!cur) return
+          for (const fn of cur) {
+            fn()
+          }
+        }
+        attached.set(name, dispatch)
+        es.addEventListener(name, dispatch)
+      }
+      set.add(listener)
+    }
+    return () => {
+      for (const name of eventNames) {
+        eventListeners.get(name)?.delete(listener)
+      }
+      void attached
+    }
+  },
+
+  listUsers: () => request<{ users: UserRecord[]; role_bindings: RoleBinding[] }>('/api/v1/users'),
+  createUser: (body: { email: string; display_name: string; password: string }) =>
+    request<UserRecord>('/api/v1/users', { method: 'POST', body: JSON.stringify(body) }),
+  updateUserStatus: (id: string, status: string) =>
+    request<{ updated: boolean }>(`/api/v1/users/${encodeURIComponent(id)}/status`, {
+      method: 'POST',
+      body: JSON.stringify({ status }),
+    }),
+  upsertRoleBinding: (b: Partial<RoleBinding>) =>
+    request<RoleBinding>('/api/v1/roles', { method: 'POST', body: JSON.stringify(b) }),
+  deleteRoleBinding: (id: string) =>
+    request<{ deleted: boolean }>(`/api/v1/roles/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  listTokens: (all?: boolean) =>
+    request<{ items: APITokenRecord[] }>(`/api/v1/tokens${all ? '?all=1' : ''}`),
+  createToken: (body: {
+    name: string
+    role_ceiling: Role
+    allowed_systems?: string[]
+    allowed_envs?: string[]
+    read_only_forced?: boolean
+    ttl_seconds?: number
+  }) => request<APITokenCreateResponse>('/api/v1/tokens', { method: 'POST', body: JSON.stringify(body) }),
+  revokeToken: (id: string) =>
+    request<{ revoked: boolean }>(`/api/v1/tokens/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   listSystems: () => request<{ items: SystemRecord[] }>('/api/v1/systems'),
   saveSystem: (s: Partial<SystemRecord>) =>

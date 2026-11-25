@@ -41,6 +41,10 @@ const (
 	ErrCodeOutputExists           = "output_exists"
 	ErrCodeCredentialMissing      = "credential_missing"
 	ErrCodeTargetMaintenance      = "target_maintenance"
+	ErrCodeAuthRequired           = "auth_required"
+	ErrCodeForbidden              = "forbidden"
+	ErrCodeRemoteUnreachable      = "remote_unreachable"
+	ErrCodeRemoteUnsupported      = "remote_mode_unsupported"
 	ErrCodeInternalError          = "internal_error"
 )
 
@@ -66,6 +70,8 @@ type ErrorBody struct {
 type Meta struct {
 	Version    string `json:"version"`
 	Session    string `json:"session"`
+	Context    string `json:"context,omitempty"`
+	Mode       string `json:"mode,omitempty"`
 	DurationMs int64  `json:"duration_ms,omitempty"`
 	DryRun     bool   `json:"dry_run,omitempty"`
 	Preflight  bool   `json:"preflight,omitempty"`
@@ -77,11 +83,11 @@ func ExitCodeForError(code string) int {
 	switch code {
 	case "":
 		return ExitSuccess
-	case ErrCodeInvalidUsage, ErrCodeInvalidInput, ErrCodeReasonRequired, ErrCodeUnknownFlag, ErrCodeMultiTargetWrite:
+	case ErrCodeInvalidUsage, ErrCodeInvalidInput, ErrCodeReasonRequired, ErrCodeUnknownFlag, ErrCodeMultiTargetWrite, ErrCodeRemoteUnsupported:
 		return ExitUsage
 	case ErrCodeDBNotFound, ErrCodeSystemNotFound, ErrCodeOperationNotFound, ErrCodeNotFound:
 		return ExitNotFound
-	case ErrCodePolicyDenied, ErrCodeApprovalRejected, ErrCodeProdFrozen, ErrCodeHighCostReadBlocked, ErrCodeTargetMaintenance:
+	case ErrCodePolicyDenied, ErrCodeApprovalRejected, ErrCodeProdFrozen, ErrCodeHighCostReadBlocked, ErrCodeTargetMaintenance, ErrCodeAuthRequired, ErrCodeForbidden:
 		return ExitDenied
 	case ErrCodeAmbiguousTarget, ErrCodeDaemonVersionMismatch, ErrCodeOutputExists, ErrCodeConflict:
 		return ExitConflict

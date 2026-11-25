@@ -96,7 +96,7 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 				setExitCode(ic.WriteError(types.ErrCodeInvalidUsage, false, err.Error(), "Use --param key=value.", nil, nil, types.Meta{}))
 				return nil
 			}
-			cwd, detectedRemotes := detectWorkspaceContext(cmd.Context(), addOpts.noWorkspace)
+			cwd, detectedRemotes := detectWorkspaceContextForIO(cmd.Context(), ic, addOpts.noWorkspace)
 			req := daemon.DBAddRequest{
 				DSN:                   dsnVal,
 				InlinePasswordWarning: inlineDSNUsed,
@@ -247,7 +247,7 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 				setExitCode(writeClientInitErr(ic, err))
 				return nil
 			}
-			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
+			cwd, gitRemotes := detectWorkspaceContextForIO(cmd.Context(), ic, false)
 			var detail types.TargetDetail
 			if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/show", map[string]any{
 				"target":                args[0],

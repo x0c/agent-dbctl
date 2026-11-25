@@ -1,7 +1,20 @@
 import type { DisplayCatalog, DisplayMetaItem } from '../api'
 import type { Locale } from './i18n'
 
-const STORAGE_KEY = 'agent-dbctl.display_catalog.v1'
+const STORAGE_KEY_PREFIX = 'agent-dbctl.display_catalog.v1'
+
+export function clearCachedCatalog(): void {
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i)
+      if (k && k.startsWith(STORAGE_KEY_PREFIX)) {
+        localStorage.removeItem(k)
+      }
+    }
+  } catch {
+    // Ignore storage access errors.
+  }
+}
 
 export const EMPTY_CATALOG: DisplayCatalog = {
   catalog_version: 0,
@@ -13,9 +26,9 @@ export const EMPTY_CATALOG: DisplayCatalog = {
 }
 
 /** Synchronously reads last-known-good display catalog for frame-0 offline-first rendering. */
-export function loadCachedCatalog(): DisplayCatalog {
+export function loadCachedCatalog(namespace = 'local'): DisplayCatalog {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = localStorage.getItem(`${STORAGE_KEY_PREFIX}.${namespace}`)
     if (!raw) return EMPTY_CATALOG
     const parsed = JSON.parse(raw) as DisplayCatalog
     if (!parsed || typeof parsed !== 'object') return EMPTY_CATALOG
@@ -26,14 +39,9 @@ export function loadCachedCatalog(): DisplayCatalog {
 }
 
 /** Replaces the cached catalog wholesale when version changes (never merges partial entries). */
-export function saveCachedCatalog(cat: DisplayCatalog): DisplayCatalog {
+export function saveCachedCatalog(cat: DisplayCatalog, namespace = 'local'): DisplayCatalog {
   try {
-    const current = loadCachedCatalog()
-    if (current.catalog_version !== cat.catalog_version || current.environments.length !== cat.environments.length) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(cat))
-    } else {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(cat))
-    }
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}.${namespace}`, JSON.stringify(cat))
   } catch {
     // Ignore storage quota errors in restricted environments.
   }

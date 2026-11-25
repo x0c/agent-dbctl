@@ -1,9 +1,6 @@
 package cli
 
 import (
-	"fmt"
-	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -35,13 +32,12 @@ func newOpWaitCmd(ioCtx func() IOContext, version, commit string, exitCode *int)
 				*exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
-			tSec := int(opts.timeout.Seconds())
-			if tSec <= 0 {
-				tSec = 120
+			timeout := opts.timeout
+			if timeout <= 0 {
+				timeout = 120 * time.Second
 			}
-			path := fmt.Sprintf("/rpc/v1/ops/%s/wait?timeout_sec=%d", url.PathEscape(args[0]), tSec)
-			var resp types.ExecResponse
-			if err := client.DoJSON(cmd.Context(), http.MethodGet, path, nil, &resp); err != nil {
+			resp, err := waitForOperationLoop(cmd.Context(), client, args[0], timeout)
+			if err != nil {
 				*exitCode = writeRPCErr(ic, err)
 				return nil
 			}

@@ -10,16 +10,24 @@ import (
 	"github.com/x0c/agent-dbctl/internal/config"
 )
 
-// LocalWebProvider opens the local embedded Web UI approval page on 127.0.0.1.
+// LocalWebProvider opens the local embedded Web UI approval page on 127.0.0.1 (or headless public URL in server mode).
 type LocalWebProvider struct {
-	mu      sync.RWMutex
-	baseURL string
-	onEvent func(approvalID string)
+	mu       sync.RWMutex
+	baseURL  string
+	headless bool
+	onEvent  func(approvalID string)
 }
 
 // NewLocalWebProvider creates the default built-in local-web ApprovalProvider.
 func NewLocalWebProvider(onEvent func(approvalID string)) *LocalWebProvider {
 	return &LocalWebProvider{onEvent: onEvent}
+}
+
+// SetHeadless disables local browser spawning (used in server mode).
+func (p *LocalWebProvider) SetHeadless(headless bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.headless = headless
 }
 
 // SetBaseURL sets the active loopback HTTP URL once the web listener starts.
@@ -44,7 +52,10 @@ func (p *LocalWebProvider) SupportsInteractiveResolve() bool {
 }
 
 func (p *LocalWebProvider) Submit(_ context.Context, req SubmissionRequest) (*SubmissionResult, error) {
-	base := p.BaseURL()
+	p.mu.RLock()
+	base := p.baseURL
+	headless := p.headless
+	p.mu.RUnlock()
 	if base == "" {
 		return nil, fmt.Errorf("local web UI server URL not initialized")
 	}
@@ -52,7 +63,7 @@ func (p *LocalWebProvider) Submit(_ context.Context, req SubmissionRequest) (*Su
 	if p.onEvent != nil {
 		p.onEvent(req.ApprovalID)
 	}
-	if os.Getenv(config.EnvNoBrowser) != "1" {
+	if !headless && os.Getenv(config.EnvNoBrowser) != "1" {
 		_ = OpenBrowser(approvalURL)
 	}
 	return &SubmissionResult{

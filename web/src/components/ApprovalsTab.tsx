@@ -80,12 +80,9 @@ export function ApprovalsTab({
   }, [])
 
   useEffect(() => {
-    const es = new EventSource('/api/v1/events')
-    const refresh = () => void load()
-    es.addEventListener('approval_created', refresh)
-    es.addEventListener('approval_resolved', refresh)
-    es.addEventListener('operation_updated', refresh)
-    return () => es.close()
+    return api.subscribeEvents(['approval_created', 'approval_resolved', 'operation_updated'], () => {
+      void load()
+    })
   }, [filterStatus])
 
   const selected = useMemo(

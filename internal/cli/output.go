@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/term"
 
+	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
 
@@ -23,6 +24,8 @@ type IOContext struct {
 	NoInput     bool
 	Version     string
 	Session     string
+	Context     string
+	Mode        string
 	BinPath     string
 	Stdout      io.Writer
 	Stderr      io.Writer
@@ -65,6 +68,12 @@ func (ioCtx IOContext) WriteSuccess(data any, meta types.Meta) int {
 	if meta.Session == "" {
 		meta.Session = ioCtx.Session
 	}
+	if meta.Context == "" && ioCtx.Context != "" {
+		meta.Context = ioCtx.Context
+	}
+	if meta.Mode == "" && ioCtx.Mode != "" {
+		meta.Mode = ioCtx.Mode
+	}
 	if ioCtx.JSONMode {
 		env := types.Envelope{
 			OK:    true,
@@ -81,6 +90,30 @@ func (ioCtx IOContext) WriteSuccess(data any, meta types.Meta) int {
 	return types.ExitSuccess
 }
 
+func rewriteContextNextCommands(ioCtx IOContext, cmds []string) []string {
+	if ioCtx.Mode != string(config.ContextModeRemote) || ioCtx.Context == "" || len(cmds) == 0 {
+		return cmds
+	}
+	out := make([]string, 0, len(cmds))
+	for _, cmd := range cmds {
+		trimmed := strings.TrimSpace(cmd)
+		if trimmed == "" || strings.Contains(trimmed, "--context") {
+			out = append(out, cmd)
+			continue
+		}
+		if strings.Contains(trimmed, " serve") || strings.Contains(trimmed, " context ") {
+			out = append(out, cmd)
+			continue
+		}
+		if strings.HasSuffix(trimmed, " --json") {
+			out = append(out, strings.TrimSuffix(trimmed, " --json")+" --context "+ioCtx.Context+" --json")
+		} else {
+			out = append(out, trimmed+" --context "+ioCtx.Context)
+		}
+	}
+	return out
+}
+
 func (ioCtx IOContext) WriteError(code string, retryable bool, message, hint string, ctxMap map[string]any, nextCmds []string, meta types.Meta) int {
 	if meta.Version == "" {
 		meta.Version = ioCtx.Version
@@ -88,6 +121,13 @@ func (ioCtx IOContext) WriteError(code string, retryable bool, message, hint str
 	if meta.Session == "" {
 		meta.Session = ioCtx.Session
 	}
+	if meta.Context == "" && ioCtx.Context != "" {
+		meta.Context = ioCtx.Context
+	}
+	if meta.Mode == "" && ioCtx.Mode != "" {
+		meta.Mode = ioCtx.Mode
+	}
+	nextCmds = rewriteContextNextCommands(ioCtx, nextCmds)
 	exitCode := types.ExitCodeForError(code)
 	if ioCtx.JSONMode {
 		env := types.Envelope{

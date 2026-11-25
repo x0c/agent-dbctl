@@ -16,6 +16,7 @@ import (
 
 	"github.com/x0c/agent-dbctl/internal/approval"
 	"github.com/x0c/agent-dbctl/internal/audit"
+	"github.com/x0c/agent-dbctl/internal/auth"
 	"github.com/x0c/agent-dbctl/internal/classify"
 	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/driver"
@@ -23,6 +24,7 @@ import (
 	drvplugin "github.com/x0c/agent-dbctl/internal/driver/plugin"
 	"github.com/x0c/agent-dbctl/internal/netdial"
 	"github.com/x0c/agent-dbctl/internal/policy"
+	"github.com/x0c/agent-dbctl/internal/rbac"
 	"github.com/x0c/agent-dbctl/internal/secrets"
 	"github.com/x0c/agent-dbctl/internal/store"
 	"github.com/x0c/agent-dbctl/internal/types"
@@ -30,32 +32,51 @@ import (
 
 // Identity identifies the running daemon process so CLIs detect stale versions cleanly.
 type Identity struct {
-	Version    string `json:"version"`
-	Commit     string `json:"commit"`
-	PID        int    `json:"pid"`
-	Session    string `json:"session"`
-	ConfigHome string `json:"config_home"`
-	WebURL     string `json:"web_url"`
-	StartedAt  string `json:"started_at_utc"`
+	Version       string           `json:"version"`
+	Commit        string           `json:"commit"`
+	PID           int              `json:"pid,omitempty"`
+	Session       string           `json:"session,omitempty"`
+	ConfigHome    string           `json:"config_home,omitempty"`
+	WebURL        string           `json:"web_url"`
+	StartedAt     string           `json:"started_at_utc"`
+	Mode          types.ServerMode `json:"mode,omitempty"`
+	APIVersion    int              `json:"api_version,omitempty"`
+	MinCLIVersion string           `json:"min_cli_version,omitempty"`
+	NodeID        string           `json:"node_id,omitempty"`
 }
 
-// Event is pushed over SSE to live Web Console subscribers.
+// Event is pushed over SSE to live Web Console subscribers and cross-node Pub/Sub.
 type Event struct {
-	Type string `json:"type"`
-	Data any    `json:"data,omitempty"`
+	Type    string          `json:"type"`
+	Data    any             `json:"data,omitempty"`
+	RawData json.RawMessage `json:"-"`
 }
 
-// Service owns all local daemon business orchestration.
+type sseSubscriber struct {
+	ch        chan Event
+	principal types.Principal
+}
+
+// Service owns all local or remote daemon business orchestration.
 type Service struct {
-	paths     config.Paths
-	store     *store.Store
-	secrets   secrets.Store
-	drivers   *driver.Registry
-	plugins   *drvplugin.Manager
-	approvals *approval.Manager
-	localWeb  *approval.LocalWebProvider
-	slots     *audit.ResultSlotStore
-	identity  Identity
+	mode         types.ServerMode
+	nodeID       string
+	serverCfg    *config.ServerConfig
+	paths        config.Paths
+	store        *store.Store
+	secrets      secrets.Store
+	drivers      *driver.Registry
+	plugins      *drvplugin.Manager
+	approvals    *approval.Manager
+	localWeb     *approval.LocalWebProvider
+	slots        audit.ResultRelay
+	bus          EventBus
+	tunnels      *netdial.TunnelPool
+	connPool     *driver.ConnPool
+	dialPolicy   netdial.DialPolicy
+	secretPolicy secrets.ServerPolicy
+	oidcClient   *auth.OIDCClient
+	identity     Identity
 
 	rootCtx    context.Context
 	cancelRoot context.CancelFunc
@@ -66,13 +87,13 @@ type Service struct {
 	opActive  map[string]context.CancelFunc
 
 	sseMu   sync.Mutex
-	sseSubs map[chan Event]struct{}
+	sseSubs map[*sseSubscriber]struct{}
 
 	uiSessionToken string
 	uiCSRFToken    string
 }
 
-// NewService wires up Store, Secrets, Drivers, Plugins, Approvals, and ResultSlots.
+// NewService wires up Store, Secrets, Drivers, Plugins, Approvals, TunnelPool, ConnPool, and ResultSlots for local mode.
 func NewService(ctx context.Context, paths config.Paths, version, commit string) (*Service, error) {
 	st, err := store.Open(ctx, paths.DBPath)
 	if err != nil {
@@ -85,11 +106,16 @@ func NewService(ctx context.Context, paths config.Paths, version, commit string)
 	pm := drvplugin.NewManager(paths.PluginsDir, reg)
 	_, _ = pm.Reload()
 
-	slots := audit.NewResultSlotStore(10 * time.Minute)
+	slots := audit.NewMemoryResultRelay(10 * time.Minute)
 	appMgr := approval.NewManager(st)
+	tunnels := netdial.NewTunnelPool(netdial.TunnelPoolConfig{})
+	connPool := driver.NewConnPool(driver.ConnPoolConfig{})
+	bus := NewMemoryEventBus()
 
 	rootCtx, cancelRoot := context.WithCancel(context.Background())
 	svc := &Service{
+		mode:      types.ModeLocal,
+		nodeID:    "local-" + randomHexToken(4),
 		paths:     paths,
 		store:     st,
 		secrets:   sec,
@@ -97,6 +123,9 @@ func NewService(ctx context.Context, paths config.Paths, version, commit string)
 		plugins:   pm,
 		approvals: appMgr,
 		slots:     slots,
+		bus:       bus,
+		tunnels:   tunnels,
+		connPool:  connPool,
 		identity: Identity{
 			Version:    version,
 			Commit:     commit,
@@ -104,12 +133,14 @@ func NewService(ctx context.Context, paths config.Paths, version, commit string)
 			Session:    paths.Session,
 			ConfigHome: paths.ConfigHome,
 			StartedAt:  time.Now().UTC().Format(time.RFC3339),
+			Mode:       types.ModeLocal,
+			APIVersion: 1,
 		},
 		rootCtx:        rootCtx,
 		cancelRoot:     cancelRoot,
 		opWaiters:      make(map[string]chan types.ExecResponse),
 		opActive:       make(map[string]context.CancelFunc),
-		sseSubs:        make(map[chan Event]struct{}),
+		sseSubs:        make(map[*sseSubscriber]struct{}),
 		uiSessionToken: randomHexToken(32),
 		uiCSRFToken:    randomHexToken(32),
 	}
@@ -120,6 +151,7 @@ func NewService(ctx context.Context, paths config.Paths, version, commit string)
 	svc.localWeb = lw
 	appMgr.RegisterProvider(lw)
 
+	_ = bus.Start(rootCtx, svc.handleBusEvent)
 	slots.Start(rootCtx)
 	return svc, nil
 }
@@ -190,39 +222,189 @@ func (s *Service) CancelBackground() {
 	s.cancelRoot()
 }
 
-// Shutdown gracefully stops background workers, slots, approvals, plugins, and SQLite.
+// Shutdown gracefully stops background workers, slots, pools, approvals, plugins, and store.
 func (s *Service) Shutdown() {
 	s.cancelRoot()
 	s.approvals.Shutdown()
 	s.wg.Wait()
 	s.slots.Wait()
+	_ = s.slots.Close()
+	if s.bus != nil {
+		_ = s.bus.Close()
+	}
+	if s.connPool != nil {
+		_ = s.connPool.Close()
+	}
+	if s.tunnels != nil {
+		_ = s.tunnels.Close()
+	}
 	s.plugins.Shutdown()
 	_ = s.store.Close()
 }
 
-func (s *Service) subscribeSSE() chan Event {
-	ch := make(chan Event, 32)
-	s.sseMu.Lock()
-	s.sseSubs[ch] = struct{}{}
-	s.sseMu.Unlock()
-	return ch
+// Mode returns the active daemon runtime mode ("local" or "server").
+func (s *Service) Mode() types.ServerMode {
+	if s.mode == "" {
+		return types.ModeLocal
+	}
+	return s.mode
 }
 
-func (s *Service) unsubscribeSSE(ch chan Event) {
+// IsServerMode reports whether Service is running as a multi-user remote server.
+func (s *Service) IsServerMode() bool {
+	return s.Mode() == types.ModeServer
+}
+
+// ServerConfig returns the active server configuration (nil in local mode).
+func (s *Service) ServerConfig() *config.ServerConfig {
+	return s.serverCfg
+}
+
+// InvalidateCatalogPools clears pooled connections/tunnels locally and notifies replicas.
+func (s *Service) InvalidateCatalogPools(kind, id string) {
+	s.invalidateLocalPools(kind, id)
+	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": kind, "id": id}})
+}
+
+func (s *Service) invalidateLocalPools(kind, id string) {
+	if s.connPool != nil {
+		switch kind {
+		case "target":
+			s.connPool.InvalidateTarget(id)
+		case "instance":
+			s.connPool.InvalidateInstance(id)
+		case "network":
+			s.connPool.InvalidateNetwork(id)
+		case "credential":
+			s.connPool.InvalidateCredential(id)
+		default:
+			s.connPool.InvalidateAll()
+		}
+	}
+	if s.tunnels != nil {
+		if kind == "network" && id != "" {
+			s.tunnels.InvalidateProfile(id)
+		} else if kind == "topology" || kind == "" || kind == "credential" {
+			s.tunnels.InvalidateAll()
+		}
+	}
+}
+
+func (s *Service) handleBusEvent(ev Event) {
+	switch ev.Type {
+	case "approval_resolved":
+		if len(ev.RawData) > 0 {
+			var app types.ApprovalRequest
+			if json.Unmarshal(ev.RawData, &app) == nil && app.ID != "" {
+				s.approvals.NotifyExternalResolution(app)
+			}
+		}
+	case "operation_cancel":
+		if len(ev.RawData) > 0 {
+			var payload struct {
+				OperationID string `json:"operation_id"`
+			}
+			if json.Unmarshal(ev.RawData, &payload) == nil && payload.OperationID != "" {
+				s.opMu.Lock()
+				cancelFn := s.opActive[payload.OperationID]
+				s.opMu.Unlock()
+				if cancelFn != nil {
+					cancelFn()
+				}
+			}
+		}
+		return
+	case "catalog_updated":
+		if len(ev.RawData) > 0 {
+			var payload struct {
+				Kind string `json:"kind"`
+				ID   string `json:"id"`
+			}
+			if json.Unmarshal(ev.RawData, &payload) == nil {
+				s.invalidateLocalPools(payload.Kind, payload.ID)
+			}
+		}
+	}
+	s.broadcastLocalSSE(ev)
+}
+
+func (s *Service) subscribeSSE(p types.Principal) *sseSubscriber {
+	sub := &sseSubscriber{
+		ch:        make(chan Event, 32),
+		principal: p,
+	}
 	s.sseMu.Lock()
-	delete(s.sseSubs, ch)
+	s.sseSubs[sub] = struct{}{}
 	s.sseMu.Unlock()
-	close(ch)
+	return sub
+}
+
+func (s *Service) unsubscribeSSE(sub *sseSubscriber) {
+	s.sseMu.Lock()
+	delete(s.sseSubs, sub)
+	s.sseMu.Unlock()
+	close(sub.ch)
 }
 
 func (s *Service) broadcast(ev Event) {
+	s.broadcastLocalSSE(ev)
+	if s.bus != nil {
+		_ = s.bus.Publish(context.Background(), ev)
+	}
+}
+
+func (s *Service) broadcastLocalSSE(ev Event) {
 	s.sseMu.Lock()
 	defer s.sseMu.Unlock()
-	for ch := range s.sseSubs {
+	for sub := range s.sseSubs {
+		filtered, allowed := s.filterEventForPrincipal(sub.principal, ev)
+		if !allowed {
+			continue
+		}
 		select {
-		case ch <- ev:
+		case sub.ch <- filtered:
 		default:
 		}
+	}
+}
+
+func (s *Service) filterEventForPrincipal(p types.Principal, ev Event) (Event, bool) {
+	if !s.IsServerMode() || rbac.IsPlatformAdmin(p) {
+		return ev, true
+	}
+	switch ev.Type {
+	case "operation_updated":
+		var op types.Operation
+		if rawOp, ok := ev.Data.(types.Operation); ok {
+			op = rawOp
+		} else if len(ev.RawData) > 0 {
+			_ = json.Unmarshal(ev.RawData, &op)
+		}
+		if op.ID != "" && !rbac.CanViewOperation(p, op) {
+			return Event{}, false
+		}
+		// Never broadcast raw unredacted SQL over SSE in server mode.
+		op.QueryText = ""
+		ev.Data = op
+		return ev, true
+	case "approval_resolved":
+		var app types.ApprovalRequest
+		if rawApp, ok := ev.Data.(types.ApprovalRequest); ok {
+			app = rawApp
+		} else if len(ev.RawData) > 0 {
+			_ = json.Unmarshal(ev.RawData, &app)
+		}
+		if app.ID != "" && rbac.EffectiveRoleForScope(p, rbac.ResourceScope{
+			SystemSlug:      app.SystemSlug,
+			EnvironmentCode: app.EnvironmentCode,
+		}) == "" {
+			return Event{}, false
+		}
+		app.QueryText = ""
+		ev.Data = app
+		return ev, true
+	default:
+		return ev, true
 	}
 }
 
@@ -382,6 +564,9 @@ func (s *Service) openDriverConn(ctx context.Context, detail types.TargetDetail,
 		return nil, fmt.Errorf("target %q references missing instance", detail.Target.Ref)
 	}
 	inst := *detail.Instance
+	if s.IsServerMode() && (s.serverCfg == nil || !s.serverCfg.AllowSQLiteTargets) && classify.CanonicalEngine(inst.Engine) == "sqlite" {
+		return nil, fmt.Errorf("sqlite targets are disabled in server mode")
+	}
 	effectiveNet := detail.NetworkProfile
 	// Route read-only queries to replica instance if configured, resolving the replica's own NetworkProfile.
 	if preferReplica && inst.Role == types.RolePrimary {
@@ -430,7 +615,7 @@ func (s *Service) openDriverConn(ctx context.Context, detail types.TargetDetail,
 	var resolvedCred secrets.ResolvedSecret
 	if chosenCred != nil {
 		var err error
-		resolvedCred, err = secrets.ResolveCredential(ctx, s.secrets, chosenCred)
+		resolvedCred, err = secrets.ResolveCredentialWithOptions(ctx, s.secrets, chosenCred, s.secretPolicy)
 		if err != nil {
 			return nil, err
 		}
@@ -440,23 +625,18 @@ func (s *Service) openDriverConn(ctx context.Context, detail types.TargetDetail,
 	if effectiveNet != nil && effectiveNet.BastionCredentialID != "" {
 		if cp := s.resolveCredentialProfile(ctx, effectiveNet.BastionCredentialID); cp != nil {
 			var err error
-			bastionCred, err = secrets.ResolveCredential(ctx, s.secrets, cp)
+			bastionCred, err = secrets.ResolveCredentialWithOptions(ctx, s.secrets, cp, s.secretPolicy)
 			if err != nil {
 				return nil, fmt.Errorf("resolve bastion credential: %w", err)
 			}
 		}
 	}
 
-	dialRes, err := netdial.BuildContext(ctx, effectiveNet, bastionCred, inst.TLSMode, inst.Host)
-	if err != nil {
-		return nil, err
-	}
-
 	needsBridge := effectiveNet != nil &&
 		effectiveNet.Mode != "" &&
 		effectiveNet.Mode != types.NetworkDirect
 
-	conn, err := drv.Open(ctx, driver.ConnectionConfig{
+	connCfg := driver.ConnectionConfig{
 		Engine:          inst.Engine,
 		Host:            inst.Host,
 		Port:            inst.Port,
@@ -464,17 +644,58 @@ func (s *Service) openDriverConn(ctx context.Context, detail types.TargetDetail,
 		Params:          inst.Params,
 		ReadOnly:        readOnly,
 		Credential:      resolvedCred,
-		DialContext:     dialRes.DialContext,
 		NeedsDialBridge: needsBridge,
-		TLSMode:         dialRes.TLSMode,
-		TLSConfig:       dialRes.TLSConfig,
-		CloseHook:       driver.CloseOnce(dialRes.Close),
-	})
-	if err != nil {
-		_ = dialRes.Close()
-		return nil, err
 	}
-	return conn, nil
+
+	openFresh := func(openCtx context.Context) (driver.Conn, error) {
+		var dialRes netdial.DialResult
+		var err error
+		if s.tunnels != nil {
+			dialRes, err = s.tunnels.BuildContextWithPolicy(openCtx, effectiveNet, bastionCred, inst.TLSMode, inst.Host, s.dialPolicy)
+		} else {
+			dialRes, err = netdial.BuildContextWithPolicy(openCtx, effectiveNet, bastionCred, inst.TLSMode, inst.Host, s.dialPolicy)
+		}
+		if err != nil {
+			return nil, err
+		}
+		cfgCopy := connCfg
+		cfgCopy.DialContext = dialRes.DialContext
+		cfgCopy.TLSMode = dialRes.TLSMode
+		cfgCopy.TLSConfig = dialRes.TLSConfig
+		cfgCopy.CloseHook = driver.CloseOnce(dialRes.Close)
+		conn, openErr := drv.Open(openCtx, cfgCopy)
+		if openErr != nil {
+			_ = dialRes.Close()
+			return nil, openErr
+		}
+		return conn, nil
+	}
+
+	if s.connPool == nil || !readOnly || driver.ShouldBypassPool(connCfg) || (drv.Metadata().Tier == "plugin" && needsBridge) {
+		return openFresh(ctx)
+	}
+
+	netID, netHash := "", ""
+	if effectiveNet != nil {
+		netID = effectiveNet.ID
+		netHash = effectiveNet.ID + "|" + string(effectiveNet.Mode) + "|" + effectiveNet.UpdatedAtUTC + "|" + effectiveNet.TLSMode
+	}
+	credID := ""
+	var credKind types.CredentialKind
+	if chosenCred != nil {
+		credID = chosenCred.ID
+		credKind = chosenCred.Kind
+	}
+	meta := driver.ConnPoolMeta{
+		TargetID:         detail.Target.ID,
+		InstanceID:       inst.ID,
+		NetworkProfileID: netID,
+		CredentialID:     credID,
+		CredKind:         credKind,
+		ReadOnly:         true,
+	}
+	meta.Key = driver.BuildConnPoolKey(meta, connCfg, netHash)
+	return s.connPool.Acquire(ctx, meta, openFresh)
 }
 
 // PingTarget tests live connectivity for one resolved target.
@@ -574,6 +795,11 @@ func (s *Service) PingInstance(ctx context.Context, instanceID, credID, dbName s
 	if err != nil {
 		return types.PingResult{}, err
 	}
+	if s.IsServerMode() {
+		if authErr := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionDBTest, s.scopeForScopedResource(ctx, inst.ScopeType, inst.ScopeID)); authErr != nil {
+			return types.PingResult{}, authErr
+		}
+	}
 	detail := types.TargetDetail{
 		Target:         types.Target{Ref: inst.Name, DatabaseName: dbName, ROCredentialID: credID},
 		Instance:       &inst,
@@ -589,6 +815,11 @@ func (s *Service) DiscoverInstance(ctx context.Context, instanceID, credID, dbNa
 	if err != nil {
 		return nil, err
 	}
+	if s.IsServerMode() {
+		if authErr := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionInstanceDiscover, s.scopeForScopedResource(ctx, inst.ScopeType, inst.ScopeID)); authErr != nil {
+			return nil, authErr
+		}
+	}
 	detail := types.TargetDetail{
 		Target:         types.Target{Ref: inst.Name, DatabaseName: dbName, ROCredentialID: credID},
 		Instance:       &inst,
@@ -602,14 +833,30 @@ func (s *Service) DiscoverInstance(ctx context.Context, instanceID, credID, dbNa
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
-	return conn.ListDatabases(connCtx)
+	dbs, err := conn.ListDatabases(connCtx)
+	if err == nil {
+		_ = s.store.RecordAuditEvent(ctx, s.effectiveActor(ctx, ""), "instance.discover", inst.ID, "", map[string]any{
+			"instance": inst.Name,
+			"count":    len(dbs),
+		})
+	}
+	return dbs, err
 }
 
 // InspectSchema lists tables/collections/key prefixes or describes one object on a target using read-only credentials.
 func (s *Service) InspectSchema(ctx context.Context, targetRefOrAlias, workspaceCWD, table, search string, limit int, gitRemotes ...string) (any, error) {
+	p := rbac.PrincipalFromContext(ctx)
 	detail, err := s.ResolveTarget(ctx, targetRefOrAlias, workspaceCWD, gitRemotes...)
 	if err != nil {
 		return nil, err
+	}
+	if s.IsServerMode() {
+		if authErr := rbac.Authorize(p, rbac.ActionDBSchema, scopeForTarget(detail)); authErr != nil {
+			return nil, &TargetLookupError{
+				Code:    types.ErrCodeForbidden,
+				Message: authErr.Error(),
+			}
+		}
 	}
 	if detail.Target.Status == types.TargetDisabled || detail.Target.Status == types.TargetMaintenance {
 		return nil, &TargetLookupError{
@@ -661,8 +908,9 @@ func (s *Service) InspectSchema(ctx context.Context, targetRefOrAlias, workspace
 				Message: err.Error(),
 			}
 		}
+		actor := s.effectiveActor(ctx, "")
 		res.TargetRef = detail.Target.Ref
-		_ = s.store.RecordAuditEvent(ctx, "agent-cli", "schema.list", detail.Target.ID, "", map[string]any{
+		_ = s.store.RecordAuditEvent(ctx, actor, "schema.list", detail.Target.ID, "", map[string]any{
 			"target_ref": detail.Target.Ref,
 			"search":     search,
 			"returned":   res.ReturnedCount,
@@ -679,8 +927,9 @@ func (s *Service) InspectSchema(ctx context.Context, targetRefOrAlias, workspace
 			Message: err.Error(),
 		}
 	}
+	actor := s.effectiveActor(ctx, "")
 	tblSchema.TargetRef = detail.Target.Ref
-	_ = s.store.RecordAuditEvent(ctx, "agent-cli", "schema.describe", detail.Target.ID, "", map[string]any{
+	_ = s.store.RecordAuditEvent(ctx, actor, "schema.describe", detail.Target.ID, "", map[string]any{
 		"target_ref": detail.Target.Ref,
 		"table":      tblSchema.Name,
 	})
@@ -689,9 +938,19 @@ func (s *Service) InspectSchema(ctx context.Context, targetRefOrAlias, workspace
 
 // Execute runs the full dry-run / preflight / policy / approval / driver execution pipeline.
 func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.ExecResponse, error) {
+	p := rbac.PrincipalFromContext(ctx)
 	detail, err := s.ResolveTarget(ctx, req.TargetRefOrAlias, req.WorkspaceCWD, req.WorkspaceGitRemotes...)
 	if err != nil {
 		return types.ExecResponse{}, err
+	}
+	scope := scopeForTarget(detail)
+	if s.IsServerMode() {
+		if authErr := rbac.Authorize(p, rbac.ActionDBExecute, scope); authErr != nil {
+			return types.ExecResponse{}, &TargetLookupError{
+				Code:    types.ErrCodeForbidden,
+				Message: authErr.Error(),
+			}
+		}
 	}
 	if detail.Instance == nil {
 		return types.ExecResponse{}, fmt.Errorf("target %q has no bound instance", detail.Target.Ref)
@@ -707,6 +966,12 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 		cls = classify.Classify(engine, req.Query)
 	}
 	eff := detail.EffectivePolicy
+	if s.IsServerMode() && rbac.ShouldForceReadOnly(p, scope) {
+		eff.RequireApprovalOnWrite = true
+		eff.RequireApprovalOnDDL = true
+		eff.RequireApprovalOnAdmin = true
+		eff.RequireApprovalOnUnknown = true
+	}
 
 	// 1. Offline Dry-Run: strictly zero DB dial, zero approval, zero business mutation.
 	if req.DryRun {
@@ -752,6 +1017,12 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 	}
 
 	eval := policy.EvaluateQuery(detail.Target, eff, cls, pf, req.Query)
+	if s.IsServerMode() && rbac.ShouldForceReadOnly(p, scope) && !cls.IsReadOnly {
+		eval.Decision = types.DecisionDeny
+		eval.DenyCode = types.ErrCodeForbidden
+		eval.DenyMessage = "Current token/role is restricted to read-only operations."
+		eval.CredentialMode = types.AccessReadOnly
+	}
 	if req.Preflight {
 		return buildExecResponseSkeleton(detail, cls, pf, eval, types.OpPending), nil
 	}
@@ -778,9 +1049,10 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 	if globalCfg.RedactAuditLiterals {
 		redacted = audit.RedactQuery(req.Query)
 	}
-	actor := req.Actor
-	if actor == "" {
-		actor = "agent-cli"
+	actor := s.effectiveActor(ctx, req.Actor)
+	ownerUID := p.ID
+	if p.OwnerUserID != "" {
+		ownerUID = p.OwnerUserID
 	}
 
 	sysID, sysSlug := detail.Target.OwnerSystemID, ""
@@ -789,14 +1061,19 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 	}
 
 	op := types.Operation{
-		TargetID:        detail.Target.ID,
-		TargetRef:       detail.Target.Ref,
-		SystemID:        sysID,
-		SystemSlug:      sysSlug,
-		EnvironmentCode: detail.Target.EnvironmentCode,
-		Engine:          engine,
-		Actor:           actor,
-		Reason:          req.Reason,
+		TargetID:          detail.Target.ID,
+		TargetRef:         detail.Target.Ref,
+		SystemID:          sysID,
+		SystemSlug:        sysSlug,
+		EnvironmentCode:   detail.Target.EnvironmentCode,
+		Engine:            engine,
+		Actor:             actor,
+		PrincipalID:       p.ID,
+		PrincipalKind:     p.Kind,
+		OwnerUserID:       ownerUID,
+		OwnerNodeID:       s.nodeID,
+		LeaseExpiresAtUTC: time.Now().UTC().Add(45 * time.Second).Format(time.RFC3339Nano),
+		Reason:            req.Reason,
 		WorkspaceCWD:    req.WorkspaceCWD,
 		QueryText:       req.Query,
 		QueryRedacted:   redacted,
@@ -897,6 +1174,12 @@ func (s *Service) driveApprovalLifecycle(op types.Operation, detail types.Target
 	}
 	switch app.Status {
 	case types.ApprovalApproved:
+		if s.IsServerMode() {
+			claimed, claimErr := s.store.TryClaimWaitingOperation(s.rootCtx, op.ID, s.nodeID, 45*time.Second)
+			if claimErr != nil || !claimed {
+				return
+			}
+		}
 		resp := s.runExecution(s.rootCtx, op, detail, eval, reqMaxRows, reqMaxBytes, reqTimeout)
 		resp.Reviewer = app.Reviewer
 		resp.ReviewerNote = app.ReviewerNote
@@ -944,12 +1227,37 @@ func (s *Service) runExecutionWithConn(parentCtx context.Context, op types.Opera
 	maxBytes := minPositiveInt64(reqMaxBytes, eff.MaxBytes)
 
 	op.Status = types.OpRunning
+	op.OwnerNodeID = s.nodeID
+	op.LeaseExpiresAtUTC = time.Now().UTC().Add(45 * time.Second).Format(time.RFC3339Nano)
 	op, _ = s.store.UpdateOperation(parentCtx, op.Actor, "operation.running", op)
 	s.broadcast(Event{Type: "operation_updated", Data: op})
 
 	execCtx, cancel := context.WithTimeout(parentCtx, time.Duration(timeoutSec)*time.Second)
 	s.setOpCancel(op.ID, cancel)
+	stopLease := make(chan struct{})
+	if s.IsServerMode() {
+		s.wg.Add(1)
+		go func(opID, nodeID string) {
+			defer s.wg.Done()
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopLease:
+					return
+				case <-execCtx.Done():
+					return
+				case <-ticker.C:
+					if cancelReq, _ := s.store.RenewOperationLease(execCtx, opID, nodeID, 45*time.Second); cancelReq {
+						cancel()
+						return
+					}
+				}
+			}
+		}(op.ID, s.nodeID)
+	}
 	defer func() {
+		close(stopLease)
 		cancel()
 		s.clearOpCancel(op.ID)
 	}()
@@ -1008,8 +1316,10 @@ func (s *Service) runExecutionWithConn(parentCtx context.Context, op types.Opera
 	op.Truncated = res.Truncated
 	op.CutoffReason = res.CutoffReason
 	op.LatencyMs = res.LatencyMs
+	op.OwnerNodeID = ""
+	op.LeaseExpiresAtUTC = ""
 	op, _ = s.store.UpdateOperation(context.Background(), op.Actor, "operation.succeeded", op)
-	s.slots.Put(op.ID, res)
+	_ = s.slots.PutResult(context.Background(), op.ID, res)
 	s.broadcast(Event{Type: "operation_updated", Data: op})
 
 	resp := s.responseFromOperation(op, eval)
@@ -1019,7 +1329,36 @@ func (s *Service) runExecutionWithConn(parentCtx context.Context, op types.Opera
 
 // ResolveApproval approves or rejects a pending approval ticket from the Web UI.
 func (s *Service) ResolveApproval(ctx context.Context, approvalID string, approve bool, reviewer, note, token string, trustedUISession bool) (types.ApprovalRequest, error) {
-	app, err := s.approvals.Resolve(ctx, approvalID, approve, reviewer, note, token, trustedUISession)
+	p := rbac.PrincipalFromContext(ctx)
+	reviewerUserID := ""
+	if s.IsServerMode() {
+		appCur, _, err := s.store.GetApproval(ctx, approvalID)
+		if err != nil {
+			return types.ApprovalRequest{}, err
+		}
+		sysID := ""
+		if sys, sErr := s.store.ResolveSystem(ctx, appCur.SystemSlug); sErr == nil {
+			sysID = sys.ID
+		}
+		forbidSelf := true
+		if cfg, gErr := s.store.GetGlobalSecurityConfig(ctx); gErr == nil {
+			forbidSelf = cfg.ForbidSelfApproval
+		}
+		if s.serverCfg != nil && s.serverCfg.Auth.ForbidSelfApproval != nil {
+			forbidSelf = forbidSelf && *s.serverCfg.Auth.ForbidSelfApproval
+		}
+		if authErr := rbac.AuthorizeApprovalDecision(p, appCur, sysID, forbidSelf); authErr != nil {
+			return types.ApprovalRequest{}, authErr
+		}
+		if forbidSelf {
+			if op, opErr := s.store.GetOperation(ctx, appCur.OperationID); opErr == nil && op.OwnerUserID != "" && op.OwnerUserID == p.ID {
+				return types.ApprovalRequest{}, fmt.Errorf("forbidden: four-eyes policy forbids self-approval")
+			}
+		}
+		reviewer = p.Subject
+		reviewerUserID = p.ID
+	}
+	app, err := s.approvals.ResolveWithUser(ctx, approvalID, approve, reviewer, reviewerUserID, note, token, trustedUISession)
 	if err != nil {
 		return app, err
 	}
@@ -1027,11 +1366,20 @@ func (s *Service) ResolveApproval(ctx context.Context, approvalID string, approv
 	return app, nil
 }
 
-// GetOperationStatus retrieves operation state plus cached in-memory ResultSlot if available.
+// GetOperationStatus retrieves operation state plus cached ResultRelay entry if available.
 func (s *Service) GetOperationStatus(ctx context.Context, opID string) (types.ExecResponse, error) {
 	op, err := s.store.GetOperation(ctx, opID)
 	if err != nil {
 		return types.ExecResponse{}, err
+	}
+	if s.IsServerMode() {
+		p := rbac.PrincipalFromContext(ctx)
+		if !rbac.CanViewOperation(p, op) {
+			return types.ExecResponse{}, &TargetLookupError{
+				Code:    types.ErrCodeForbidden,
+				Message: "forbidden: operation is outside your authorized scope",
+			}
+		}
 	}
 	eval := types.PolicyEvaluation{
 		Decision:       op.Decision,
@@ -1040,7 +1388,7 @@ func (s *Service) GetOperationStatus(ctx context.Context, opID string) (types.Ex
 		CredentialMode: op.CredentialMode,
 	}
 	resp := s.responseFromOperation(op, eval)
-	if res, ok := s.slots.Get(op.ID); ok {
+	if res, ok, rErr := s.slots.GetResult(ctx, op.ID); rErr == nil && ok {
 		resp.Result = res
 	}
 	if op.ApprovalID != "" {
@@ -1054,11 +1402,26 @@ func (s *Service) GetOperationStatus(ctx context.Context, opID string) (types.Ex
 	return resp, nil
 }
 
-// CancelOperation cancels a waiting approval or an actively running execution.
+// CancelOperation cancels a waiting approval or an actively running execution (locally or across nodes).
 func (s *Service) CancelOperation(ctx context.Context, opID, actor string) (types.ExecResponse, error) {
 	op, err := s.store.GetOperation(ctx, opID)
 	if err != nil {
 		return types.ExecResponse{}, err
+	}
+	if s.IsServerMode() {
+		p := rbac.PrincipalFromContext(ctx)
+		if authErr := rbac.Authorize(p, rbac.ActionOperationCancel, rbac.ResourceScope{
+			SystemID:        op.SystemID,
+			SystemSlug:      op.SystemSlug,
+			EnvironmentCode: op.EnvironmentCode,
+			OwnerUserID:     op.OwnerUserID,
+		}); authErr != nil {
+			return types.ExecResponse{}, &TargetLookupError{
+				Code:    types.ErrCodeForbidden,
+				Message: authErr.Error(),
+			}
+		}
+		actor = p.Subject
 	}
 	if op.ApprovalID != "" && op.Status == types.OpWaitingApproval {
 		_, _ = s.approvals.Cancel(ctx, op.ApprovalID, actor)
@@ -1069,6 +1432,12 @@ func (s *Service) CancelOperation(ctx context.Context, opID, actor string) (type
 				break
 			}
 			time.Sleep(15 * time.Millisecond)
+		}
+	}
+	if s.IsServerMode() && op.Status == types.OpRunning {
+		_ = s.store.RequestOperationCancel(ctx, opID)
+		if s.bus != nil {
+			_ = s.bus.Publish(ctx, Event{Type: "operation_cancel", Data: map[string]string{"operation_id": opID}})
 		}
 	}
 	s.opMu.Lock()
@@ -1200,6 +1569,11 @@ func (s *Service) TestRiskPattern(ctx context.Context, req types.PatternTestRequ
 			engine = detail.Instance.Engine
 		}
 	} else {
+		if s.IsServerMode() {
+			if authErr := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionCatalogRead, rbac.ResourceScope{}); authErr != nil {
+				return types.PatternTestResult{}, authErr
+			}
+		}
 		if engine == "" {
 			engine = "postgres"
 		}
@@ -1275,6 +1649,33 @@ func (s *Service) TestRiskPattern(ctx context.Context, req types.PatternTestRequ
 func WriteJSON(v any) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+func (s *Service) effectiveActor(ctx context.Context, reqActor string) string {
+	p := rbac.PrincipalFromContext(ctx)
+	if s.IsServerMode() {
+		return p.Subject
+	}
+	if strings.TrimSpace(reqActor) != "" {
+		return strings.TrimSpace(reqActor)
+	}
+	if p.Kind != types.PrincipalLocalOwner && p.Subject != "" {
+		return p.Subject
+	}
+	return "agent-cli"
+}
+
+func scopeForTarget(d types.TargetDetail) rbac.ResourceScope {
+	sysSlug := ""
+	if d.OwnerSystem != nil {
+		sysSlug = d.OwnerSystem.Slug
+	}
+	return rbac.ResourceScope{
+		SystemID:        d.Target.OwnerSystemID,
+		SystemSlug:      sysSlug,
+		LinkedSystemIDs: d.Target.LinkedSystemIDs,
+		EnvironmentCode: d.Target.EnvironmentCode,
+	}
 }
 
 func minPositive(req, ceiling int) int {

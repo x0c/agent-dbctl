@@ -216,10 +216,9 @@ export function RiskPatternsPanel({
   }, [])
 
   useEffect(() => {
-    const es = new EventSource('/api/v1/events')
-    const refresh = () => void load()
-    es.addEventListener('patterns_updated', refresh)
-    return () => es.close()
+    return api.subscribeEvents(['patterns_updated'], () => {
+      void load()
+    })
   }, [])
 
   const openEditor = (rule?: RiskPatternRule) => {

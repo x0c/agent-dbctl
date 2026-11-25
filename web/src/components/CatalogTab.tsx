@@ -263,15 +263,9 @@ export function CatalogTab({
   }, [])
 
   useEffect(() => {
-    const es = new EventSource('/api/v1/events')
-    const onCatalogUpdated = () => {
+    return api.subscribeEvents(['catalog_updated'], () => {
       void loadAll()
-    }
-    es.addEventListener('catalog_updated', onCatalogUpdated)
-    return () => {
-      es.removeEventListener('catalog_updated', onCatalogUpdated)
-      es.close()
-    }
+    })
   }, [])
 
   useEffect(() => {

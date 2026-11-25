@@ -12,18 +12,28 @@ import {
   Toaster,
   toast,
 } from '@x0c/ui'
-import { Cpu, Database, Languages, ScrollText, Search, ShieldAlert, ShieldCheck } from 'lucide-react'
+import { Cpu, Database, KeyRound, Languages, LogOut, ScrollText, Search, ShieldAlert, ShieldCheck } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { api, type BootstrapPayload, type DisplayCatalog } from './api'
+import {
+  AuthRequiredError,
+  api,
+  closeEventStream,
+  setOnAuthRequired,
+  type BootstrapPayload,
+  type DisplayCatalog,
+  type PublicAuthInfo,
+} from './api'
+import { AccessTab } from './components/AccessTab'
 import { ApprovalsTab } from './components/ApprovalsTab'
 import { AuditTab } from './components/AuditTab'
 import { CatalogTab, type CatalogSubTab } from './components/CatalogTab'
 import { DriversTab } from './components/DriversTab'
+import { LoginView } from './components/LoginView'
 import { PoliciesTab, type PoliciesSubTab } from './components/PoliciesTab'
-import { loadCachedCatalog, saveCachedCatalog } from './lib/catalog'
+import { EMPTY_CATALOG, clearCachedCatalog, loadCachedCatalog, saveCachedCatalog } from './lib/catalog'
 import { useI18n } from './lib/i18n'
 
-type Tab = 'approvals' | 'catalog' | 'policies' | 'audit' | 'drivers'
+type Tab = 'approvals' | 'catalog' | 'policies' | 'audit' | 'drivers' | 'access'
 
 const CATALOG_SUBTABS = new Set<CatalogSubTab>(['targets', 'systems', 'instances', 'networks', 'credentials'])
 
@@ -98,6 +108,9 @@ function parseDeepLink(): {
   if (path === '/drivers' || path.startsWith('/drivers/')) {
     return { tab: 'drivers', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null }
   }
+  if (path === '/access' || path.startsWith('/access/')) {
+    return { tab: 'access', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null }
+  }
   return { tab: 'approvals', approvalId: null, approvalToken: null, catalogSubTab: 'targets', policiesSubTab: 'guardrails', credentialId: null }
 }
 
@@ -107,26 +120,76 @@ export function App() {
   const [tab, setTab] = useState<Tab>(initialLink.tab)
   const [catalog, setCatalog] = useState<DisplayCatalog>(() => loadCachedCatalog())
   const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null)
+  const [authState, setAuthState] = useState<'authenticated' | 'unauthenticated'>('authenticated')
+  const [authInfo, setAuthInfo] = useState<PublicAuthInfo | null>(null)
   const [pendingCount, setPendingCount] = useState<number>(0)
   const [cmdOpen, setCmdOpen] = useState(false)
+
+  const handleUnauthenticated = (info?: PublicAuthInfo) => {
+    clearCachedCatalog()
+    setCatalog(EMPTY_CATALOG)
+    setBootstrap(null)
+    if (info) {
+      setAuthInfo(info)
+    }
+    setAuthState('unauthenticated')
+  }
 
   const refreshBootstrap = async () => {
     try {
       const data = await api.bootstrap()
+      setAuthState('authenticated')
+      setAuthInfo(null)
       setBootstrap(data)
       setPendingCount(data.pending_approval_count ?? 0)
       if (data.display_catalog) {
-        setCatalog(saveCachedCatalog(data.display_catalog))
+        const ns = data.mode === 'server' ? 'server' : 'local'
+        setCatalog(saveCachedCatalog(data.display_catalog, ns))
       }
-    } catch {
+    } catch (e) {
+      if (e instanceof AuthRequiredError) {
+        handleUnauthenticated(e.authInfo)
+        if (!e.authInfo) {
+          void api.getAuthConfig().then(setAuthInfo).catch(() => undefined)
+        }
+        return
+      }
       // Keep last-known-good offline cached display catalog.
     }
   }
 
   useEffect(() => {
+    setOnAuthRequired((info) => handleUnauthenticated(info))
     void refreshBootstrap()
+    return () => {
+      setOnAuthRequired(null)
+      closeEventStream()
+    }
   }, [])
 
+  const handleLogout = async () => {
+    await api.logout()
+    clearCachedCatalog()
+    setCatalog(EMPTY_CATALOG)
+    setBootstrap(null)
+    setAuthState('unauthenticated')
+    try {
+      setAuthInfo(await api.getAuthConfig())
+    } catch {
+      // Ignore auth config fetch failures on logout.
+    }
+  }
+
+  if (authState === 'unauthenticated') {
+    return (
+      <>
+        <LoginView authInfo={authInfo} onSuccess={refreshBootstrap} />
+        <Toaster />
+      </>
+    )
+  }
+
+  const isServerMode = bootstrap?.mode === 'server'
   const navItems: Array<AdminNavItem & { id: Tab }> = [
     {
       id: 'approvals',
@@ -138,6 +201,16 @@ export function App() {
     { id: 'policies', label: t('nav.policies'), icon: ShieldCheck, section: t('nav.section.assets') },
     { id: 'audit', label: t('nav.audit'), icon: ScrollText, section: t('nav.section.observability') },
     { id: 'drivers', label: t('nav.drivers'), icon: Cpu, section: t('nav.section.observability') },
+    ...(isServerMode
+      ? [
+          {
+            id: 'access' as Tab,
+            label: t('nav.access'),
+            icon: KeyRound,
+            section: t('nav.section.observability'),
+          },
+        ]
+      : []),
   ]
 
   const handleToggleFreeze = async (next: boolean) => {
@@ -217,6 +290,25 @@ export function App() {
             <Languages className="size-3.5" />
             <span>{t('common.langToggle')}</span>
           </Button>
+          {isServerMode && bootstrap?.current_user && (
+            <div className="flex items-center gap-2 pl-1">
+              <span className="hidden text-xs text-muted-foreground md:inline">
+                {bootstrap.current_user.email || bootstrap.current_user.display_name}
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-8 gap-1.5 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground"
+                onClick={() => void handleLogout()}
+                title={t('nav.signOut')}
+                aria-label={t('nav.signOut')}
+              >
+                <LogOut className="size-3.5" />
+                <span className="hidden sm:inline">{t('nav.signOut')}</span>
+              </Button>
+            </div>
+          )}
         </div>
       </AppTopbar>
 
@@ -296,6 +388,9 @@ export function App() {
         )}
         {tab === 'audit' && <AuditTab catalog={catalog} />}
         {tab === 'drivers' && <DriversTab />}
+        {tab === 'access' && isServerMode && bootstrap?.current_user && (
+          <AccessTab currentUser={bootstrap.current_user} />
+        )}
       </AppFrame>
       <Toaster />
     </div>

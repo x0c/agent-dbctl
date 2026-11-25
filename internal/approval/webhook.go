@@ -98,7 +98,12 @@ func NewWebhookProvider(cfg WebhookConfig) (*WebhookProvider, error) {
 		endpointURL:   validURL,
 		signingSecret: cfg.SigningSecret,
 		localWeb:      cfg.LocalWeb,
-		client:        &http.Client{Timeout: timeout},
+		client: &http.Client{
+			Timeout: timeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}, nil
 }
 

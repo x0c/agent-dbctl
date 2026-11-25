@@ -53,21 +53,34 @@ func newAuditCmd(ioCtx func() IOContext, version, commit string, exitCode *int) 
 		Short: "Verify append-only SHA-256 hash chain integrity",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ic := ioCtx()
-			paths, err := config.ResolvePaths(ic.Session)
-			if err != nil {
-				*exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
-				return nil
-			}
-			st, err := store.Open(cmd.Context(), paths.DBPath)
-			if err != nil {
-				*exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
-				return nil
-			}
-			defer func() { _ = st.Close() }()
-			res, err := st.VerifyAuditChain(cmd.Context())
-			if err != nil {
-				*exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
-				return nil
+			var res types.AuditVerifyResult
+			if isRemoteIO(ic) {
+				client, err := ensureDaemon(ic, version, commit)
+				if err != nil {
+					*exitCode = writeClientInitErr(ic, err)
+					return nil
+				}
+				if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/audit/verify", map[string]any{}, &res); err != nil {
+					*exitCode = writeRPCErr(ic, err)
+					return nil
+				}
+			} else {
+				paths, err := config.ResolvePaths(ic.Session)
+				if err != nil {
+					*exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
+					return nil
+				}
+				st, err := store.Open(cmd.Context(), paths.DBPath)
+				if err != nil {
+					*exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
+					return nil
+				}
+				defer func() { _ = st.Close() }()
+				res, err = st.VerifyAuditChain(cmd.Context())
+				if err != nil {
+					*exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
+					return nil
+				}
 			}
 			if !res.Valid {
 				*exitCode = ic.WriteError(types.ErrCodeAuditTampered, false, res.Reason, "Audit chain tampering or sequence gap detected.", map[string]any{"verify": res}, nil, types.Meta{})
@@ -90,7 +103,7 @@ func newAuditCmd(ioCtx func() IOContext, version, commit string, exitCode *int) 
 		Short: "Query audit log entries with filters and pagination",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ic := ioCtx()
-			res, code := queryAuditEntries(cmd.Context(), ic, listOpts)
+			res, code := queryAuditEntries(cmd.Context(), ic, version, commit, listOpts)
 			if code != types.ExitSuccess {
 				*exitCode = code
 				return nil
@@ -160,7 +173,7 @@ func newAuditCmd(ioCtx func() IOContext, version, commit string, exitCode *int) 
 				*exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, fmt.Sprintf("Unsupported --format %q (use jsonl or csv).", exportFormat), "Pass --format jsonl or --format csv.", nil, []string{ic.BinPath + " audit export --format jsonl --json"}, types.Meta{})
 				return nil
 			}
-			res, code := queryAuditEntries(cmd.Context(), ic, exportOpts)
+			res, code := queryAuditEntries(cmd.Context(), ic, version, commit, exportOpts)
 			if code != types.ExitSuccess {
 				*exitCode = code
 				return nil
@@ -237,7 +250,7 @@ func registerAuditFilterFlags(cmd *cobra.Command, opts *auditFilterOpts, default
 	cmd.Flags().BoolVar(&opts.force, "force", false, "Overwrite existing --out file")
 }
 
-func queryAuditEntries(ctx context.Context, ic IOContext, opts auditFilterOpts) (auditQueryResult, int) {
+func queryAuditEntries(ctx context.Context, ic IOContext, version, commit string, opts auditFilterOpts) (auditQueryResult, int) {
 	sinceUTC, err := parseAuditTimeFlag(opts.since, false)
 	if err != nil {
 		return auditQueryResult{}, ic.WriteError(types.ErrCodeInvalidUsage, false, err.Error(), "Use RFC3339, YYYY-MM-DD, or relative durations like 24h or 7d.", nil, nil, types.Meta{})
@@ -257,6 +270,46 @@ func queryAuditEntries(ctx context.Context, ic IOContext, opts auditFilterOpts) 
 		offset = 0
 	}
 
+	buildQuery := func() string {
+		q := url.Values{}
+		if opts.action != "" {
+			q.Set("action", opts.action)
+		}
+		if opts.target != "" {
+			q.Set("target", opts.target)
+		}
+		if opts.opID != "" {
+			q.Set("operation_id", opts.opID)
+		}
+		if opts.actor != "" {
+			q.Set("actor", opts.actor)
+		}
+		if sinceUTC != "" {
+			q.Set("since", sinceUTC)
+		}
+		if untilUTC != "" {
+			q.Set("until", untilUTC)
+		}
+		q.Set("limit", strconv.Itoa(limit))
+		q.Set("offset", strconv.Itoa(offset))
+		return "/rpc/v1/audit?" + q.Encode()
+	}
+
+	if isRemoteIO(ic) {
+		cl, err := ensureDaemon(ic, version, commit)
+		if err != nil {
+			return auditQueryResult{}, writeClientInitErr(ic, err)
+		}
+		var res auditQueryResult
+		if err := cl.DoJSON(ctx, http.MethodGet, buildQuery(), nil, &res); err != nil {
+			return auditQueryResult{}, writeRPCErr(ic, err)
+		}
+		if res.Items == nil {
+			res.Items = []types.AuditEntry{}
+		}
+		return res, types.ExitSuccess
+	}
+
 	paths, err := config.ResolvePaths(ic.Session)
 	if err != nil {
 		return auditQueryResult{}, ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
@@ -265,30 +318,8 @@ func queryAuditEntries(ctx context.Context, ic IOContext, opts auditFilterOpts) 
 	// Query running daemon when available; otherwise fall back to offline read-only SQLite access.
 	if cl, err := daemon.NewClient(paths); err == nil {
 		if _, idErr := cl.GetIdentity(ctx); idErr == nil {
-			q := url.Values{}
-			if opts.action != "" {
-				q.Set("action", opts.action)
-			}
-			if opts.target != "" {
-				q.Set("target", opts.target)
-			}
-			if opts.opID != "" {
-				q.Set("operation_id", opts.opID)
-			}
-			if opts.actor != "" {
-				q.Set("actor", opts.actor)
-			}
-			if sinceUTC != "" {
-				q.Set("since", sinceUTC)
-			}
-			if untilUTC != "" {
-				q.Set("until", untilUTC)
-			}
-			q.Set("limit", strconv.Itoa(limit))
-			q.Set("offset", strconv.Itoa(offset))
-
 			var res auditQueryResult
-			if rpcErr := cl.DoJSON(ctx, http.MethodGet, "/rpc/v1/audit?"+q.Encode(), nil, &res); rpcErr == nil {
+			if rpcErr := cl.DoJSON(ctx, http.MethodGet, buildQuery(), nil, &res); rpcErr == nil {
 				if res.Items == nil {
 					res.Items = []types.AuditEntry{}
 				}

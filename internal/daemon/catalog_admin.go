@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -12,6 +13,8 @@ import (
 	"github.com/x0c/agent-dbctl/internal/classify"
 	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/policy"
+	"github.com/x0c/agent-dbctl/internal/rbac"
+	"github.com/x0c/agent-dbctl/internal/secrets"
 	"github.com/x0c/agent-dbctl/internal/store"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
@@ -106,13 +109,6 @@ type TargetDeleteResult struct {
 	NextCommands []string         `json:"next_commands,omitempty"`
 }
 
-func defaultActor(actor string) string {
-	if strings.TrimSpace(actor) == "" {
-		return "agent-cli"
-	}
-	return strings.TrimSpace(actor)
-}
-
 // BuildMissingSecrets lists keychain credentials from the provided IDs (or all credentials if empty) missing a secret.
 func (s *Service) BuildMissingSecrets(ctx context.Context, filterIDs []string) []types.MissingSecretInfo {
 	creds, err := s.store.ListCredentialProfiles(ctx)
@@ -150,9 +146,133 @@ func (s *Service) BuildMissingSecrets(ctx context.Context, filterIDs []string) [
 	return out
 }
 
+func (s *Service) scopeForScopedResource(ctx context.Context, scopeType, scopeID string) rbac.ResourceScope {
+	switch strings.ToLower(strings.TrimSpace(scopeType)) {
+	case "system":
+		if scopeID == "" {
+			return rbac.ResourceScope{}
+		}
+		if sys, err := s.store.ResolveSystem(ctx, scopeID); err == nil {
+			return rbac.ResourceScope{SystemID: sys.ID, SystemSlug: sys.Slug}
+		}
+		return rbac.ResourceScope{SystemID: scopeID, SystemSlug: scopeID}
+	case "env":
+		return rbac.ResourceScope{EnvironmentCode: scopeID}
+	case "target":
+		if tgt, err := s.store.ResolveTargetRecord(ctx, scopeID); err == nil {
+			return rbac.ResourceScope{
+				SystemID:        tgt.OwnerSystemID,
+				LinkedSystemIDs: tgt.LinkedSystemIDs,
+				EnvironmentCode: tgt.EnvironmentCode,
+			}
+		}
+		return rbac.ResourceScope{}
+	default:
+		return rbac.ResourceScope{}
+	}
+}
+
+func (s *Service) authorizeScopedWrite(ctx context.Context, action rbac.Action, scopeType, scopeID string) error {
+	if !s.IsServerMode() {
+		return nil
+	}
+	return rbac.Authorize(rbac.PrincipalFromContext(ctx), action, s.scopeForScopedResource(ctx, scopeType, scopeID))
+}
+
+func validateProxyURL(raw string, serverMode bool) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return fmt.Errorf("invalid proxy_url %q: %w", raw, err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return fmt.Errorf("invalid proxy_url scheme %q (expected http, https, socks5, or socks5h)", u.Scheme)
+	}
+	if serverMode && u.User != nil {
+		return fmt.Errorf("forbidden: inline credentials in proxy_url are disallowed in server mode; bind a credential profile instead")
+	}
+	return nil
+}
+
+func (s *Service) validateServerCred(ctx context.Context, cp types.CredentialProfile) error {
+	if !s.IsServerMode() {
+		return nil
+	}
+	if err := s.authorizeScopedWrite(ctx, rbac.ActionCredentialWrite, cp.ScopeType, cp.ScopeID); err != nil {
+		return err
+	}
+	switch cp.Kind {
+	case types.CredEnvRef:
+		if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionCredentialExecWrite, rbac.ResourceScope{}); err != nil {
+			return err
+		}
+		if err := secrets.ValidateServerEnvVar(cp.EnvVarName, s.secretPolicy); err != nil {
+			return err
+		}
+	case types.CredExecProvider:
+		if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionCredentialExecWrite, rbac.ResourceScope{}); err != nil {
+			return err
+		}
+		if err := secrets.ValidateServerExecCommand(cp.ExecCommand, s.secretPolicy); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) validateServerTargetBindings(ctx context.Context, tgt types.Target) error {
+	if !s.IsServerMode() {
+		return nil
+	}
+	p := rbac.PrincipalFromContext(ctx)
+	if rbac.IsPlatformAdmin(p) {
+		return nil
+	}
+	if tgt.InstanceID != "" {
+		inst, err := s.store.GetInstance(ctx, tgt.InstanceID)
+		if err == nil && inst.ScopeType == "system" && inst.ScopeID != tgt.OwnerSystemID {
+			return fmt.Errorf("forbidden: cannot bind instance %q belonging to another system", inst.Name)
+		}
+	}
+	for _, credID := range []string{tgt.ROCredentialID, tgt.RWCredentialID} {
+		if credID == "" {
+			continue
+		}
+		cp, err := s.store.ResolveCredentialProfile(ctx, credID)
+		if err == nil && cp.ScopeType == "system" && cp.ScopeID != tgt.OwnerSystemID {
+			return fmt.Errorf("forbidden: cannot bind credential %q belonging to another system", cp.Name)
+		}
+	}
+	if tgt.EnvironmentCode != "" && (tgt.ROCredentialID != "" || tgt.RWCredentialID != "") {
+		if env, err := s.store.ResolveEnvironment(ctx, tgt.EnvironmentCode); err == nil && env.SafetyTier == types.SafetyTierYOLO {
+			allTargets, _ := s.store.ListTargets(ctx)
+			allEnvs, _ := s.store.ListEnvironments(ctx)
+			envTiers := make(map[string]types.SafetyTier, len(allEnvs))
+			for _, e := range allEnvs {
+				envTiers[e.Code] = e.SafetyTier
+			}
+			for _, other := range allTargets {
+				if other.ID == tgt.ID || envTiers[other.EnvironmentCode] != types.SafetyTierStrict {
+					continue
+				}
+				if (tgt.ROCredentialID != "" && (other.ROCredentialID == tgt.ROCredentialID || other.RWCredentialID == tgt.ROCredentialID)) ||
+					(tgt.RWCredentialID != "" && (other.ROCredentialID == tgt.RWCredentialID || other.RWCredentialID == tgt.RWCredentialID)) {
+					return fmt.Errorf("forbidden: credential is bound to a strict target %q and cannot be reused on a yolo target without platform_admin", other.Ref)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // AdminUpsertSystem creates or updates a System idempotently with optional dry-run.
 func (s *Service) AdminUpsertSystem(ctx context.Context, actor string, sys types.System, dryRun bool) (AdminMutationResult[types.System], error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
 	if strings.TrimSpace(sys.Slug) == "" {
 		return AdminMutationResult[types.System]{}, fmt.Errorf("system slug is required")
 	}
@@ -175,6 +295,15 @@ func (s *Service) AdminUpsertSystem(ctx context.Context, actor string, sys types
 	} else if cur, err := s.store.ResolveSystem(ctx, sys.Slug); err == nil {
 		existing = &cur
 		sys.ID = cur.ID
+	}
+	if s.IsServerMode() {
+		scope := rbac.ResourceScope{}
+		if existing != nil {
+			scope = rbac.ResourceScope{SystemID: existing.ID, SystemSlug: existing.Slug}
+		}
+		if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionSystemWrite, scope); err != nil {
+			return AdminMutationResult[types.System]{}, err
+		}
 	}
 
 	if sys.Tags == nil {
@@ -244,7 +373,12 @@ func (s *Service) AdminDeleteSystem(ctx context.Context, actor, idOrSlug string)
 	if err != nil {
 		return err
 	}
-	if err := s.store.DeleteSystem(ctx, defaultActor(actor), cur.ID); err != nil {
+	if s.IsServerMode() {
+		if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionSystemWrite, rbac.ResourceScope{SystemID: cur.ID, SystemSlug: cur.Slug}); err != nil {
+			return err
+		}
+	}
+	if err := s.store.DeleteSystem(ctx, s.effectiveActor(ctx, actor), cur.ID); err != nil {
 		return err
 	}
 	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "system", "id": cur.ID}})
@@ -253,7 +387,12 @@ func (s *Service) AdminDeleteSystem(ctx context.Context, actor, idOrSlug string)
 
 // AdminUpsertEnvironment creates or updates an Environment idempotently with optional dry-run.
 func (s *Service) AdminUpsertEnvironment(ctx context.Context, actor string, env types.Environment, dryRun bool) (AdminMutationResult[types.Environment], error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
+	if s.IsServerMode() {
+		if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionEnvWrite, rbac.ResourceScope{}); err != nil {
+			return AdminMutationResult[types.Environment]{}, err
+		}
+	}
 	if strings.TrimSpace(env.Code) == "" {
 		return AdminMutationResult[types.Environment]{}, fmt.Errorf("environment code is required")
 	}
@@ -340,7 +479,12 @@ func (s *Service) AdminDeleteEnvironment(ctx context.Context, actor, code string
 	if err != nil {
 		return err
 	}
-	if err := s.store.DeleteEnvironment(ctx, defaultActor(actor), cur.Code); err != nil {
+	if s.IsServerMode() {
+		if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionEnvWrite, rbac.ResourceScope{}); err != nil {
+			return err
+		}
+	}
+	if err := s.store.DeleteEnvironment(ctx, s.effectiveActor(ctx, actor), cur.Code); err != nil {
 		return err
 	}
 	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "environment", "code": cur.Code}})
@@ -349,7 +493,7 @@ func (s *Service) AdminDeleteEnvironment(ctx context.Context, actor, code string
 
 // AdminUpsertNetworkProfile creates or updates a NetworkProfile idempotently with optional dry-run.
 func (s *Service) AdminUpsertNetworkProfile(ctx context.Context, actor string, np types.NetworkProfile, dryRun bool) (AdminMutationResult[types.NetworkProfile], error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
 	if strings.TrimSpace(np.Name) == "" {
 		return AdminMutationResult[types.NetworkProfile]{}, fmt.Errorf("network profile name is required")
 	}
@@ -370,6 +514,24 @@ func (s *Service) AdminUpsertNetworkProfile(ctx context.Context, actor string, n
 		existing = &cur
 		np.ID = cur.ID
 	}
+	if np.ScopeType == "" && existing != nil {
+		np.ScopeType = existing.ScopeType
+		np.ScopeID = existing.ScopeID
+	}
+	if np.ScopeType == "" {
+		np.ScopeType = "global"
+	}
+	if np.ScopeType == "global" && np.ScopeID == "" {
+		np.ScopeID = "global"
+	}
+	if err := s.authorizeScopedWrite(ctx, rbac.ActionNetworkWrite, np.ScopeType, np.ScopeID); err != nil {
+		return AdminMutationResult[types.NetworkProfile]{}, err
+	}
+	if existing != nil && s.IsServerMode() {
+		if err := s.authorizeScopedWrite(ctx, rbac.ActionNetworkWrite, existing.ScopeType, existing.ScopeID); err != nil {
+			return AdminMutationResult[types.NetworkProfile]{}, err
+		}
+	}
 
 	if np.Mode == "" {
 		if existing != nil {
@@ -382,6 +544,9 @@ func (s *Service) AdminUpsertNetworkProfile(ctx context.Context, actor string, n
 	case types.NetworkDirect, types.NetworkSSHTunnel, types.NetworkSOCKS5, types.NetworkHTTPProxy:
 	default:
 		return AdminMutationResult[types.NetworkProfile]{}, fmt.Errorf("invalid network mode %q (expected direct, ssh_tunnel, socks5, or http_proxy)", np.Mode)
+	}
+	if err := validateProxyURL(np.ProxyURL, s.IsServerMode()); err != nil {
+		return AdminMutationResult[types.NetworkProfile]{}, err
 	}
 	if np.BastionPort == 0 && np.Mode == types.NetworkSSHTunnel {
 		np.BastionPort = 22
@@ -415,6 +580,7 @@ func (s *Service) AdminUpsertNetworkProfile(ctx context.Context, actor string, n
 	if err != nil {
 		return AdminMutationResult[types.NetworkProfile]{}, err
 	}
+	s.InvalidateCatalogPools("network_profile", saved.ID)
 	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "network_profile", "id": saved.ID}})
 	return AdminMutationResult[types.NetworkProfile]{
 		DryRun: false,
@@ -430,16 +596,20 @@ func (s *Service) AdminDeleteNetworkProfile(ctx context.Context, actor, idOrName
 	if err != nil {
 		return err
 	}
-	if err := s.store.DeleteNetworkProfile(ctx, defaultActor(actor), cur.ID); err != nil {
+	if err := s.authorizeScopedWrite(ctx, rbac.ActionNetworkWrite, cur.ScopeType, cur.ScopeID); err != nil {
 		return err
 	}
+	if err := s.store.DeleteNetworkProfile(ctx, s.effectiveActor(ctx, actor), cur.ID); err != nil {
+		return err
+	}
+	s.InvalidateCatalogPools("network_profile", cur.ID)
 	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "network_profile", "id": cur.ID}})
 	return nil
 }
 
 // AdminUpsertCredentialProfile creates/updates credential metadata and optionally writes/clears the OS secret.
 func (s *Service) AdminUpsertCredentialProfile(ctx context.Context, actor string, req CredentialUpsertRequest) (AdminMutationResult[types.CredentialProfile], error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
 	cp := req.CredentialProfile
 	if strings.TrimSpace(cp.Name) == "" {
 		return AdminMutationResult[types.CredentialProfile]{}, fmt.Errorf("credential name is required")
@@ -453,6 +623,16 @@ func (s *Service) AdminUpsertCredentialProfile(ctx context.Context, actor string
 	} else if cur, err := s.store.ResolveCredentialProfile(ctx, cp.Name); err == nil {
 		existing = &cur
 		cp.ID = cur.ID
+	}
+	if cp.ScopeType == "" && existing != nil {
+		cp.ScopeType = existing.ScopeType
+		cp.ScopeID = existing.ScopeID
+	}
+	if cp.ScopeType == "" {
+		cp.ScopeType = "global"
+	}
+	if cp.ScopeType == "global" && cp.ScopeID == "" {
+		cp.ScopeID = "global"
 	}
 
 	if cp.Kind == "" {
@@ -484,6 +664,14 @@ func (s *Service) AdminUpsertCredentialProfile(ctx context.Context, actor string
 	}
 	if cp.Kind == types.CredExecProvider && strings.TrimSpace(cp.ExecCommand) == "" {
 		return AdminMutationResult[types.CredentialProfile]{}, fmt.Errorf("exec_command is required for exec_provider credential")
+	}
+	if err := s.validateServerCred(ctx, cp); err != nil {
+		return AdminMutationResult[types.CredentialProfile]{}, err
+	}
+	if existing != nil && s.IsServerMode() {
+		if err := s.authorizeScopedWrite(ctx, rbac.ActionCredentialWrite, existing.ScopeType, existing.ScopeID); err != nil {
+			return AdminMutationResult[types.CredentialProfile]{}, err
+		}
 	}
 
 	metaAction := "created"
@@ -558,6 +746,7 @@ func (s *Service) AdminUpsertCredentialProfile(ctx context.Context, actor string
 
 	saved.HasSecret = s.hasCredentialSecret(ctx, saved)
 	if overallAction != "unchanged" {
+		s.InvalidateCatalogPools("credential", saved.ID)
 		s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "credential", "id": saved.ID}})
 	}
 	res := AdminMutationResult[types.CredentialProfile]{
@@ -584,17 +773,28 @@ func (s *Service) AdminDeleteCredentialProfile(ctx context.Context, actor, idOrN
 	if err != nil {
 		return err
 	}
-	if err := s.store.DeleteCredentialProfile(ctx, defaultActor(actor), cur.ID); err != nil {
+	if s.IsServerMode() {
+		if err := s.authorizeScopedWrite(ctx, rbac.ActionCredentialWrite, cur.ScopeType, cur.ScopeID); err != nil {
+			return err
+		}
+		if cur.Kind == types.CredExecProvider || cur.Kind == types.CredEnvRef {
+			if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionCredentialExecWrite, rbac.ResourceScope{}); err != nil {
+				return err
+			}
+		}
+	}
+	if err := s.store.DeleteCredentialProfile(ctx, s.effectiveActor(ctx, actor), cur.ID); err != nil {
 		return err
 	}
 	_ = s.secrets.Delete(ctx, "cred:"+cur.ID)
+	s.InvalidateCatalogPools("credential", cur.ID)
 	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "credential", "id": cur.ID}})
 	return nil
 }
 
 // AdminUpsertInstance creates or updates an Instance idempotently with optional dry-run.
 func (s *Service) AdminUpsertInstance(ctx context.Context, actor string, inst types.Instance, dryRun bool) (AdminMutationResult[types.Instance], error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
 	if strings.TrimSpace(inst.Name) == "" {
 		return AdminMutationResult[types.Instance]{}, fmt.Errorf("instance name is required")
 	}
@@ -622,6 +822,24 @@ func (s *Service) AdminUpsertInstance(ctx context.Context, actor string, inst ty
 		existing = &cur
 		inst.ID = cur.ID
 	}
+	if inst.ScopeType == "" && existing != nil {
+		inst.ScopeType = existing.ScopeType
+		inst.ScopeID = existing.ScopeID
+	}
+	if inst.ScopeType == "" {
+		inst.ScopeType = "global"
+	}
+	if inst.ScopeType == "global" && inst.ScopeID == "" {
+		inst.ScopeID = "global"
+	}
+	if err := s.authorizeScopedWrite(ctx, rbac.ActionInstanceWrite, inst.ScopeType, inst.ScopeID); err != nil {
+		return AdminMutationResult[types.Instance]{}, err
+	}
+	if existing != nil && s.IsServerMode() {
+		if err := s.authorizeScopedWrite(ctx, rbac.ActionInstanceWrite, existing.ScopeType, existing.ScopeID); err != nil {
+			return AdminMutationResult[types.Instance]{}, err
+		}
+	}
 
 	if inst.Engine == "" && existing != nil {
 		inst.Engine = existing.Engine
@@ -631,6 +849,16 @@ func (s *Service) AdminUpsertInstance(ctx context.Context, actor string, inst ty
 	}
 	if _, ok := s.drivers.Get(inst.Engine); !ok {
 		return AdminMutationResult[types.Instance]{}, fmt.Errorf("unsupported engine %q (run `driver list` to inspect registered engines)", inst.Engine)
+	}
+	if s.IsServerMode() && classify.CanonicalEngine(inst.Engine) == "sqlite" && !s.ServerConfig().AllowSQLiteTargets {
+		return AdminMutationResult[types.Instance]{}, fmt.Errorf("forbidden: sqlite targets are disabled in server mode")
+	}
+	if s.IsServerMode() && inst.NetworkProfileID != "" && !rbac.IsPlatformAdmin(rbac.PrincipalFromContext(ctx)) {
+		if np, err := s.store.ResolveNetworkProfile(ctx, inst.NetworkProfileID); err == nil {
+			if np.ScopeType == "system" && (inst.ScopeType != "system" || inst.ScopeID != np.ScopeID) {
+				return AdminMutationResult[types.Instance]{}, fmt.Errorf("forbidden: cannot bind network profile %q across systems", np.Name)
+			}
+		}
 	}
 	if inst.Role == "" {
 		if existing != nil {
@@ -687,6 +915,7 @@ func (s *Service) AdminUpsertInstance(ctx context.Context, actor string, inst ty
 	if err != nil {
 		return AdminMutationResult[types.Instance]{}, err
 	}
+	s.InvalidateCatalogPools("instance", saved.ID)
 	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "instance", "id": saved.ID}})
 	return AdminMutationResult[types.Instance]{
 		DryRun: false,
@@ -702,9 +931,13 @@ func (s *Service) AdminDeleteInstance(ctx context.Context, actor, idOrName strin
 	if err != nil {
 		return err
 	}
-	if err := s.store.DeleteInstance(ctx, defaultActor(actor), cur.ID); err != nil {
+	if err := s.authorizeScopedWrite(ctx, rbac.ActionInstanceWrite, cur.ScopeType, cur.ScopeID); err != nil {
 		return err
 	}
+	if err := s.store.DeleteInstance(ctx, s.effectiveActor(ctx, actor), cur.ID); err != nil {
+		return err
+	}
+	s.InvalidateCatalogPools("instance", cur.ID)
 	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "instance", "id": cur.ID}})
 	return nil
 }
@@ -746,7 +979,7 @@ func (s *Service) AdminDiscoverInstance(ctx context.Context, instanceRef, credRe
 
 // AdminUpsertTarget creates or updates a Target idempotently, accepting IDs or natural keys.
 func (s *Service) AdminUpsertTarget(ctx context.Context, actor string, tgt types.Target, dryRun bool) (AdminMutationResult[types.Target], error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
 	var existing *types.Target
 	if tgt.ID != "" {
 		if cur, err := s.store.ResolveTargetRecord(ctx, tgt.ID); err == nil {
@@ -839,6 +1072,26 @@ func (s *Service) AdminUpsertTarget(ctx context.Context, actor string, tgt types
 	default:
 		return AdminMutationResult[types.Target]{}, fmt.Errorf("invalid target status %q (expected active, maintenance, or disabled)", tgt.Status)
 	}
+	if s.IsServerMode() {
+		if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionTargetWrite, rbac.ResourceScope{
+			SystemID:        tgt.OwnerSystemID,
+			LinkedSystemIDs: tgt.LinkedSystemIDs,
+			EnvironmentCode: tgt.EnvironmentCode,
+		}); err != nil {
+			return AdminMutationResult[types.Target]{}, err
+		}
+		if existing != nil && existing.OwnerSystemID != "" && existing.OwnerSystemID != tgt.OwnerSystemID {
+			if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionTargetWrite, rbac.ResourceScope{
+				SystemID:        existing.OwnerSystemID,
+				EnvironmentCode: existing.EnvironmentCode,
+			}); err != nil {
+				return AdminMutationResult[types.Target]{}, err
+			}
+		}
+		if err := s.validateServerTargetBindings(ctx, tgt); err != nil {
+			return AdminMutationResult[types.Target]{}, err
+		}
+	}
 
 	action := "created"
 	if existing != nil {
@@ -868,6 +1121,7 @@ func (s *Service) AdminUpsertTarget(ctx context.Context, actor string, tgt types
 	if err != nil {
 		return AdminMutationResult[types.Target]{}, err
 	}
+	s.InvalidateCatalogPools("target", saved.ID)
 	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "target", "id": saved.ID}})
 	return AdminMutationResult[types.Target]{
 		DryRun: false,
@@ -883,9 +1137,19 @@ func (s *Service) AdminDeleteTarget(ctx context.Context, actor, idOrRefOrAlias s
 	if err != nil {
 		return TargetDeleteResult{}, err
 	}
-	if err := s.store.DeleteTarget(ctx, defaultActor(actor), cur.ID); err != nil {
+	if s.IsServerMode() {
+		if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionTargetWrite, rbac.ResourceScope{
+			SystemID:        cur.OwnerSystemID,
+			LinkedSystemIDs: cur.LinkedSystemIDs,
+			EnvironmentCode: cur.EnvironmentCode,
+		}); err != nil {
+			return TargetDeleteResult{}, err
+		}
+	}
+	if err := s.store.DeleteTarget(ctx, s.effectiveActor(ctx, actor), cur.ID); err != nil {
 		return TargetDeleteResult{}, err
 	}
+	s.InvalidateCatalogPools("target", cur.ID)
 	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "target", "id": cur.ID}})
 
 	orphans := s.findOrphansAfterTargetDelete(ctx, cur)
@@ -1001,7 +1265,7 @@ func (s *Service) findOrphansAfterTargetDelete(ctx context.Context, deleted type
 
 // AdminAddDatabase performs declarative one-shot onboarding (System + Credential + Instance + Target).
 func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddRequest) (DBAddResponse, error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
 	var warnings []string
 
 	switch req.ScanReadMode {
@@ -1040,6 +1304,9 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 		return DBAddResponse{}, fmt.Errorf("unsupported engine %q (run `driver list` to inspect registered engines)", engine)
 	}
 	canonEngine := classify.CanonicalEngine(engine)
+	if s.IsServerMode() && canonEngine == "sqlite" && !s.ServerConfig().AllowSQLiteTargets {
+		return DBAddResponse{}, fmt.Errorf("forbidden: sqlite targets are disabled in server mode")
+	}
 
 	host := firstNonEmpty(strings.TrimSpace(req.Host), parsed.Host)
 	dbName := firstNonEmpty(strings.TrimSpace(req.Database), parsed.DatabaseName)
@@ -1082,7 +1349,11 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 
 	sysSlug := strings.TrimSpace(req.System)
 	if sysSlug == "" && !req.NoWorkspace {
-		if matched := s.resolveSystemByWorkspace(ctx, req.WorkspaceCWD, sysGitRemotes); matched != nil {
+		wsCWD := req.WorkspaceCWD
+		if s.IsServerMode() {
+			wsCWD = ""
+		}
+		if matched := s.resolveSystemByWorkspace(ctx, wsCWD, sysGitRemotes); matched != nil {
 			sysSlug = matched.Slug
 		}
 	}
@@ -1092,7 +1363,7 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 				sysSlug = repoSlug
 			}
 		}
-		if sysSlug == "" && strings.TrimSpace(req.WorkspaceCWD) != "" {
+		if !s.IsServerMode() && sysSlug == "" && strings.TrimSpace(req.WorkspaceCWD) != "" {
 			base := sanitizeSlug(filepath.Base(filepath.Clean(req.WorkspaceCWD)))
 			if base != "" && base != "." {
 				sysSlug = base
@@ -1104,19 +1375,29 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 	}
 
 	var sysWS []string
-	for _, ws := range req.WorkspacePaths {
-		if trimmed := strings.TrimSpace(ws); trimmed != "" {
-			sysWS = append(sysWS, trimmed)
+	if !s.IsServerMode() {
+		for _, ws := range req.WorkspacePaths {
+			if trimmed := strings.TrimSpace(ws); trimmed != "" {
+				sysWS = append(sysWS, trimmed)
+			}
 		}
-	}
-	if len(sysWS) == 0 && !req.NoWorkspace && strings.TrimSpace(req.WorkspaceCWD) != "" {
-		sysWS = []string{req.WorkspaceCWD}
+		if len(sysWS) == 0 && !req.NoWorkspace && strings.TrimSpace(req.WorkspaceCWD) != "" {
+			sysWS = []string{req.WorkspaceCWD}
+		}
 	}
 
 	var sysObj types.System
 	sysAction := "created"
 	if existingSys, err := s.store.ResolveSystem(ctx, sysSlug); err == nil {
 		sysObj = existingSys
+		if s.IsServerMode() {
+			if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionTargetWrite, rbac.ResourceScope{
+				SystemID:   existingSys.ID,
+				SystemSlug: existingSys.Slug,
+			}); err != nil {
+				return DBAddResponse{}, err
+			}
+		}
 		mergedWS := mergeUniqueStrings(existingSys.WorkspacePaths, sysWS)
 		existingRemotes := config.NormalizeGitRemotes(existingSys.GitRemotes)
 		mergedRemotes := config.NormalizeGitRemotes(append(append([]string(nil), existingRemotes...), sysGitRemotes...))
@@ -1134,10 +1415,23 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 		}
 		if nameChanged || wsChanged || gitChanged {
 			sysAction = "updated"
+			if s.IsServerMode() {
+				if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionSystemWrite, rbac.ResourceScope{
+					SystemID:   existingSys.ID,
+					SystemSlug: existingSys.Slug,
+				}); err != nil {
+					return DBAddResponse{}, err
+				}
+			}
 		} else {
 			sysAction = "unchanged"
 		}
 	} else {
+		if s.IsServerMode() {
+			if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionSystemWrite, rbac.ResourceScope{}); err != nil {
+				return DBAddResponse{}, err
+			}
+		}
 		sysName := firstNonEmpty(strings.TrimSpace(req.SystemName), titleSlug(sysSlug))
 		sysObj = types.System{
 			Slug:           sysSlug,
@@ -1295,6 +1589,18 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 				Username:    user,
 				EnvVarName:  strings.TrimSpace(req.EnvVarName),
 				ExecCommand: strings.TrimSpace(req.ExecCommand),
+				ScopeType:   func() string {
+					if s.IsServerMode() && sysObj.ID != "" {
+						return "system"
+					}
+					return "global"
+				}(),
+				ScopeID:     func() string {
+					if s.IsServerMode() && sysObj.ID != "" {
+						return sysObj.ID
+					}
+					return "global"
+				}(),
 			},
 			SecretValue:    secretVal,
 			SecretProvided: secretProvided,
@@ -1351,11 +1657,26 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 	}
 	if existingInst != nil {
 		instInput.ID = existingInst.ID
+		instInput.ScopeType = existingInst.ScopeType
+		instInput.ScopeID = existingInst.ScopeID
 		if len(instInput.Params) == 0 && len(existingInst.Params) > 0 {
 			instInput.Params = existingInst.Params
 		}
 		if instInput.TLSMode == "" {
 			instInput.TLSMode = existingInst.TLSMode
+		}
+	} else if s.IsServerMode() && sysObj.ID != "" && !rbac.IsPlatformAdmin(rbac.PrincipalFromContext(ctx)) {
+		instInput.ScopeType = "system"
+		instInput.ScopeID = sysObj.ID
+	}
+	if s.IsServerMode() {
+		if err := s.authorizeScopedWrite(ctx, rbac.ActionInstanceWrite, instInput.ScopeType, instInput.ScopeID); err != nil {
+			return DBAddResponse{}, err
+		}
+		if managedCredReq != nil {
+			if err := s.validateServerCred(ctx, managedCredReq.CredentialProfile); err != nil {
+				return DBAddResponse{}, err
+			}
 		}
 	}
 
@@ -1463,6 +1784,10 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 	actions["system"] = sysRes.Action
 
 	if managedCredReq != nil {
+		if s.IsServerMode() && sysObj.ID != "" {
+			managedCredReq.ScopeType = "system"
+			managedCredReq.ScopeID = sysObj.ID
+		}
 		cRes, err := s.AdminUpsertCredentialProfile(ctx, actor, *managedCredReq)
 		if err != nil {
 			return DBAddResponse{}, err
@@ -1478,6 +1803,10 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 		missingSecrets = append(missingSecrets, s.BuildMissingSecrets(ctx, []string{roCredID, rwCredID})...)
 	}
 
+	if existingInst == nil && s.IsServerMode() && sysObj.ID != "" && !rbac.IsPlatformAdmin(rbac.PrincipalFromContext(ctx)) {
+		instInput.ScopeType = "system"
+		instInput.ScopeID = sysObj.ID
+	}
 	instRes, err := s.AdminUpsertInstance(ctx, actor, instInput, false)
 	if err != nil {
 		return DBAddResponse{}, err
@@ -1561,7 +1890,27 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 
 // AdminApplyTopology previews (--dry-run) or atomically imports a TopologyBundle and flags missing Keychain secrets.
 func (s *Service) AdminApplyTopology(ctx context.Context, actor string, bundle types.TopologyBundle, dryRun bool) (types.TopologyImportResult, error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
+	if s.IsServerMode() {
+		if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionTopologyWrite, rbac.ResourceScope{}); err != nil {
+			return types.TopologyImportResult{}, err
+		}
+		for _, np := range bundle.NetworkProfiles {
+			if err := validateProxyURL(np.ProxyURL, true); err != nil {
+				return types.TopologyImportResult{}, err
+			}
+		}
+		for _, cp := range bundle.CredentialProfiles {
+			if err := s.validateServerCred(ctx, cp); err != nil {
+				return types.TopologyImportResult{}, err
+			}
+		}
+		for _, inst := range bundle.Instances {
+			if classify.CanonicalEngine(inst.Engine) == "sqlite" && !s.ServerConfig().AllowSQLiteTargets {
+				return types.TopologyImportResult{}, fmt.Errorf("forbidden: sqlite targets are disabled in server mode")
+			}
+		}
+	}
 	if dryRun {
 		res, err := s.store.PlanTopologyImport(ctx, bundle)
 		if err != nil {
@@ -1584,6 +1933,7 @@ func (s *Service) AdminApplyTopology(ctx context.Context, actor string, bundle t
 		res.MissingSecrets = s.BuildMissingSecrets(ctx, credIDs)
 	}
 	if res.Status == "applied" {
+		s.InvalidateCatalogPools("topology", "")
 		s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "topology"}})
 	}
 	return res, nil
@@ -1628,7 +1978,12 @@ func (s *Service) missingSecretsForTopologyPlan(ctx context.Context, b types.Top
 
 // AdminUpdateGlobalSecurity updates GlobalSecurityConfig idempotently with optional dry-run.
 func (s *Service) AdminUpdateGlobalSecurity(ctx context.Context, actor string, cfg types.GlobalSecurityConfig, dryRun bool) (AdminMutationResult[types.GlobalSecurityConfig], error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
+	if s.IsServerMode() {
+		if err := rbac.Authorize(rbac.PrincipalFromContext(ctx), rbac.ActionGlobalSecurityWrite, rbac.ResourceScope{}); err != nil {
+			return AdminMutationResult[types.GlobalSecurityConfig]{}, err
+		}
+	}
 	if err := policy.ValidateGlobalConfig(cfg); err != nil {
 		return AdminMutationResult[types.GlobalSecurityConfig]{}, err
 	}
@@ -1678,7 +2033,7 @@ func (s *Service) AdminUpdateGlobalSecurity(ctx context.Context, actor string, c
 
 // AdminUpsertPolicy creates or updates a PolicyRuleSet idempotently with natural-key scope resolution.
 func (s *Service) AdminUpsertPolicy(ctx context.Context, actor string, p types.PolicyRuleSet, dryRun bool) (AdminMutationResult[types.PolicyRuleSet], error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
 	if strings.TrimSpace(p.Name) == "" {
 		return AdminMutationResult[types.PolicyRuleSet]{}, fmt.Errorf("policy name is required")
 	}
@@ -1703,6 +2058,9 @@ func (s *Service) AdminUpsertPolicy(ctx context.Context, actor string, p types.P
 		return AdminMutationResult[types.PolicyRuleSet]{}, err
 	}
 	p.ScopeID = resolvedScope
+	if err := s.authorizeScopedWrite(ctx, rbac.ActionPolicyWrite, p.ScopeType, p.ScopeID); err != nil {
+		return AdminMutationResult[types.PolicyRuleSet]{}, err
+	}
 	if err := policy.ValidateRuleSet(p); err != nil {
 		return AdminMutationResult[types.PolicyRuleSet]{}, err
 	}
@@ -1746,7 +2104,7 @@ func (s *Service) AdminUpsertPolicy(ctx context.Context, actor string, p types.P
 
 // AdminSetTargetScanReadMode creates or updates a target-scoped policy's ScanReadMode without disturbing other overrides.
 func (s *Service) AdminSetTargetScanReadMode(ctx context.Context, actor, targetIDOrRef string, mode types.ScanReadMode, dryRun bool) (AdminMutationResult[types.PolicyRuleSet], error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
 	switch mode {
 	case types.ScanReadAllow, types.ScanReadReasonOnly, types.ScanReadRequireApproval:
 	default:
@@ -1854,7 +2212,10 @@ func (s *Service) AdminDeletePolicy(ctx context.Context, actor, idOrName string)
 	if err != nil {
 		return err
 	}
-	if err := s.store.DeletePolicy(ctx, defaultActor(actor), cur.ID); err != nil {
+	if err := s.authorizeScopedWrite(ctx, rbac.ActionPolicyWrite, cur.ScopeType, cur.ScopeID); err != nil {
+		return err
+	}
+	if err := s.store.DeletePolicy(ctx, s.effectiveActor(ctx, actor), cur.ID); err != nil {
 		return err
 	}
 	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "policy", "id": cur.ID}})
@@ -1863,7 +2224,7 @@ func (s *Service) AdminDeletePolicy(ctx context.Context, actor, idOrName string)
 
 // AdminUpsertRiskPattern creates or updates a RiskPatternRule idempotently with optional dry-run.
 func (s *Service) AdminUpsertRiskPattern(ctx context.Context, actor string, r types.RiskPatternRule, dryRun bool) (AdminMutationResult[types.RiskPatternRule], error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
 	r.Name = strings.TrimSpace(r.Name)
 	if r.ScopeType == "" {
 		r.ScopeType = "global"
@@ -1873,6 +2234,9 @@ func (s *Service) AdminUpsertRiskPattern(ctx context.Context, actor string, r ty
 		return AdminMutationResult[types.RiskPatternRule]{}, err
 	}
 	r.ScopeID = resolvedScope
+	if err := s.authorizeScopedWrite(ctx, rbac.ActionPatternWrite, r.ScopeType, r.ScopeID); err != nil {
+		return AdminMutationResult[types.RiskPatternRule]{}, err
+	}
 	if err := policy.ValidateRiskPatternRule(r); err != nil {
 		return AdminMutationResult[types.RiskPatternRule]{}, err
 	}
@@ -1936,7 +2300,10 @@ func (s *Service) AdminDeleteRiskPattern(ctx context.Context, actor, idOrName, s
 	if err != nil {
 		return err
 	}
-	if err := s.store.DeleteRiskPatternRule(ctx, defaultActor(actor), cur.ID); err != nil {
+	if err := s.authorizeScopedWrite(ctx, rbac.ActionPatternWrite, cur.ScopeType, cur.ScopeID); err != nil {
+		return err
+	}
+	if err := s.store.DeleteRiskPatternRule(ctx, s.effectiveActor(ctx, actor), cur.ID); err != nil {
 		return err
 	}
 	s.broadcast(Event{Type: "patterns_updated", Data: map[string]string{"id": cur.ID}})
@@ -1945,7 +2312,7 @@ func (s *Service) AdminDeleteRiskPattern(ctx context.Context, actor, idOrName, s
 
 // AdminInstallRulePack installs a builtin risk pattern pack for a scope (supporting dry-run).
 func (s *Service) AdminInstallRulePack(ctx context.Context, actor, packID, scopeType, scopeID string, dryRun bool) (map[string]any, error) {
-	actor = defaultActor(actor)
+	actor = s.effectiveActor(ctx, actor)
 	pack, ok := policy.GetBuiltinRulePack(packID)
 	if !ok {
 		return nil, fmt.Errorf("%w: unknown builtin rule pack %q", store.ErrNotFound, packID)
@@ -1955,6 +2322,9 @@ func (s *Service) AdminInstallRulePack(ctx context.Context, actor, packID, scope
 	}
 	resolvedScope, err := s.resolveScopeTarget(ctx, scopeType, scopeID)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.authorizeScopedWrite(ctx, rbac.ActionPatternWrite, scopeType, resolvedScope); err != nil {
 		return nil, err
 	}
 	if dryRun {

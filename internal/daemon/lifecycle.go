@@ -127,7 +127,11 @@ func (s *Service) WaitForOperation(ctx context.Context, opID string, timeout tim
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(80 * time.Millisecond)
+	pollInterval := 80 * time.Millisecond
+	if s.IsServerMode() {
+		pollInterval = 250 * time.Millisecond
+	}
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
 	for {

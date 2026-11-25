@@ -20,7 +20,7 @@ var (
 
 // ListSystems returns all business systems ordered by slug.
 func (s *Store) ListSystems(ctx context.Context) ([]types.System, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.dbQuery(ctx, `
 		SELECT id, slug, name, owner, description, tags_json, workspace_paths_json, git_remotes_json, default_policy_id, created_at_utc, updated_at_utc
 		FROM systems ORDER BY slug ASC`)
 	if err != nil {
@@ -86,7 +86,7 @@ func (s *Store) upsertSystemTx(ctx context.Context, tx *sql.Tx, actor string, sy
 	gitJSON, _ := json.Marshal(sys.GitRemotes)
 
 	var existingCreated string
-	err := tx.QueryRowContext(ctx, `SELECT created_at_utc FROM systems WHERE id = ?`, sys.ID).Scan(&existingCreated)
+	err := s.txQueryRow(ctx, tx, `SELECT created_at_utc FROM systems WHERE id = ?`, sys.ID).Scan(&existingCreated)
 	action := "system.create"
 	if err == nil {
 		action = "system.update"
@@ -96,11 +96,11 @@ func (s *Store) upsertSystemTx(ctx context.Context, tx *sql.Tx, actor string, sy
 	} else {
 		return sys, err
 	}
-	if err := requirePolicyExistsTx(ctx, tx, sys.DefaultPolicyID); err != nil {
+	if err := s.requirePolicyExistsTx(ctx, tx, sys.DefaultPolicyID); err != nil {
 		return sys, err
 	}
 	sys.UpdatedAtUTC = now
-	_, err = tx.ExecContext(ctx, `
+	_, err = s.txExec(ctx, tx, `
 		INSERT INTO systems(id, slug, name, owner, description, tags_json, workspace_paths_json, git_remotes_json, default_policy_id, created_at_utc, updated_at_utc)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -115,7 +115,7 @@ func (s *Store) upsertSystemTx(ctx context.Context, tx *sql.Tx, actor string, sy
 			updated_at_utc = excluded.updated_at_utc`,
 		sys.ID, sys.Slug, sys.Name, sys.Owner, sys.Description, string(tagsJSON), string(wsJSON), string(gitJSON), sys.DefaultPolicyID, sys.CreatedAtUTC, sys.UpdatedAtUTC)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if isUniqueErr(err) {
 			return sys, fmt.Errorf("%w: duplicate system slug %q", ErrConflict, sys.Slug)
 		}
 		return sys, err
@@ -130,8 +130,10 @@ func (s *Store) upsertSystemTx(ctx context.Context, tx *sql.Tx, actor string, sy
 func (s *Store) DeleteSystem(ctx context.Context, actor, id string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var slug string
-		_ = tx.QueryRowContext(ctx, `SELECT slug FROM systems WHERE id = ?`, id).Scan(&slug)
-		res, err := tx.ExecContext(ctx, `DELETE FROM systems WHERE id = ?`, id)
+		if err := s.txQueryRow(ctx, tx, `SELECT slug FROM systems WHERE id = ?`, id).Scan(&slug); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		res, err := s.txExec(ctx, tx, `DELETE FROM systems WHERE id = ?`, id)
 		if err != nil {
 			return fmt.Errorf("%w: cannot delete system %s in use: %v", ErrConflict, id, err)
 		}
@@ -149,7 +151,7 @@ func (s *Store) DeleteSystem(ctx context.Context, actor, id string) error {
 
 // ListEnvironments returns all environments ordered by sort_order.
 func (s *Store) ListEnvironments(ctx context.Context) ([]types.Environment, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.dbQuery(ctx, `
 		SELECT code, safety_tier, labels_json, color, sort_order, default_policy_id, created_at_utc, updated_at_utc
 		FROM environments ORDER BY sort_order ASC, code ASC`)
 	if err != nil {
@@ -204,7 +206,7 @@ func (s *Store) upsertEnvironmentTx(ctx context.Context, tx *sql.Tx, actor strin
 	labelsJSON, _ := json.Marshal(env.Labels)
 
 	var existingCreated string
-	err := tx.QueryRowContext(ctx, `SELECT created_at_utc FROM environments WHERE code = ?`, env.Code).Scan(&existingCreated)
+	err := s.txQueryRow(ctx, tx, `SELECT created_at_utc FROM environments WHERE code = ?`, env.Code).Scan(&existingCreated)
 	action := "environment.create"
 	if err == nil {
 		action = "environment.update"
@@ -214,11 +216,11 @@ func (s *Store) upsertEnvironmentTx(ctx context.Context, tx *sql.Tx, actor strin
 	} else {
 		return env, err
 	}
-	if err := requirePolicyExistsTx(ctx, tx, env.DefaultPolicyID); err != nil {
+	if err := s.requirePolicyExistsTx(ctx, tx, env.DefaultPolicyID); err != nil {
 		return env, err
 	}
 	env.UpdatedAtUTC = now
-	_, err = tx.ExecContext(ctx, `
+	_, err = s.txExec(ctx, tx, `
 		INSERT INTO environments(code, safety_tier, labels_json, color, sort_order, default_policy_id, created_at_utc, updated_at_utc)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(code) DO UPDATE SET
@@ -242,13 +244,13 @@ func (s *Store) upsertEnvironmentTx(ctx context.Context, tx *sql.Tx, actor strin
 func (s *Store) DeleteEnvironment(ctx context.Context, actor, code string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var tgtCount int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM targets WHERE environment_code = ?`, code).Scan(&tgtCount); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM targets WHERE environment_code = ?`, code).Scan(&tgtCount); err != nil {
 			return err
 		}
 		if tgtCount > 0 {
 			return fmt.Errorf("%w: cannot delete environment %q in use (targets=%d)", ErrConflict, code, tgtCount)
 		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM environments WHERE code = ?`, code)
+		res, err := s.txExec(ctx, tx, `DELETE FROM environments WHERE code = ?`, code)
 		if err != nil {
 			return fmt.Errorf("%w: cannot delete environment %q in use: %v", ErrConflict, code, err)
 		}
@@ -266,8 +268,8 @@ func (s *Store) DeleteEnvironment(ctx context.Context, actor, code string) error
 
 // ListNetworkProfiles returns all reusable network profiles.
 func (s *Store) ListNetworkProfiles(ctx context.Context) ([]types.NetworkProfile, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, mode, proxy_url, bastion_host, bastion_port, bastion_user, bastion_credential_id, ssh_strict_host_key, tls_mode, created_at_utc, updated_at_utc
+	rows, err := s.dbQuery(ctx, `
+		SELECT id, name, scope_type, scope_id, mode, proxy_url, bastion_host, bastion_port, bastion_user, bastion_credential_id, ssh_strict_host_key, tls_mode, created_at_utc, updated_at_utc
 		FROM network_profiles ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
@@ -278,7 +280,7 @@ func (s *Store) ListNetworkProfiles(ctx context.Context) ([]types.NetworkProfile
 	for rows.Next() {
 		var np types.NetworkProfile
 		var strict int
-		if err := rows.Scan(&np.ID, &np.Name, &np.Mode, &np.ProxyURL, &np.BastionHost, &np.BastionPort, &np.BastionUser, &np.BastionCredentialID, &strict, &np.TLSMode, &np.CreatedAtUTC, &np.UpdatedAtUTC); err != nil {
+		if err := rows.Scan(&np.ID, &np.Name, &np.ScopeType, &np.ScopeID, &np.Mode, &np.ProxyURL, &np.BastionHost, &np.BastionPort, &np.BastionUser, &np.BastionCredentialID, &strict, &np.TLSMode, &np.CreatedAtUTC, &np.UpdatedAtUTC); err != nil {
 			return nil, err
 		}
 		np.SSHStrictHostKey = strict == 1
@@ -306,6 +308,12 @@ func (s *Store) upsertNetworkProfileTx(ctx context.Context, tx *sql.Tx, actor st
 	if strings.TrimSpace(np.Name) == "" {
 		return np, fmt.Errorf("network profile name is required")
 	}
+	if np.ScopeType == "" {
+		np.ScopeType = "global"
+	}
+	if np.ScopeType == "global" {
+		np.ScopeID = "global"
+	}
 	if np.Mode == "" {
 		np.Mode = types.NetworkDirect
 	}
@@ -321,7 +329,7 @@ func (s *Store) upsertNetworkProfileTx(ctx context.Context, tx *sql.Tx, actor st
 	}
 
 	var existingCreated string
-	err := tx.QueryRowContext(ctx, `SELECT created_at_utc FROM network_profiles WHERE id = ?`, np.ID).Scan(&existingCreated)
+	err := s.txQueryRow(ctx, tx, `SELECT created_at_utc FROM network_profiles WHERE id = ?`, np.ID).Scan(&existingCreated)
 	action := "network_profile.create"
 	if err == nil {
 		action = "network_profile.update"
@@ -331,15 +339,17 @@ func (s *Store) upsertNetworkProfileTx(ctx context.Context, tx *sql.Tx, actor st
 	} else {
 		return np, err
 	}
-	if err := requireCredentialExistsTx(ctx, tx, np.BastionCredentialID); err != nil {
+	if err := s.requireCredentialExistsTx(ctx, tx, np.BastionCredentialID); err != nil {
 		return np, err
 	}
 	np.UpdatedAtUTC = now
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO network_profiles(id, name, mode, proxy_url, bastion_host, bastion_port, bastion_user, bastion_credential_id, ssh_strict_host_key, tls_mode, created_at_utc, updated_at_utc)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err = s.txExec(ctx, tx, `
+		INSERT INTO network_profiles(id, name, scope_type, scope_id, mode, proxy_url, bastion_host, bastion_port, bastion_user, bastion_credential_id, ssh_strict_host_key, tls_mode, created_at_utc, updated_at_utc)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
+			scope_type = excluded.scope_type,
+			scope_id = excluded.scope_id,
 			mode = excluded.mode,
 			proxy_url = excluded.proxy_url,
 			bastion_host = excluded.bastion_host,
@@ -349,9 +359,9 @@ func (s *Store) upsertNetworkProfileTx(ctx context.Context, tx *sql.Tx, actor st
 			ssh_strict_host_key = excluded.ssh_strict_host_key,
 			tls_mode = excluded.tls_mode,
 			updated_at_utc = excluded.updated_at_utc`,
-		np.ID, np.Name, string(np.Mode), np.ProxyURL, np.BastionHost, np.BastionPort, np.BastionUser, np.BastionCredentialID, strictInt, np.TLSMode, np.CreatedAtUTC, np.UpdatedAtUTC)
+		np.ID, np.Name, np.ScopeType, np.ScopeID, string(np.Mode), np.ProxyURL, np.BastionHost, np.BastionPort, np.BastionUser, np.BastionCredentialID, strictInt, np.TLSMode, np.CreatedAtUTC, np.UpdatedAtUTC)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if isUniqueErr(err) {
 			return np, fmt.Errorf("%w: duplicate network profile name %q", ErrConflict, np.Name)
 		}
 		return np, err
@@ -366,13 +376,13 @@ func (s *Store) upsertNetworkProfileTx(ctx context.Context, tx *sql.Tx, actor st
 func (s *Store) DeleteNetworkProfile(ctx context.Context, actor, id string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var refCount int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM instances WHERE network_profile_id = ?`, id).Scan(&refCount); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM instances WHERE network_profile_id = ?`, id).Scan(&refCount); err != nil {
 			return err
 		}
 		if refCount > 0 {
 			return fmt.Errorf("%w: cannot delete network profile %s referenced by %d instance(s)", ErrConflict, id, refCount)
 		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM network_profiles WHERE id = ?`, id)
+		res, err := s.txExec(ctx, tx, `DELETE FROM network_profiles WHERE id = ?`, id)
 		if err != nil {
 			return err
 		}
@@ -386,8 +396,8 @@ func (s *Store) DeleteNetworkProfile(ctx context.Context, actor, id string) erro
 
 // ListCredentialProfiles lists secret-free credential metadata.
 func (s *Store) ListCredentialProfiles(ctx context.Context) ([]types.CredentialProfile, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, kind, access_level, username, env_var_name, exec_command, created_at_utc, updated_at_utc
+	rows, err := s.dbQuery(ctx, `
+		SELECT id, name, scope_type, scope_id, kind, access_level, username, env_var_name, exec_command, created_at_utc, updated_at_utc
 		FROM credential_profiles ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
@@ -397,7 +407,7 @@ func (s *Store) ListCredentialProfiles(ctx context.Context) ([]types.CredentialP
 	var out []types.CredentialProfile
 	for rows.Next() {
 		var cp types.CredentialProfile
-		if err := rows.Scan(&cp.ID, &cp.Name, &cp.Kind, &cp.AccessLevel, &cp.Username, &cp.EnvVarName, &cp.ExecCommand, &cp.CreatedAtUTC, &cp.UpdatedAtUTC); err != nil {
+		if err := rows.Scan(&cp.ID, &cp.Name, &cp.ScopeType, &cp.ScopeID, &cp.Kind, &cp.AccessLevel, &cp.Username, &cp.EnvVarName, &cp.ExecCommand, &cp.CreatedAtUTC, &cp.UpdatedAtUTC); err != nil {
 			return nil, err
 		}
 		out = append(out, cp)
@@ -424,6 +434,12 @@ func (s *Store) upsertCredentialProfileTx(ctx context.Context, tx *sql.Tx, actor
 	if strings.TrimSpace(cp.Name) == "" {
 		return cp, fmt.Errorf("credential name is required")
 	}
+	if cp.ScopeType == "" {
+		cp.ScopeType = "global"
+	}
+	if cp.ScopeType == "global" {
+		cp.ScopeID = "global"
+	}
 	if cp.Kind == "" {
 		cp.Kind = types.CredKeychain
 	}
@@ -435,7 +451,7 @@ func (s *Store) upsertCredentialProfileTx(ctx context.Context, tx *sql.Tx, actor
 	}
 
 	var existingCreated string
-	err := tx.QueryRowContext(ctx, `SELECT created_at_utc FROM credential_profiles WHERE id = ?`, cp.ID).Scan(&existingCreated)
+	err := s.txQueryRow(ctx, tx, `SELECT created_at_utc FROM credential_profiles WHERE id = ?`, cp.ID).Scan(&existingCreated)
 	action := "credential_profile.create"
 	if err == nil {
 		action = "credential_profile.update"
@@ -446,20 +462,22 @@ func (s *Store) upsertCredentialProfileTx(ctx context.Context, tx *sql.Tx, actor
 		return cp, err
 	}
 	cp.UpdatedAtUTC = now
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO credential_profiles(id, name, kind, access_level, username, env_var_name, exec_command, created_at_utc, updated_at_utc)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err = s.txExec(ctx, tx, `
+		INSERT INTO credential_profiles(id, name, scope_type, scope_id, kind, access_level, username, env_var_name, exec_command, created_at_utc, updated_at_utc)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
+			scope_type = excluded.scope_type,
+			scope_id = excluded.scope_id,
 			kind = excluded.kind,
 			access_level = excluded.access_level,
 			username = excluded.username,
 			env_var_name = excluded.env_var_name,
 			exec_command = excluded.exec_command,
 			updated_at_utc = excluded.updated_at_utc`,
-		cp.ID, cp.Name, string(cp.Kind), string(cp.AccessLevel), cp.Username, cp.EnvVarName, cp.ExecCommand, cp.CreatedAtUTC, cp.UpdatedAtUTC)
+		cp.ID, cp.Name, cp.ScopeType, cp.ScopeID, string(cp.Kind), string(cp.AccessLevel), cp.Username, cp.EnvVarName, cp.ExecCommand, cp.CreatedAtUTC, cp.UpdatedAtUTC)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if isUniqueErr(err) {
 			return cp, fmt.Errorf("%w: duplicate credential name %q", ErrConflict, cp.Name)
 		}
 		return cp, err
@@ -474,16 +492,16 @@ func (s *Store) upsertCredentialProfileTx(ctx context.Context, tx *sql.Tx, actor
 func (s *Store) DeleteCredentialProfile(ctx context.Context, actor, id string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var tgtCount, netCount int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM targets WHERE ro_credential_id = ? OR rw_credential_id = ?`, id, id).Scan(&tgtCount); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM targets WHERE ro_credential_id = ? OR rw_credential_id = ?`, id, id).Scan(&tgtCount); err != nil {
 			return err
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM network_profiles WHERE bastion_credential_id = ?`, id).Scan(&netCount); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM network_profiles WHERE bastion_credential_id = ?`, id).Scan(&netCount); err != nil {
 			return err
 		}
 		if tgtCount > 0 || netCount > 0 {
 			return fmt.Errorf("%w: cannot delete credential profile %s in use (targets=%d, networks=%d)", ErrConflict, id, tgtCount, netCount)
 		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM credential_profiles WHERE id = ?`, id)
+		res, err := s.txExec(ctx, tx, `DELETE FROM credential_profiles WHERE id = ?`, id)
 		if err != nil {
 			return err
 		}
@@ -491,14 +509,15 @@ func (s *Store) DeleteCredentialProfile(ctx context.Context, actor, id string) e
 		if n == 0 {
 			return ErrNotFound
 		}
+		_, _ = s.txExec(ctx, tx, `DELETE FROM encrypted_secrets WHERE secret_key = ?`, "cred:"+id)
 		return s.appendAuditTx(ctx, tx, actor, "credential_profile.delete", id, "", map[string]any{"id": id}, nowUTC())
 	})
 }
 
 // ListInstances returns all database instances.
 func (s *Store) ListInstances(ctx context.Context) ([]types.Instance, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, engine, host, port, role, primary_instance_id, network_profile_id, tls_mode, params_json, capabilities_json, capabilities_detected_at_utc, created_at_utc, updated_at_utc
+	rows, err := s.dbQuery(ctx, `
+		SELECT id, name, scope_type, scope_id, engine, host, port, role, primary_instance_id, network_profile_id, tls_mode, params_json, capabilities_json, capabilities_detected_at_utc, created_at_utc, updated_at_utc
 		FROM instances ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
@@ -509,7 +528,7 @@ func (s *Store) ListInstances(ctx context.Context) ([]types.Instance, error) {
 	for rows.Next() {
 		var inst types.Instance
 		var paramsJSON, capsJSON string
-		if err := rows.Scan(&inst.ID, &inst.Name, &inst.Engine, &inst.Host, &inst.Port, &inst.Role, &inst.PrimaryInstanceID, &inst.NetworkProfileID, &inst.TLSMode, &paramsJSON, &capsJSON, &inst.CapabilitiesDetectedAt, &inst.CreatedAtUTC, &inst.UpdatedAtUTC); err != nil {
+		if err := rows.Scan(&inst.ID, &inst.Name, &inst.ScopeType, &inst.ScopeID, &inst.Engine, &inst.Host, &inst.Port, &inst.Role, &inst.PrimaryInstanceID, &inst.NetworkProfileID, &inst.TLSMode, &paramsJSON, &capsJSON, &inst.CapabilitiesDetectedAt, &inst.CreatedAtUTC, &inst.UpdatedAtUTC); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(paramsJSON), &inst.Params)
@@ -526,10 +545,10 @@ func (s *Store) ListInstances(ctx context.Context) ([]types.Instance, error) {
 func (s *Store) GetInstance(ctx context.Context, id string) (types.Instance, error) {
 	var inst types.Instance
 	var paramsJSON, capsJSON string
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, name, engine, host, port, role, primary_instance_id, network_profile_id, tls_mode, params_json, capabilities_json, capabilities_detected_at_utc, created_at_utc, updated_at_utc
+	err := s.dbQueryRow(ctx, `
+		SELECT id, name, scope_type, scope_id, engine, host, port, role, primary_instance_id, network_profile_id, tls_mode, params_json, capabilities_json, capabilities_detected_at_utc, created_at_utc, updated_at_utc
 		FROM instances WHERE id = ?`, id).
-		Scan(&inst.ID, &inst.Name, &inst.Engine, &inst.Host, &inst.Port, &inst.Role, &inst.PrimaryInstanceID, &inst.NetworkProfileID, &inst.TLSMode, &paramsJSON, &capsJSON, &inst.CapabilitiesDetectedAt, &inst.CreatedAtUTC, &inst.UpdatedAtUTC)
+		Scan(&inst.ID, &inst.Name, &inst.ScopeType, &inst.ScopeID, &inst.Engine, &inst.Host, &inst.Port, &inst.Role, &inst.PrimaryInstanceID, &inst.NetworkProfileID, &inst.TLSMode, &paramsJSON, &capsJSON, &inst.CapabilitiesDetectedAt, &inst.CreatedAtUTC, &inst.UpdatedAtUTC)
 	if errors.Is(err, sql.ErrNoRows) {
 		return inst, ErrNotFound
 	}
@@ -563,6 +582,12 @@ func (s *Store) upsertInstanceTx(ctx context.Context, tx *sql.Tx, actor string, 
 	if strings.TrimSpace(inst.Name) == "" || strings.TrimSpace(inst.Engine) == "" {
 		return inst, fmt.Errorf("instance name and engine are required")
 	}
+	if inst.ScopeType == "" {
+		inst.ScopeType = "global"
+	}
+	if inst.ScopeType == "global" {
+		inst.ScopeID = "global"
+	}
 	if inst.Role == "" {
 		inst.Role = types.RoleStandalone
 	}
@@ -575,7 +600,7 @@ func (s *Store) upsertInstanceTx(ctx context.Context, tx *sql.Tx, actor string, 
 	paramsJSON, _ := json.Marshal(inst.Params)
 
 	var existingCreated, existingCapsJSON, existingCapsAt string
-	err := tx.QueryRowContext(ctx, `SELECT created_at_utc, capabilities_json, capabilities_detected_at_utc FROM instances WHERE id = ?`, inst.ID).
+	err := s.txQueryRow(ctx, tx, `SELECT created_at_utc, capabilities_json, capabilities_detected_at_utc FROM instances WHERE id = ?`, inst.ID).
 		Scan(&existingCreated, &existingCapsJSON, &existingCapsAt)
 	action := "instance.create"
 	if err == nil {
@@ -589,7 +614,7 @@ func (s *Store) upsertInstanceTx(ctx context.Context, tx *sql.Tx, actor string, 
 	}
 	if inst.NetworkProfileID != "" {
 		var cnt int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM network_profiles WHERE id = ?`, inst.NetworkProfileID).Scan(&cnt); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM network_profiles WHERE id = ?`, inst.NetworkProfileID).Scan(&cnt); err != nil {
 			return inst, err
 		}
 		if cnt == 0 {
@@ -601,7 +626,7 @@ func (s *Store) upsertInstanceTx(ctx context.Context, tx *sql.Tx, actor string, 
 			return inst, fmt.Errorf("instance %q cannot set primary_instance_id to itself", inst.ID)
 		}
 		var cnt int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM instances WHERE id = ?`, inst.PrimaryInstanceID).Scan(&cnt); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM instances WHERE id = ?`, inst.PrimaryInstanceID).Scan(&cnt); err != nil {
 			return inst, err
 		}
 		if cnt == 0 {
@@ -625,11 +650,13 @@ func (s *Store) upsertInstanceTx(ctx context.Context, tx *sql.Tx, actor string, 
 	}
 
 	inst.UpdatedAtUTC = now
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO instances(id, name, engine, host, port, role, primary_instance_id, network_profile_id, tls_mode, params_json, capabilities_json, capabilities_detected_at_utc, created_at_utc, updated_at_utc)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err = s.txExec(ctx, tx, `
+		INSERT INTO instances(id, name, scope_type, scope_id, engine, host, port, role, primary_instance_id, network_profile_id, tls_mode, params_json, capabilities_json, capabilities_detected_at_utc, created_at_utc, updated_at_utc)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
+			scope_type = excluded.scope_type,
+			scope_id = excluded.scope_id,
 			engine = excluded.engine,
 			host = excluded.host,
 			port = excluded.port,
@@ -641,9 +668,9 @@ func (s *Store) upsertInstanceTx(ctx context.Context, tx *sql.Tx, actor string, 
 			capabilities_json = excluded.capabilities_json,
 			capabilities_detected_at_utc = excluded.capabilities_detected_at_utc,
 			updated_at_utc = excluded.updated_at_utc`,
-		inst.ID, inst.Name, inst.Engine, inst.Host, inst.Port, string(inst.Role), inst.PrimaryInstanceID, inst.NetworkProfileID, inst.TLSMode, string(paramsJSON), capsJSON, capsAt, inst.CreatedAtUTC, inst.UpdatedAtUTC)
+		inst.ID, inst.Name, inst.ScopeType, inst.ScopeID, inst.Engine, inst.Host, inst.Port, string(inst.Role), inst.PrimaryInstanceID, inst.NetworkProfileID, inst.TLSMode, string(paramsJSON), capsJSON, capsAt, inst.CreatedAtUTC, inst.UpdatedAtUTC)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if isUniqueErr(err) {
 			return inst, fmt.Errorf("%w: duplicate instance name %q", ErrConflict, inst.Name)
 		}
 		return inst, err
@@ -661,7 +688,7 @@ func (s *Store) UpdateInstanceCapabilities(ctx context.Context, id string, caps 
 	}
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var prevJSON string
-		if err := tx.QueryRowContext(ctx, `SELECT capabilities_json FROM instances WHERE id = ?`, id).Scan(&prevJSON); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT capabilities_json FROM instances WHERE id = ?`, id).Scan(&prevJSON); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -687,7 +714,7 @@ func (s *Store) UpdateInstanceCapabilities(ctx context.Context, id string, caps 
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE instances SET capabilities_json = ?, capabilities_detected_at_utc = ?, updated_at_utc = ? WHERE id = ?`,
+		if _, err := s.txExec(ctx, tx, `UPDATE instances SET capabilities_json = ?, capabilities_detected_at_utc = ?, updated_at_utc = ? WHERE id = ?`,
 			string(raw), caps.DetectedAtUTC, now, id); err != nil {
 			return err
 		}
@@ -699,13 +726,13 @@ func (s *Store) UpdateInstanceCapabilities(ctx context.Context, id string, caps 
 func (s *Store) DeleteInstance(ctx context.Context, actor, id string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var repCount int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM instances WHERE primary_instance_id = ?`, id).Scan(&repCount); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM instances WHERE primary_instance_id = ?`, id).Scan(&repCount); err != nil {
 			return err
 		}
 		if repCount > 0 {
 			return fmt.Errorf("%w: cannot delete primary instance %s referenced by %d replica(s)", ErrConflict, id, repCount)
 		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM instances WHERE id = ?`, id)
+		res, err := s.txExec(ctx, tx, `DELETE FROM instances WHERE id = ?`, id)
 		if err != nil {
 			return fmt.Errorf("%w: cannot delete instance %s in use: %v", ErrConflict, id, err)
 		}
@@ -719,7 +746,7 @@ func (s *Store) DeleteInstance(ctx context.Context, actor, id string) error {
 
 // ListTargets returns all targets including linked system IDs.
 func (s *Store) ListTargets(ctx context.Context) ([]types.Target, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.dbQuery(ctx, `
 		SELECT id, ref, alias, owner_system_id, environment_code, instance_id, database_name, ro_credential_id, rw_credential_id, policy_override_id, status, description, created_at_utc, updated_at_utc
 		FROM targets ORDER BY ref ASC`)
 	if err != nil {
@@ -740,7 +767,7 @@ func (s *Store) ListTargets(ctx context.Context) ([]types.Target, error) {
 		return nil, err
 	}
 
-	linkRows, err := s.db.QueryContext(ctx, `SELECT target_id, system_id FROM target_linked_systems ORDER BY system_id ASC`)
+	linkRows, err := s.dbQuery(ctx, `SELECT target_id, system_id FROM target_linked_systems ORDER BY system_id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -791,7 +818,7 @@ func (s *Store) upsertTargetTx(ctx context.Context, tx *sql.Tx, actor string, t 
 	}
 
 	var existingCreated string
-	err := tx.QueryRowContext(ctx, `SELECT created_at_utc FROM targets WHERE id = ?`, t.ID).Scan(&existingCreated)
+	err := s.txQueryRow(ctx, tx, `SELECT created_at_utc FROM targets WHERE id = ?`, t.ID).Scan(&existingCreated)
 	action := "target.create"
 	if err == nil {
 		action = "target.update"
@@ -801,17 +828,17 @@ func (s *Store) upsertTargetTx(ctx context.Context, tx *sql.Tx, actor string, t 
 	} else {
 		return t, err
 	}
-	if err := requireCredentialExistsTx(ctx, tx, t.ROCredentialID); err != nil {
+	if err := s.requireCredentialExistsTx(ctx, tx, t.ROCredentialID); err != nil {
 		return t, err
 	}
-	if err := requireCredentialExistsTx(ctx, tx, t.RWCredentialID); err != nil {
+	if err := s.requireCredentialExistsTx(ctx, tx, t.RWCredentialID); err != nil {
 		return t, err
 	}
-	if err := requirePolicyExistsTx(ctx, tx, t.PolicyOverrideID); err != nil {
+	if err := s.requirePolicyExistsTx(ctx, tx, t.PolicyOverrideID); err != nil {
 		return t, err
 	}
 	t.UpdatedAtUTC = now
-	_, err = tx.ExecContext(ctx, `
+	_, err = s.txExec(ctx, tx, `
 		INSERT INTO targets(id, ref, alias, owner_system_id, environment_code, instance_id, database_name, ro_credential_id, rw_credential_id, policy_override_id, status, description, created_at_utc, updated_at_utc)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -829,13 +856,13 @@ func (s *Store) upsertTargetTx(ctx context.Context, tx *sql.Tx, actor string, t 
 			updated_at_utc = excluded.updated_at_utc`,
 		t.ID, t.Ref, t.Alias, t.OwnerSystemID, t.EnvironmentCode, t.InstanceID, t.DatabaseName, t.ROCredentialID, t.RWCredentialID, t.PolicyOverrideID, string(t.Status), t.Description, t.CreatedAtUTC, t.UpdatedAtUTC)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if isUniqueErr(err) {
 			return t, fmt.Errorf("%w: duplicate target ref %q", ErrConflict, t.Ref)
 		}
 		return t, err
 	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM target_linked_systems WHERE target_id = ?`, t.ID); err != nil {
+	if _, err := s.txExec(ctx, tx, `DELETE FROM target_linked_systems WHERE target_id = ?`, t.ID); err != nil {
 		return t, err
 	}
 	seen := map[string]bool{t.OwnerSystemID: true}
@@ -844,7 +871,7 @@ func (s *Store) upsertTargetTx(ctx context.Context, tx *sql.Tx, actor string, t 
 			continue
 		}
 		seen[sid] = true
-		if _, err := tx.ExecContext(ctx, `INSERT INTO target_linked_systems(target_id, system_id) VALUES (?, ?)`, t.ID, sid); err != nil {
+		if _, err := s.txExec(ctx, tx, `INSERT INTO target_linked_systems(target_id, system_id) VALUES (?, ?)`, t.ID, sid); err != nil {
 			return t, err
 		}
 	}
@@ -858,8 +885,10 @@ func (s *Store) upsertTargetTx(ctx context.Context, tx *sql.Tx, actor string, t 
 func (s *Store) DeleteTarget(ctx context.Context, actor, id string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var ref string
-		_ = tx.QueryRowContext(ctx, `SELECT ref FROM targets WHERE id = ?`, id).Scan(&ref)
-		res, err := tx.ExecContext(ctx, `DELETE FROM targets WHERE id = ?`, id)
+		if err := s.txQueryRow(ctx, tx, `SELECT ref FROM targets WHERE id = ?`, id).Scan(&ref); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		res, err := s.txExec(ctx, tx, `DELETE FROM targets WHERE id = ?`, id)
 		if err != nil {
 			return err
 		}
@@ -878,14 +907,14 @@ func (s *Store) DeleteTarget(ctx context.Context, actor, id string) error {
 // GetGlobalSecurityConfig returns the global security guardrails.
 func (s *Store) GetGlobalSecurityConfig(ctx context.Context) (types.GlobalSecurityConfig, error) {
 	var cfg types.GlobalSecurityConfig
-	var freeze, blockMulti, redact, reqReason int
-	err := s.db.QueryRowContext(ctx, `
+	var freeze, blockMulti, redact, reqReason, forbidSelf int
+	err := s.dbQueryRow(ctx, `
 		SELECT exec_timeout_sec, approval_timeout_sec, max_rows, max_bytes, explain_max_rows,
 			prod_read_only_freeze, block_multi_statement_in_prod, default_approval_provider, redact_audit_literals,
-			require_reason_for_approval, updated_at_utc
+			require_reason_for_approval, forbid_self_approval, updated_at_utc
 		FROM global_security_config WHERE id = 1`).
 		Scan(&cfg.ExecTimeoutSec, &cfg.ApprovalTimeoutSec, &cfg.MaxRows, &cfg.MaxBytes, &cfg.ExplainMaxRows,
-			&freeze, &blockMulti, &cfg.DefaultApprovalProvider, &redact, &reqReason, &cfg.UpdatedAtUTC)
+			&freeze, &blockMulti, &cfg.DefaultApprovalProvider, &redact, &reqReason, &forbidSelf, &cfg.UpdatedAtUTC)
 	if err != nil {
 		return cfg, err
 	}
@@ -893,6 +922,7 @@ func (s *Store) GetGlobalSecurityConfig(ctx context.Context) (types.GlobalSecuri
 	cfg.BlockMultiStatementInProd = blockMulti == 1
 	cfg.RedactAuditLiterals = redact == 1
 	cfg.RequireReasonForApproval = reqReason == 1
+	cfg.ForbidSelfApproval = forbidSelf == 1
 	return cfg, nil
 }
 
@@ -907,7 +937,7 @@ func (s *Store) UpdateGlobalSecurityConfig(ctx context.Context, actor string, cf
 	now := nowUTC()
 	cfg.UpdatedAtUTC = now
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
+		_, err := s.txExec(ctx, tx, `
 			UPDATE global_security_config SET
 				exec_timeout_sec = ?,
 				approval_timeout_sec = ?,
@@ -919,11 +949,12 @@ func (s *Store) UpdateGlobalSecurityConfig(ctx context.Context, actor string, cf
 				default_approval_provider = ?,
 				redact_audit_literals = ?,
 				require_reason_for_approval = ?,
+				forbid_self_approval = ?,
 				updated_at_utc = ?
 			WHERE id = 1`,
 			cfg.ExecTimeoutSec, cfg.ApprovalTimeoutSec, cfg.MaxRows, cfg.MaxBytes, cfg.ExplainMaxRows,
 			boolToInt(cfg.ProdReadOnlyFreeze), boolToInt(cfg.BlockMultiStatementInProd),
-			cfg.DefaultApprovalProvider, boolToInt(cfg.RedactAuditLiterals), boolToInt(cfg.RequireReasonForApproval), now)
+			cfg.DefaultApprovalProvider, boolToInt(cfg.RedactAuditLiterals), boolToInt(cfg.RequireReasonForApproval), boolToInt(cfg.ForbidSelfApproval), now)
 		if err != nil {
 			return err
 		}
@@ -934,7 +965,7 @@ func (s *Store) UpdateGlobalSecurityConfig(ctx context.Context, actor string, cf
 
 // ListPolicies returns all policy rule sets.
 func (s *Store) ListPolicies(ctx context.Context) ([]types.PolicyRuleSet, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.dbQuery(ctx, `
 		SELECT id, name, scope_type, scope_id,
 			allow_safe_read, require_approval_on_high_cost_read, require_approval_on_write,
 			require_approval_on_ddl, require_approval_on_admin, require_approval_on_unknown,
@@ -992,9 +1023,9 @@ func (s *Store) UpsertPolicy(ctx context.Context, actor string, p types.PolicyRu
 
 func (s *Store) upsertPolicyTx(ctx context.Context, tx *sql.Tx, actor string, p types.PolicyRuleSet, now string) (types.PolicyRuleSet, error) {
 	if p.ScopeType != "env" {
-		p.ScopeID = canonicalizeScopeIDTx(ctx, tx, p.ScopeType, p.ScopeID)
+		p.ScopeID = s.canonicalizeScopeIDTx(ctx, tx, p.ScopeType, p.ScopeID)
 	} else {
-		p.ScopeID = canonicalizeScopeIDTx(ctx, tx, "env", p.ScopeID)
+		p.ScopeID = s.canonicalizeScopeIDTx(ctx, tx, "env", p.ScopeID)
 	}
 	if err := policy.ValidateRuleSet(p); err != nil {
 		return p, err
@@ -1003,7 +1034,7 @@ func (s *Store) upsertPolicyTx(ctx context.Context, tx *sql.Tx, actor string, p 
 		p.ID = newID("pol")
 	}
 	var existingCreated string
-	err := tx.QueryRowContext(ctx, `SELECT created_at_utc FROM policies WHERE id = ?`, p.ID).Scan(&existingCreated)
+	err := s.txQueryRow(ctx, tx, `SELECT created_at_utc FROM policies WHERE id = ?`, p.ID).Scan(&existingCreated)
 	action := "policy.create"
 	if err == nil {
 		action = "policy.update"
@@ -1014,7 +1045,7 @@ func (s *Store) upsertPolicyTx(ctx context.Context, tx *sql.Tx, actor string, p 
 		return p, err
 	}
 	p.UpdatedAtUTC = now
-	_, err = tx.ExecContext(ctx, `
+	_, err = s.txExec(ctx, tx, `
 		INSERT INTO policies(
 			id, name, scope_type, scope_id,
 			allow_safe_read, require_approval_on_high_cost_read, require_approval_on_write,
@@ -1048,7 +1079,7 @@ func (s *Store) upsertPolicyTx(ctx context.Context, tx *sql.Tx, actor string, p 
 		intPtrToNullInt(p.MaxRows), int64PtrToNullInt(p.MaxBytes), int64PtrToNullInt(p.ExplainMaxRows),
 		p.ApprovalProvider, string(p.ScanReadMode), p.CreatedAtUTC, p.UpdatedAtUTC)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
+		if isUniqueErr(err) {
 			return p, fmt.Errorf("%w: duplicate policy name %q", ErrConflict, p.Name)
 		}
 		return p, err
@@ -1063,19 +1094,19 @@ func (s *Store) upsertPolicyTx(ctx context.Context, tx *sql.Tx, actor string, p 
 func (s *Store) DeletePolicy(ctx context.Context, actor, id string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var envCount, sysCount, tgtCount int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM environments WHERE default_policy_id = ?`, id).Scan(&envCount); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM environments WHERE default_policy_id = ?`, id).Scan(&envCount); err != nil {
 			return err
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM systems WHERE default_policy_id = ?`, id).Scan(&sysCount); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM systems WHERE default_policy_id = ?`, id).Scan(&sysCount); err != nil {
 			return err
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM targets WHERE policy_override_id = ?`, id).Scan(&tgtCount); err != nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM targets WHERE policy_override_id = ?`, id).Scan(&tgtCount); err != nil {
 			return err
 		}
 		if envCount > 0 || sysCount > 0 || tgtCount > 0 {
 			return fmt.Errorf("%w: cannot delete policy %s in use (envs=%d, systems=%d, targets=%d)", ErrConflict, id, envCount, sysCount, tgtCount)
 		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM policies WHERE id = ?`, id)
+		res, err := s.txExec(ctx, tx, `DELETE FROM policies WHERE id = ?`, id)
 		if err != nil {
 			return err
 		}
@@ -1134,7 +1165,7 @@ func (s *Store) ImportTopology(ctx context.Context, actor string, b types.Topolo
 	return err
 }
 
-func canonicalizeScopeIDTx(ctx context.Context, tx *sql.Tx, scopeType, scopeID string) string {
+func (s *Store) canonicalizeScopeIDTx(ctx context.Context, tx *sql.Tx, scopeType, scopeID string) string {
 	trimmed := strings.TrimSpace(scopeID)
 	if trimmed == "" {
 		return ""
@@ -1142,29 +1173,29 @@ func canonicalizeScopeIDTx(ctx context.Context, tx *sql.Tx, scopeType, scopeID s
 	switch scopeType {
 	case "env":
 		var code string
-		if err := tx.QueryRowContext(ctx, `SELECT code FROM environments WHERE LOWER(code) = LOWER(?) LIMIT 1`, trimmed).Scan(&code); err == nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT code FROM environments WHERE LOWER(code) = LOWER(?) LIMIT 1`, trimmed).Scan(&code); err == nil {
 			return code
 		}
 	case "system":
 		var id string
-		if err := tx.QueryRowContext(ctx, `SELECT id FROM systems WHERE id = ? OR LOWER(slug) = LOWER(?) LIMIT 1`, trimmed, trimmed).Scan(&id); err == nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT id FROM systems WHERE id = ? OR LOWER(slug) = LOWER(?) LIMIT 1`, trimmed, trimmed).Scan(&id); err == nil {
 			return id
 		}
 	case "target":
 		var id string
-		if err := tx.QueryRowContext(ctx, `SELECT id FROM targets WHERE id = ? OR LOWER(ref) = LOWER(?) LIMIT 1`, trimmed, trimmed).Scan(&id); err == nil {
+		if err := s.txQueryRow(ctx, tx, `SELECT id FROM targets WHERE id = ? OR LOWER(ref) = LOWER(?) LIMIT 1`, trimmed, trimmed).Scan(&id); err == nil {
 			return id
 		}
 	}
 	return trimmed
 }
 
-func requirePolicyExistsTx(ctx context.Context, tx *sql.Tx, id string) error {
+func (s *Store) requirePolicyExistsTx(ctx context.Context, tx *sql.Tx, id string) error {
 	if id == "" {
 		return nil
 	}
 	var cnt int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM policies WHERE id = ?`, id).Scan(&cnt); err != nil {
+	if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM policies WHERE id = ?`, id).Scan(&cnt); err != nil {
 		return err
 	}
 	if cnt == 0 {
@@ -1173,12 +1204,12 @@ func requirePolicyExistsTx(ctx context.Context, tx *sql.Tx, id string) error {
 	return nil
 }
 
-func requireCredentialExistsTx(ctx context.Context, tx *sql.Tx, id string) error {
+func (s *Store) requireCredentialExistsTx(ctx context.Context, tx *sql.Tx, id string) error {
 	if id == "" {
 		return nil
 	}
 	var cnt int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM credential_profiles WHERE id = ?`, id).Scan(&cnt); err != nil {
+	if err := s.txQueryRow(ctx, tx, `SELECT COUNT(1) FROM credential_profiles WHERE id = ?`, id).Scan(&cnt); err != nil {
 		return err
 	}
 	if cnt == 0 {
@@ -1200,7 +1231,7 @@ func (s *Store) cleanupScopedPoliciesAndRulesTx(ctx context.Context, tx *sql.Tx,
 		AND id NOT IN (SELECT default_policy_id FROM environments WHERE default_policy_id != '')
 		AND id NOT IN (SELECT default_policy_id FROM systems WHERE default_policy_id != '')
 		AND id NOT IN (SELECT policy_override_id FROM targets WHERE policy_override_id != '')`
-	polRows, err := tx.QueryContext(ctx, polQuery, polArgs...)
+	polRows, err := s.txQuery(ctx, tx, polQuery, polArgs...)
 	if err != nil {
 		return err
 	}
@@ -1215,7 +1246,7 @@ func (s *Store) cleanupScopedPoliciesAndRulesTx(ctx context.Context, tx *sql.Tx,
 	}
 	_ = polRows.Close()
 	for _, pid := range polIDs {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM policies WHERE id = ?`, pid); err != nil {
+		if _, err := s.txExec(ctx, tx, `DELETE FROM policies WHERE id = ?`, pid); err != nil {
 			return err
 		}
 		if err := s.appendAuditTx(ctx, tx, actor, "policy.delete", pid, "", map[string]any{"id": pid, "cascade_scope": scopeType + ":" + id}, now); err != nil {
@@ -1224,7 +1255,7 @@ func (s *Store) cleanupScopedPoliciesAndRulesTx(ctx context.Context, tx *sql.Tx,
 	}
 
 	patWhere, patArgs := match("scope_id")
-	patRows, err := tx.QueryContext(ctx, `SELECT id FROM risk_pattern_rules WHERE `+patWhere, patArgs...)
+	patRows, err := s.txQuery(ctx, tx, `SELECT id FROM risk_pattern_rules WHERE `+patWhere, patArgs...)
 	if err != nil {
 		return err
 	}
@@ -1239,7 +1270,7 @@ func (s *Store) cleanupScopedPoliciesAndRulesTx(ctx context.Context, tx *sql.Tx,
 	}
 	_ = patRows.Close()
 	for _, rid := range patIDs {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM risk_pattern_rules WHERE id = ?`, rid); err != nil {
+		if _, err := s.txExec(ctx, tx, `DELETE FROM risk_pattern_rules WHERE id = ?`, rid); err != nil {
 			return err
 		}
 		if err := s.appendAuditTx(ctx, tx, actor, "risk_pattern.delete", rid, "", map[string]any{"id": rid, "cascade_scope": scopeType + ":" + id}, now); err != nil {

@@ -186,12 +186,7 @@ func (p *ConnPool) Acquire(ctx context.Context, meta ConnPoolMeta, openFn func(c
 			}
 		}
 		p.hits.Add(1)
-		return &pooledConn{
-			pool:      p,
-			inner:     entry.conn,
-			meta:      meta,
-			createdAt: entry.createdAt,
-		}, nil
+		return wrapPooledConn(p, entry.conn, meta, entry.createdAt), nil
 	}
 
 	p.misses.Add(1)
@@ -199,12 +194,20 @@ func (p *ConnPool) Acquire(ctx context.Context, meta ConnPoolMeta, openFn func(c
 	if err != nil {
 		return nil, err
 	}
-	return &pooledConn{
+	return wrapPooledConn(p, conn, meta, time.Now()), nil
+}
+
+func wrapPooledConn(p *ConnPool, inner Conn, meta ConnPoolMeta, createdAt time.Time) Conn {
+	pc := &pooledConn{
 		pool:      p,
-		inner:     conn,
+		inner:     inner,
 		meta:      meta,
-		createdAt: time.Now(),
-	}, nil
+		createdAt: createdAt,
+	}
+	if si, ok := inner.(SchemaInspector); ok {
+		return &pooledSchemaConn{pooledConn: pc, si: si}
+	}
+	return pc
 }
 
 func (p *ConnPool) popLatest(key string) *idleConn {
@@ -464,6 +467,27 @@ func (c *pooledConn) Capabilities() *types.ServerCapabilities {
 		return da.Capabilities()
 	}
 	return nil
+}
+
+type pooledSchemaConn struct {
+	*pooledConn
+	si SchemaInspector
+}
+
+func (c *pooledSchemaConn) ListTables(ctx context.Context, opts SchemaListOpts) (*types.SchemaListResult, error) {
+	res, err := c.si.ListTables(ctx, opts)
+	if err != nil && ctx.Err() != nil {
+		c.poisoned.Store(true)
+	}
+	return res, err
+}
+
+func (c *pooledSchemaConn) DescribeTable(ctx context.Context, name string) (*types.TableSchema, error) {
+	res, err := c.si.DescribeTable(ctx, name)
+	if err != nil && ctx.Err() != nil {
+		c.poisoned.Store(true)
+	}
+	return res, err
 }
 
 func (c *pooledConn) Ping(ctx context.Context) (types.PingResult, error) {

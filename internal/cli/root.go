@@ -33,10 +33,11 @@ import (
 var SkillMarkdown string
 
 type globalOpts struct {
-	jsonOut bool
-	noColor bool
-	noInput bool
-	session string
+	jsonOut     bool
+	noColor     bool
+	noInput     bool
+	session     string
+	contextName string
 }
 
 // Execute builds the root CLI command, executes it, and returns the OS exit code.
@@ -56,15 +57,19 @@ Typical agent workflow:
   4. Wait if approved:   agent-dbctl op wait <operation_id> --timeout 60s --json`,
 		SilenceErrors: true,
 		SilenceUsage:  true,
-		PersistentPreRun: func(cmd *cobra.Command, _ []string) {
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			if cmd.Flags().Changed("session") && (cmd.Flags().Changed("context") || strings.TrimSpace(os.Getenv(config.EnvContext)) != "") {
+				return fmt.Errorf("--session and --context cannot be combined")
+			}
 			switch cmd.CommandPath() {
-			case "agent-dbctl skill install", "agent-dbctl skill status", "agent-dbctl skill uninstall", "agent-dbctl skill print":
-				return
+			case "agent-dbctl serve", "agent-dbctl skill install", "agent-dbctl skill status", "agent-dbctl skill uninstall", "agent-dbctl skill print":
+				return nil
 			}
 			if cmd.Parent() != nil && cmd.Parent().Name() == "completion" {
-				return
+				return nil
 			}
 			skillinstall.AutoSync(version, SkillMarkdown)
+			return nil
 		},
 	}
 	root.PersistentFlags().BoolVar(&g.jsonOut, "json", false, "Output structured JSON envelope")
@@ -72,6 +77,7 @@ Typical agent workflow:
 	root.PersistentFlags().BoolVar(&g.noInput, "no-input", false, "Disable interactive prompts")
 	root.PersistentFlags().BoolVar(&g.noInput, "non-interactive", false, "Alias for --no-input")
 	root.PersistentFlags().StringVar(&g.session, "session", "", "Daemon session name (or AGENT_DBCTL_SESSION)")
+	root.PersistentFlags().StringVar(&g.contextName, "context", "", "Target client context name (or AGENT_DBCTL_CONTEXT)")
 	_ = root.PersistentFlags().MarkHidden("non-interactive")
 
 	ioCtx := func() IOContext {
@@ -82,7 +88,22 @@ Typical agent workflow:
 		if sess == "" {
 			sess = "default"
 		}
-		return DetectIO(g.jsonOut, g.noColor, g.noInput, version, sess)
+		ic := DetectIO(g.jsonOut, g.noColor, g.noInput, version, sess)
+		ic.Context = strings.TrimSpace(g.contextName)
+		if ic.Context == "" {
+			ic.Context = strings.TrimSpace(os.Getenv(config.EnvContext))
+		}
+		ic.Mode = string(config.ContextModeLocal)
+		if paths, err := config.ResolvePaths(sess); err == nil {
+			if active, _, ctxErr := config.ResolveActiveContext(paths, ic.Context); ctxErr == nil {
+				ic.Context = active.Name
+				ic.Mode = string(active.Mode)
+			} else if strings.TrimSpace(os.Getenv(config.EnvEndpoint)) != "" && ic.Context == "" {
+				ic.Context = "env"
+				ic.Mode = string(config.ContextModeRemote)
+			}
+		}
+		return ic
 	}
 
 	// ---- db ----
@@ -105,7 +126,7 @@ Typical agent workflow:
 				exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
-			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
+			cwd, gitRemotes := detectWorkspaceContextForIO(cmd.Context(), ic, false)
 			var res struct {
 				Items             []types.TargetDetail `json:"items"`
 				SimilarNames      []string             `json:"similar_names"`
@@ -202,7 +223,7 @@ Typical agent workflow:
 				exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
-			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
+			cwd, gitRemotes := detectWorkspaceContextForIO(cmd.Context(), ic, false)
 			var detail types.TargetDetail
 			err = client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/show", map[string]any{
 				"target":                args[0],
@@ -278,7 +299,7 @@ Typical agent workflow:
 				exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
-			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
+			cwd, gitRemotes := detectWorkspaceContextForIO(cmd.Context(), ic, false)
 			table := ""
 			if len(args) == 2 {
 				table = args[1]
@@ -442,7 +463,7 @@ Typical agent workflow:
 				exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
-			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
+			cwd, gitRemotes := detectWorkspaceContextForIO(cmd.Context(), ic, false)
 			target := ""
 			if len(args) == 1 {
 				target = args[0]
@@ -588,13 +609,18 @@ Agent defaults:
 				exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
-			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
+			cwd, gitRemotes := detectWorkspaceContextForIO(cmd.Context(), ic, false)
 			tSec := int(execOpts.timeout.Seconds())
 			waitVal := execOpts.wait
 			if !cmd.Flags().Changed("wait") && ic.NoInput {
 				waitVal = false
 			}
 			start := time.Now()
+
+			rpcWait := waitVal
+			if client.IsRemote() {
+				rpcWait = false
+			}
 
 			var resp types.ExecResponse
 			err = client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/exec", types.ExecRequest{
@@ -609,11 +635,21 @@ Agent defaults:
 				MaxRows:             execOpts.maxRows,
 				MaxBytes:            execOpts.maxBytes,
 				TimeoutSec:          tSec,
-				Wait:                waitVal,
+				Wait:                rpcWait,
 			}, &resp)
 			if err != nil {
 				exitCode = writeRPCErr(ic, err)
 				return nil
+			}
+			if client.IsRemote() && waitVal && !execOpts.dryRun && !execOpts.preflight &&
+				(resp.Status == types.OpWaitingApproval || resp.Status == types.OpRunning || resp.Status == types.OpPending) {
+				waitDur := 120 * time.Second
+				if resp.Evaluation.EffectivePolicy.ApprovalTimeoutSec > 0 {
+					waitDur = time.Duration(resp.Evaluation.EffectivePolicy.ApprovalTimeoutSec) * time.Second
+				}
+				if wResp, wErr := waitForOperationLoop(cmd.Context(), client, resp.OperationID, waitDur); wErr == nil {
+					resp = wResp
+				}
 			}
 			meta := types.Meta{
 				DurationMs: time.Since(start).Milliseconds(),
@@ -836,10 +872,10 @@ Agent defaults:
 			} else if uiTab != "" {
 				tab := strings.ToLower(strings.TrimSpace(uiTab))
 				switch tab {
-				case "approvals", "targets", "catalog", "policies", "audit", "drivers":
+				case "approvals", "targets", "catalog", "policies", "audit", "drivers", "access":
 					targetURL += "/" + tab
 				default:
-					exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, fmt.Sprintf("unknown --tab %q", uiTab), "Supported tabs: approvals, targets, catalog, policies, audit, drivers.", nil, nil, types.Meta{})
+					exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, fmt.Sprintf("unknown --tab %q", uiTab), "Supported tabs: approvals, targets, catalog, policies, audit, drivers, access.", nil, nil, types.Meta{})
 					return nil
 				}
 			}
@@ -887,6 +923,10 @@ Agent defaults:
 		Short: "Start background daemon for current session",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
+			if isRemoteIO(ic) {
+				exitCode = ic.WriteError(types.ErrCodeRemoteUnsupported, false, "daemon start is unsupported on remote contexts", "Switch to local context (`agent-dbctl context use local`) to manage a local daemon.", nil, nil, types.Meta{})
+				return nil
+			}
 			client, err := ensureDaemon(ic, version, commit)
 			if err != nil {
 				exitCode = writeClientInitErr(ic, err)
@@ -912,6 +952,24 @@ Agent defaults:
 		Short: "Check running daemon identity and version",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
+			if isRemoteIO(ic) {
+				client, err := ensureDaemon(ic, version, commit)
+				if err != nil {
+					exitCode = writeClientInitErr(ic, err)
+					return nil
+				}
+				id, err := client.GetIdentity(cmd.Context())
+				if err != nil {
+					exitCode = writeRPCErr(ic, err)
+					return nil
+				}
+				if ic.JSONMode {
+					exitCode = ic.WriteSuccess(id, types.Meta{})
+					return nil
+				}
+				_, _ = fmt.Fprintf(ic.Stdout, "Mode: %s\nVersion: %s (%s)\nNode: %s\nWeb: %s\n", id.Mode, id.Version, id.Commit, id.NodeID, id.WebURL)
+				return nil
+			}
 			paths, err := config.ResolvePaths(ic.Session)
 			if err != nil {
 				exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
@@ -942,6 +1000,10 @@ Agent defaults:
 		Short: "Stop the running session daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
+			if isRemoteIO(ic) {
+				exitCode = ic.WriteError(types.ErrCodeRemoteUnsupported, false, "daemon stop is unsupported on remote contexts", "Switch to local context (`agent-dbctl context use local`) to manage a local daemon.", nil, nil, types.Meta{})
+				return nil
+			}
 			paths, err := config.ResolvePaths(ic.Session)
 			if err != nil {
 				exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
@@ -966,6 +1028,10 @@ Agent defaults:
 		Short: "Restart the session daemon with the current binary version",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
+			if isRemoteIO(ic) {
+				exitCode = ic.WriteError(types.ErrCodeRemoteUnsupported, false, "daemon restart is unsupported on remote contexts", "Switch to local context (`agent-dbctl context use local`) to manage a local daemon.", nil, nil, types.Meta{})
+				return nil
+			}
 			paths, err := config.ResolvePaths(ic.Session)
 			if err != nil {
 				exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
@@ -1001,6 +1067,31 @@ Agent defaults:
 		Short: "List built-in drivers and discovered external plugins",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
+			if isRemoteIO(ic) {
+				client, err := ensureDaemon(ic, version, commit)
+				if err != nil {
+					exitCode = writeClientInitErr(ic, err)
+					return nil
+				}
+				var res struct {
+					Drivers []any                        `json:"drivers"`
+					Plugins []drvplugin.DiscoveredPlugin `json:"plugins"`
+				}
+				if err := client.DoJSON(cmd.Context(), http.MethodGet, "/rpc/v1/plugins", nil, &res); err != nil {
+					exitCode = writeRPCErr(ic, err)
+					return nil
+				}
+				if ic.JSONMode {
+					exitCode = ic.WriteSuccess(res, types.Meta{})
+					return nil
+				}
+				rows := make([][]string, 0, len(res.Plugins))
+				for _, p := range res.Plugins {
+					rows = append(rows, []string{p.Manifest.ID, p.Manifest.Engine, p.Manifest.Version, fmt.Sprintf("%v", p.Verified), p.VerificationErr})
+				}
+				renderTable(ic.Stdout, []string{"ID", "ENGINE", "VERSION", "VERIFIED", "ERROR"}, rows)
+				return nil
+			}
 			paths, err := config.ResolvePaths(ic.Session)
 			if err != nil {
 				exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
@@ -1030,6 +1121,10 @@ Agent defaults:
 		Short: "Verify manifest.json and SHA-256 checksums for all plugins",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
+			if isRemoteIO(ic) {
+				exitCode = ic.WriteError(types.ErrCodeRemoteUnsupported, false, "plugin verify inspects local plugins on the server host only; use `plugin list` in remote mode", "", nil, nil, types.Meta{})
+				return nil
+			}
 			paths, err := config.ResolvePaths(ic.Session)
 			if err != nil {
 				exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
@@ -1096,6 +1191,66 @@ Agent defaults:
 		Short: "Check config permissions, SQLite WAL, secret backend, daemon identity, and plugins",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
+			if isRemoteIO(ic) {
+				client, err := ensureDaemon(ic, version, commit)
+				if err != nil {
+					exitCode = writeClientInitErr(ic, err)
+					return nil
+				}
+				id, err := client.GetIdentity(cmd.Context())
+				if err != nil {
+					exitCode = writeRPCErr(ic, err)
+					return nil
+				}
+				var whoami types.Principal
+				_ = client.DoJSON(cmd.Context(), http.MethodGet, "/rpc/v1/whoami", nil, &whoami)
+				var plugRes struct {
+					Plugins []drvplugin.DiscoveredPlugin `json:"plugins"`
+				}
+				_ = client.DoJSON(cmd.Context(), http.MethodGet, "/rpc/v1/plugins", nil, &plugRes)
+				report := map[string]any{
+					"binary_path":   ic.BinPath,
+					"version":       version,
+					"commit":        commit,
+					"context":       ic.Context,
+					"mode":          ic.Mode,
+					"daemon":        id,
+					"principal":     whoami,
+					"plugins_count": len(plugRes.Plugins),
+				}
+				if doctorLive {
+					var testRes struct {
+						Results []types.PingResult `json:"results"`
+					}
+					if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/test", map[string]any{
+						"all":    true,
+						"filter": daemon.ListFilter{},
+					}, &testRes); err != nil {
+						exitCode = writeRPCErr(ic, err)
+						return nil
+					}
+					reachable, failed := 0, 0
+					for _, r := range testRes.Results {
+						if r.Reachable {
+							reachable++
+						} else {
+							failed++
+						}
+					}
+					report["live_checked"] = true
+					report["live_targets_total"] = len(testRes.Results)
+					report["live_targets_reachable"] = reachable
+					report["live_targets_failed"] = failed
+					report["live_results"] = testRes.Results
+				}
+				if ic.JSONMode {
+					exitCode = ic.WriteSuccess(report, types.Meta{})
+					return nil
+				}
+				_, _ = fmt.Fprintf(ic.Stdout, "Version: %s (%s)\nContext: %s (%s)\nServer: %s (%s)\nPrincipal: %s\n",
+					version, commit, ic.Context, ic.Mode, id.WebURL, id.Version, whoami.Subject)
+				return nil
+			}
 			paths, err := config.ResolvePaths(ic.Session)
 			if err != nil {
 				exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
@@ -1368,7 +1523,15 @@ Agent defaults:
 	annotateCommand(skillPrintCmd, RiskRead, "agent-dbctl skill print")
 	skillCmd.AddCommand(skillInstallCmd, skillStatusCmd, skillUninstallCmd, skillPrintCmd)
 
-	root.AddCommand(dbCmd, execCmd, opCmd, uiCmd, daemonCmd, pluginCmd, auditCmd, doctorCmd, describeCmd, versionCmd, capabilitiesCmd, skillCmd)
+	root.AddCommand(
+		dbCmd, execCmd, opCmd, uiCmd, daemonCmd, pluginCmd, auditCmd, doctorCmd, describeCmd, versionCmd, capabilitiesCmd, skillCmd,
+		newServeCmd(ioCtx, version, commit, &exitCode),
+		newContextCmd(ioCtx, &exitCode),
+		newLoginCmd(ioCtx, version, commit, &exitCode),
+		newLogoutCmd(ioCtx, &exitCode),
+		newWhoamiCmd(ioCtx, version, commit, &exitCode),
+		newTokenCmd(ioCtx, version, commit, &exitCode),
+	)
 	registerCatalogCommands(root, ioCtx, ensureDaemon, writeClientInitErr, writeRPCErr, func(c int) { exitCode = c }, version, commit)
 	registerPolicyCommands(root, ioCtx, ensureDaemon, writeClientInitErr, writeRPCErr, func(c int) { exitCode = c }, version, commit)
 
@@ -1806,6 +1969,12 @@ func ensureDaemon(ic IOContext, version, commit string) (*daemon.Client, error) 
 	if err != nil {
 		return nil, err
 	}
+	if ctxCfg, _, ctxErr := config.ResolveActiveContext(paths, ic.Context); ctxErr != nil {
+		return nil, ctxErr
+	} else if ctxCfg.Mode == config.ContextModeRemote {
+		tok := resolveRemoteToken(paths, ctxCfg)
+		return daemon.NewRemoteClient(ctxCfg, tok)
+	}
 	if cl, err := daemon.NewClient(paths); err == nil {
 		if id, idErr := cl.GetIdentity(context.Background()); idErr == nil && daemonIdentityMatches(id, version, commit) {
 			return cl, nil
@@ -1883,7 +2052,14 @@ func stopDaemonWithPID(ctx context.Context, paths config.Paths, knownPID int) er
 }
 
 func writeClientInitErr(ic IOContext, err error) int {
+	var le *daemon.LookupError
+	if errors.As(err, &le) {
+		return writeRPCErr(ic, err)
+	}
 	msg := err.Error()
+	if isRemoteIO(ic) {
+		return ic.WriteError(types.ErrCodeRemoteUnreachable, true, msg, "Check context endpoint/TLS config with `agent-dbctl context show` and ensure server is reachable.", nil, []string{ic.BinPath + " context show --json"}, types.Meta{})
+	}
 	if strings.Contains(msg, types.ErrCodeDaemonVersionMismatch) {
 		hint := "Restart the daemon to match the current CLI binary."
 		if strings.Contains(msg, "is newer than CLI") {
@@ -1977,6 +2153,12 @@ func writeRPCErr(ic IOContext, err error) int {
 			}
 		} else if le.Code == types.ErrCodeInvalidUsage {
 			next = append(next, ic.BinPath+" db list --json")
+		} else if le.Code == types.ErrCodeAuthRequired {
+			hint = "Authentication is required or token expired. Run `agent-dbctl login` or supply AGENT_DBCTL_TOKEN."
+			next = append(next, ic.BinPath+" login")
+		} else if le.Code == types.ErrCodeForbidden {
+			hint = "Your user or token role lacks permission for this action."
+			next = append(next, ic.BinPath+" whoami --json")
 		} else if le.Code == types.ErrCodeNotFound {
 			hint = "Requested catalog or policy resource does not exist; inspect configured resources first."
 		} else if le.Code == types.ErrCodeConflict {

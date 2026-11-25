@@ -97,6 +97,7 @@ func ResolveEffectivePolicyWithSystems(
 	for _, p := range policies {
 		byID[p.ID] = p
 	}
+	scanReadExplicit := false
 
 	// Lower levels can only tighten permissions and caps; loosening is never permitted.
 	apply := func(p types.PolicyRuleSet, src string) {
@@ -153,8 +154,11 @@ func ResolveEffectivePolicyWithSystems(
 			eff.Sources["approval_provider"] = src
 		}
 		if p.ScanReadMode != "" {
-			eff.ScanReadMode = p.ScanReadMode
-			eff.Sources["scan_read_mode"] = src
+			if !scanReadExplicit || scanReadSeverity(p.ScanReadMode) >= scanReadSeverity(eff.ScanReadMode) {
+				eff.ScanReadMode = p.ScanReadMode
+				eff.Sources["scan_read_mode"] = src
+				scanReadExplicit = true
+			}
 		}
 	}
 
@@ -405,4 +409,17 @@ func deduplicateStrings(in []string) []string {
 		}
 	}
 	return out
+}
+
+func scanReadSeverity(mode types.ScanReadMode) int {
+	switch mode {
+	case types.ScanReadAllow:
+		return 1
+	case types.ScanReadReasonOnly:
+		return 2
+	case types.ScanReadRequireApproval:
+		return 3
+	default:
+		return 0
+	}
 }

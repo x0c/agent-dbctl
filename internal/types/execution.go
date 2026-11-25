@@ -146,9 +146,15 @@ type Operation struct {
 	SystemID        string            `json:"system_id"`
 	SystemSlug      string            `json:"system_slug"`
 	EnvironmentCode string            `json:"environment_code"`
-	Engine          string            `json:"engine"`
-	Actor           string            `json:"actor"`
-	Reason          string            `json:"reason,omitempty"`
+	Engine               string            `json:"engine"`
+	Actor                string            `json:"actor"`
+	PrincipalID          string            `json:"principal_id,omitempty"`
+	PrincipalKind        PrincipalKind     `json:"principal_kind,omitempty"`
+	OwnerUserID          string            `json:"owner_user_id,omitempty"`
+	OwnerNodeID          string            `json:"owner_node_id,omitempty"`
+	LeaseExpiresAtUTC    string            `json:"lease_expires_at_utc,omitempty"`
+	CancelRequestedAtUTC string            `json:"cancel_requested_at_utc,omitempty"`
+	Reason               string            `json:"reason,omitempty"`
 	WorkspaceCWD    string            `json:"workspace_cwd,omitempty"`
 	QueryText       string            `json:"query_text"`
 	QueryRedacted   string            `json:"query_redacted"`
@@ -199,6 +205,7 @@ type ApprovalRequest struct {
 	EnvironmentCode   string           `json:"environment_code"`
 	Engine            string           `json:"engine"`
 	Actor             string           `json:"actor"`
+	PrincipalID       string           `json:"principal_id,omitempty"`
 	Reason            string           `json:"reason,omitempty"`
 	WorkspaceCWD      string           `json:"workspace_cwd,omitempty"`
 	QueryText         string           `json:"query_text"`
@@ -207,6 +214,7 @@ type ApprovalRequest struct {
 	MatchedRules      []MatchedRule    `json:"matched_rules,omitempty"`
 	Preflight         *PreflightReport `json:"preflight,omitempty"`
 	Reviewer          string           `json:"reviewer,omitempty"`
+	ReviewerUserID    string           `json:"reviewer_user_id,omitempty"`
 	ReviewerNote      string           `json:"reviewer_note,omitempty"`
 	CreatedAtUTC      string           `json:"created_at_utc"`
 	ExpiresAtUTC      string           `json:"expires_at_utc"`

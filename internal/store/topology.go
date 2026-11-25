@@ -513,6 +513,12 @@ func prepareTopologyBundle(b types.TopologyBundle, snap *topologySnapshot, assig
 		if cp.Kind == "" {
 			cp.Kind = types.CredKeychain
 		}
+		if cp.ScopeType == "" {
+			cp.ScopeType = "global"
+		}
+		if cp.ScopeType == "global" {
+			cp.ScopeID = "global"
+		}
 		switch cp.Kind {
 		case types.CredKeychain, types.CredEnvRef, types.CredExecProvider:
 		default:
@@ -557,6 +563,12 @@ func prepareTopologyBundle(b types.TopologyBundle, snap *topologySnapshot, assig
 		if np.Mode == "" {
 			np.Mode = types.NetworkDirect
 		}
+		if np.ScopeType == "" {
+			np.ScopeType = "global"
+		}
+		if np.ScopeType == "global" {
+			np.ScopeID = "global"
+		}
 		switch np.Mode {
 		case types.NetworkDirect, types.NetworkSSHTunnel, types.NetworkSOCKS5, types.NetworkHTTPProxy:
 		default:
@@ -594,6 +606,12 @@ func prepareTopologyBundle(b types.TopologyBundle, snap *topologySnapshot, assig
 		}
 		if inst.Role == "" {
 			inst.Role = types.RoleStandalone
+		}
+		if inst.ScopeType == "" {
+			inst.ScopeType = "global"
+		}
+		if inst.ScopeType == "global" {
+			inst.ScopeID = "global"
 		}
 		switch inst.Role {
 		case types.RolePrimary, types.RoleReplica, types.RoleStandalone:
@@ -1064,7 +1082,7 @@ func (s *Store) ImportTopologyWithResult(ctx context.Context, actor string, b ty
 	var result types.TopologyImportResult
 	now := nowUTC()
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		snap, err := loadTopologySnapshot(ctx, &txSnapshotQuerier{tx: tx})
+		snap, err := loadTopologySnapshot(ctx, &txSnapshotQuerier{store: s, tx: tx})
 		if err != nil {
 			return err
 		}
@@ -1084,7 +1102,7 @@ func (s *Store) ImportTopologyWithResult(ctx context.Context, actor string, b ty
 		if prep.globalChanged && prep.globalSec != nil {
 			cfg := *prep.globalSec
 			cfg.UpdatedAtUTC = now
-			if _, err := tx.ExecContext(ctx, `
+			if _, err := s.txExec(ctx, tx, `
 				UPDATE global_security_config SET
 					exec_timeout_sec = ?,
 					approval_timeout_sec = ?,
@@ -1096,11 +1114,12 @@ func (s *Store) ImportTopologyWithResult(ctx context.Context, actor string, b ty
 					default_approval_provider = ?,
 					redact_audit_literals = ?,
 					require_reason_for_approval = ?,
+					forbid_self_approval = ?,
 					updated_at_utc = ?
 				WHERE id = 1`,
 				cfg.ExecTimeoutSec, cfg.ApprovalTimeoutSec, cfg.MaxRows, cfg.MaxBytes, cfg.ExplainMaxRows,
 				boolToInt(cfg.ProdReadOnlyFreeze), boolToInt(cfg.BlockMultiStatementInProd),
-				cfg.DefaultApprovalProvider, boolToInt(cfg.RedactAuditLiterals), boolToInt(cfg.RequireReasonForApproval), now); err != nil {
+				cfg.DefaultApprovalProvider, boolToInt(cfg.RedactAuditLiterals), boolToInt(cfg.RequireReasonForApproval), boolToInt(cfg.ForbidSelfApproval), now); err != nil {
 				return err
 			}
 			if err := s.appendAuditTx(ctx, tx, actor, "global_security.update", "global", "", cfg, now); err != nil {
@@ -1198,19 +1217,20 @@ func (s *Store) ImportTopologyWithResult(ctx context.Context, actor string, b ty
 }
 
 type txSnapshotQuerier struct {
-	tx *sql.Tx
+	store *Store
+	tx    *sql.Tx
 }
 
 func (q *txSnapshotQuerier) GetGlobalSecurityConfig(ctx context.Context) (types.GlobalSecurityConfig, error) {
 	var cfg types.GlobalSecurityConfig
-	var freeze, blockMulti, redact, reqReason int
-	err := q.tx.QueryRowContext(ctx, `
+	var freeze, blockMulti, redact, reqReason, forbidSelf int
+	err := q.store.txQueryRow(ctx, q.tx, `
 		SELECT exec_timeout_sec, approval_timeout_sec, max_rows, max_bytes, explain_max_rows,
 			prod_read_only_freeze, block_multi_statement_in_prod, default_approval_provider, redact_audit_literals,
-			require_reason_for_approval, updated_at_utc
+			require_reason_for_approval, forbid_self_approval, updated_at_utc
 		FROM global_security_config WHERE id = 1`).
 		Scan(&cfg.ExecTimeoutSec, &cfg.ApprovalTimeoutSec, &cfg.MaxRows, &cfg.MaxBytes, &cfg.ExplainMaxRows,
-			&freeze, &blockMulti, &cfg.DefaultApprovalProvider, &redact, &reqReason, &cfg.UpdatedAtUTC)
+			&freeze, &blockMulti, &cfg.DefaultApprovalProvider, &redact, &reqReason, &forbidSelf, &cfg.UpdatedAtUTC)
 	if err != nil {
 		return cfg, err
 	}
@@ -1218,11 +1238,12 @@ func (q *txSnapshotQuerier) GetGlobalSecurityConfig(ctx context.Context) (types.
 	cfg.BlockMultiStatementInProd = blockMulti == 1
 	cfg.RedactAuditLiterals = redact == 1
 	cfg.RequireReasonForApproval = reqReason == 1
+	cfg.ForbidSelfApproval = forbidSelf == 1
 	return cfg, nil
 }
 
 func (q *txSnapshotQuerier) ListEnvironments(ctx context.Context) ([]types.Environment, error) {
-	rows, err := q.tx.QueryContext(ctx, `SELECT code, safety_tier, labels_json, color, sort_order, default_policy_id, created_at_utc, updated_at_utc FROM environments ORDER BY sort_order ASC, code ASC`)
+	rows, err := q.store.txQuery(ctx, q.tx, `SELECT code, safety_tier, labels_json, color, sort_order, default_policy_id, created_at_utc, updated_at_utc FROM environments ORDER BY sort_order ASC, code ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1244,7 +1265,7 @@ func (q *txSnapshotQuerier) ListEnvironments(ctx context.Context) ([]types.Envir
 }
 
 func (q *txSnapshotQuerier) ListSystems(ctx context.Context) ([]types.System, error) {
-	rows, err := q.tx.QueryContext(ctx, `SELECT id, slug, name, owner, description, tags_json, workspace_paths_json, git_remotes_json, default_policy_id, created_at_utc, updated_at_utc FROM systems ORDER BY slug ASC`)
+	rows, err := q.store.txQuery(ctx, q.tx, `SELECT id, slug, name, owner, description, tags_json, workspace_paths_json, git_remotes_json, default_policy_id, created_at_utc, updated_at_utc FROM systems ORDER BY slug ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1274,7 +1295,7 @@ func (q *txSnapshotQuerier) ListSystems(ctx context.Context) ([]types.System, er
 }
 
 func (q *txSnapshotQuerier) ListCredentialProfiles(ctx context.Context) ([]types.CredentialProfile, error) {
-	rows, err := q.tx.QueryContext(ctx, `SELECT id, name, kind, access_level, username, env_var_name, exec_command, created_at_utc, updated_at_utc FROM credential_profiles ORDER BY name ASC`)
+	rows, err := q.store.txQuery(ctx, q.tx, `SELECT id, name, scope_type, scope_id, kind, access_level, username, env_var_name, exec_command, created_at_utc, updated_at_utc FROM credential_profiles ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1282,7 +1303,7 @@ func (q *txSnapshotQuerier) ListCredentialProfiles(ctx context.Context) ([]types
 	var out []types.CredentialProfile
 	for rows.Next() {
 		var cp types.CredentialProfile
-		if err := rows.Scan(&cp.ID, &cp.Name, &cp.Kind, &cp.AccessLevel, &cp.Username, &cp.EnvVarName, &cp.ExecCommand, &cp.CreatedAtUTC, &cp.UpdatedAtUTC); err != nil {
+		if err := rows.Scan(&cp.ID, &cp.Name, &cp.ScopeType, &cp.ScopeID, &cp.Kind, &cp.AccessLevel, &cp.Username, &cp.EnvVarName, &cp.ExecCommand, &cp.CreatedAtUTC, &cp.UpdatedAtUTC); err != nil {
 			return nil, err
 		}
 		out = append(out, cp)
@@ -1291,7 +1312,7 @@ func (q *txSnapshotQuerier) ListCredentialProfiles(ctx context.Context) ([]types
 }
 
 func (q *txSnapshotQuerier) ListNetworkProfiles(ctx context.Context) ([]types.NetworkProfile, error) {
-	rows, err := q.tx.QueryContext(ctx, `SELECT id, name, mode, proxy_url, bastion_host, bastion_port, bastion_user, bastion_credential_id, ssh_strict_host_key, tls_mode, created_at_utc, updated_at_utc FROM network_profiles ORDER BY name ASC`)
+	rows, err := q.store.txQuery(ctx, q.tx, `SELECT id, name, scope_type, scope_id, mode, proxy_url, bastion_host, bastion_port, bastion_user, bastion_credential_id, ssh_strict_host_key, tls_mode, created_at_utc, updated_at_utc FROM network_profiles ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1300,7 +1321,7 @@ func (q *txSnapshotQuerier) ListNetworkProfiles(ctx context.Context) ([]types.Ne
 	for rows.Next() {
 		var np types.NetworkProfile
 		var strict int
-		if err := rows.Scan(&np.ID, &np.Name, &np.Mode, &np.ProxyURL, &np.BastionHost, &np.BastionPort, &np.BastionUser, &np.BastionCredentialID, &strict, &np.TLSMode, &np.CreatedAtUTC, &np.UpdatedAtUTC); err != nil {
+		if err := rows.Scan(&np.ID, &np.Name, &np.ScopeType, &np.ScopeID, &np.Mode, &np.ProxyURL, &np.BastionHost, &np.BastionPort, &np.BastionUser, &np.BastionCredentialID, &strict, &np.TLSMode, &np.CreatedAtUTC, &np.UpdatedAtUTC); err != nil {
 			return nil, err
 		}
 		np.SSHStrictHostKey = strict == 1
@@ -1310,7 +1331,7 @@ func (q *txSnapshotQuerier) ListNetworkProfiles(ctx context.Context) ([]types.Ne
 }
 
 func (q *txSnapshotQuerier) ListInstances(ctx context.Context) ([]types.Instance, error) {
-	rows, err := q.tx.QueryContext(ctx, `SELECT id, name, engine, host, port, role, primary_instance_id, network_profile_id, tls_mode, params_json, capabilities_json, capabilities_detected_at_utc, created_at_utc, updated_at_utc FROM instances ORDER BY name ASC`)
+	rows, err := q.store.txQuery(ctx, q.tx, `SELECT id, name, scope_type, scope_id, engine, host, port, role, primary_instance_id, network_profile_id, tls_mode, params_json, capabilities_json, capabilities_detected_at_utc, created_at_utc, updated_at_utc FROM instances ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1319,7 +1340,7 @@ func (q *txSnapshotQuerier) ListInstances(ctx context.Context) ([]types.Instance
 	for rows.Next() {
 		var inst types.Instance
 		var paramsJSON, capsJSON string
-		if err := rows.Scan(&inst.ID, &inst.Name, &inst.Engine, &inst.Host, &inst.Port, &inst.Role, &inst.PrimaryInstanceID, &inst.NetworkProfileID, &inst.TLSMode, &paramsJSON, &capsJSON, &inst.CapabilitiesDetectedAt, &inst.CreatedAtUTC, &inst.UpdatedAtUTC); err != nil {
+		if err := rows.Scan(&inst.ID, &inst.Name, &inst.ScopeType, &inst.ScopeID, &inst.Engine, &inst.Host, &inst.Port, &inst.Role, &inst.PrimaryInstanceID, &inst.NetworkProfileID, &inst.TLSMode, &paramsJSON, &capsJSON, &inst.CapabilitiesDetectedAt, &inst.CreatedAtUTC, &inst.UpdatedAtUTC); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(paramsJSON), &inst.Params)
@@ -1332,7 +1353,7 @@ func (q *txSnapshotQuerier) ListInstances(ctx context.Context) ([]types.Instance
 }
 
 func (q *txSnapshotQuerier) ListTargets(ctx context.Context) ([]types.Target, error) {
-	rows, err := q.tx.QueryContext(ctx, `SELECT id, ref, alias, owner_system_id, environment_code, instance_id, database_name, ro_credential_id, rw_credential_id, policy_override_id, status, description, created_at_utc, updated_at_utc FROM targets ORDER BY ref ASC`)
+	rows, err := q.store.txQuery(ctx, q.tx, `SELECT id, ref, alias, owner_system_id, environment_code, instance_id, database_name, ro_credential_id, rw_credential_id, policy_override_id, status, description, created_at_utc, updated_at_utc FROM targets ORDER BY ref ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1349,7 +1370,7 @@ func (q *txSnapshotQuerier) ListTargets(ctx context.Context) ([]types.Target, er
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	linkRows, err := q.tx.QueryContext(ctx, `SELECT target_id, system_id FROM target_linked_systems ORDER BY system_id ASC`)
+	linkRows, err := q.store.txQuery(ctx, q.tx, `SELECT target_id, system_id FROM target_linked_systems ORDER BY system_id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1371,7 +1392,7 @@ func (q *txSnapshotQuerier) ListTargets(ctx context.Context) ([]types.Target, er
 }
 
 func (q *txSnapshotQuerier) ListPolicies(ctx context.Context) ([]types.PolicyRuleSet, error) {
-	rows, err := q.tx.QueryContext(ctx, `
+	rows, err := q.store.txQuery(ctx, q.tx, `
 		SELECT id, name, scope_type, scope_id,
 			allow_safe_read, require_approval_on_high_cost_read, require_approval_on_write,
 			require_approval_on_ddl, require_approval_on_admin, require_approval_on_unknown,
@@ -1410,7 +1431,7 @@ func (q *txSnapshotQuerier) ListPolicies(ctx context.Context) ([]types.PolicyRul
 }
 
 func (q *txSnapshotQuerier) ListRiskPatternRules(ctx context.Context) ([]types.RiskPatternRule, error) {
-	rows, err := q.tx.QueryContext(ctx, `
+	rows, err := q.store.txQuery(ctx, q.tx, `
 		SELECT id, name, description, scope_type, scope_id, enabled, builtin_pack,
 			engines_json, families_json, action, confirm_title, confirm_message,
 			approval_provider, condition_json, priority, created_at_utc, updated_at_utc

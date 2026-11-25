@@ -85,6 +85,8 @@ type Environment struct {
 type NetworkProfile struct {
 	ID                  string      `json:"id" yaml:"id"`
 	Name                string      `json:"name" yaml:"name"`
+	ScopeType           string      `json:"scope_type,omitempty" yaml:"scope_type,omitempty"` // global | system
+	ScopeID             string      `json:"scope_id,omitempty" yaml:"scope_id,omitempty"`
 	Mode                NetworkMode `json:"mode" yaml:"mode"`
 	ProxyURL            string      `json:"proxy_url,omitempty" yaml:"proxy_url,omitempty"`
 	BastionHost         string      `json:"bastion_host,omitempty" yaml:"bastion_host,omitempty"`
@@ -97,10 +99,12 @@ type NetworkProfile struct {
 	UpdatedAtUTC        string      `json:"updated_at_utc" yaml:"updated_at_utc,omitempty"`
 }
 
-// CredentialProfile references secrets stored outside SQLite (Keychain, env, exec).
+// CredentialProfile references secrets stored outside SQLite (Keychain, vault, env, exec).
 type CredentialProfile struct {
 	ID           string         `json:"id" yaml:"id"`
 	Name         string         `json:"name" yaml:"name"`
+	ScopeType    string         `json:"scope_type,omitempty" yaml:"scope_type,omitempty"` // global | system
+	ScopeID      string         `json:"scope_id,omitempty" yaml:"scope_id,omitempty"`
 	Kind         CredentialKind `json:"kind" yaml:"kind"`
 	AccessLevel  AccessLevel    `json:"access_level" yaml:"access_level"`
 	Username     string         `json:"username,omitempty" yaml:"username,omitempty"`
@@ -115,6 +119,8 @@ type CredentialProfile struct {
 type Instance struct {
 	ID                     string              `json:"id" yaml:"id"`
 	Name                   string              `json:"name" yaml:"name"`
+	ScopeType              string              `json:"scope_type,omitempty" yaml:"scope_type,omitempty"` // global | system
+	ScopeID                string              `json:"scope_id,omitempty" yaml:"scope_id,omitempty"`
 	Engine                 string              `json:"engine" yaml:"engine"`
 	Host                   string              `json:"host" yaml:"host"`
 	Port                   int                 `json:"port" yaml:"port"`

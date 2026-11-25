@@ -301,6 +301,11 @@ func (m *Manager) Wait(ctx context.Context, approvalID string) (types.ApprovalRe
 
 // Resolve verifies the optional one-time token (or trusted UI session) and records decision atomically.
 func (m *Manager) Resolve(ctx context.Context, approvalID string, approve bool, reviewer, note, token string, trustedUISession bool) (types.ApprovalRequest, error) {
+	return m.ResolveWithUser(ctx, approvalID, approve, reviewer, "", note, token, trustedUISession)
+}
+
+// ResolveWithUser records an approval decision while persisting the authenticated reviewer's user ID.
+func (m *Manager) ResolveWithUser(ctx context.Context, approvalID string, approve bool, reviewer, reviewerUserID, note, token string, trustedUISession bool) (types.ApprovalRequest, error) {
 	_, expectedHash, err := m.store.GetApproval(ctx, approvalID)
 	if err != nil {
 		return types.ApprovalRequest{}, err
@@ -318,7 +323,7 @@ func (m *Manager) Resolve(ctx context.Context, approvalID string, approve bool, 
 	if reviewer == "" {
 		reviewer = "local-human"
 	}
-	app, err := m.store.ResolveApproval(ctx, approvalID, next, reviewer, note)
+	app, err := m.store.ResolveApproval(ctx, approvalID, next, reviewer, note, reviewerUserID)
 	if err != nil {
 		if errors.Is(err, store.ErrApprovalExpired) {
 			m.notifyWaiter(approvalID, Resolution{Approval: app})
@@ -327,6 +332,11 @@ func (m *Manager) Resolve(ctx context.Context, approvalID string, approve bool, 
 	}
 	m.notifyWaiter(approvalID, Resolution{Approval: app})
 	return app, nil
+}
+
+// NotifyExternalResolution wakes any local Wait() goroutine when another replica resolves an approval.
+func (m *Manager) NotifyExternalResolution(app types.ApprovalRequest) {
+	m.notifyWaiter(app.ID, Resolution{Approval: app})
 }
 
 // Cancel marks a pending approval cancelled and cancels the upstream provider ticket.
