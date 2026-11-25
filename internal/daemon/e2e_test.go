@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1001,5 +1002,119 @@ func TestRPCDisallowsApprovalResolutionRoutes(t *testing.T) {
 	err = cl.DoJSON(context.Background(), http.MethodPost, "/rpc/v1/approvals/apr_test/approve", map[string]string{"reviewer": "bot"}, nil)
 	if err == nil {
 		t.Fatalf("expected RPC approval route to be rejected, but succeeded")
+	}
+}
+
+func TestSystemGitRemoteMatchingPriorityAndDBAddConvergence(t *testing.T) {
+	srv, _ := setupIsolatedServer(t)
+	svc := srv.Service()
+	ctx := context.Background()
+
+	// Create two systems: one bound via workspace_paths + git_remotes, another bound only via git_remotes (same monorepo), plus an unrelated system.
+	sysRepo, err := svc.Store().UpsertSystem(ctx, "test", types.System{
+		Slug:           "orders-api",
+		Name:           "Orders API",
+		WorkspacePaths: []string{"/repos/mono/orders-api"},
+		GitRemotes:     []string{"git@github.com:acme/mono.git"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sysSub, err := svc.Store().UpsertSystem(ctx, "test", types.System{
+		Slug:       "billing-api",
+		Name:       "Billing API",
+		GitRemotes: []string{"https://github.com/acme/mono.git"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sysOther, err := svc.Store().UpsertSystem(ctx, "test", types.System{
+		Slug:       "analytics",
+		Name:       "Analytics",
+		GitRemotes: []string{"github.com/acme/analytics"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inst, err := svc.Store().UpsertInstance(ctx, "test", types.Instance{
+		Name:   "shared-sqlite",
+		Engine: "sqlite",
+		Host:   filepath.Join(t.TempDir(), "shared.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		ref string
+		sys string
+	}{
+		{"orders-api/dev/db", sysRepo.ID},
+		{"billing-api/dev/db", sysSub.ID},
+		{"analytics/dev/db", sysOther.ID},
+	} {
+		if _, err := svc.Store().UpsertTarget(ctx, "test", types.Target{
+			Ref: item.ref, OwnerSystemID: item.sys, EnvironmentCode: "dev", InstanceID: inst.ID, DatabaseName: inst.Host,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// From a git worktree outside /repos/mono/orders-api, both mono systems match via git_remotes.
+	details, _, _, err := svc.ListTargetsFiltered(ctx, daemon.ListFilter{
+		WorkspaceCWD:        "/tmp/wt-123",
+		WorkspaceGitRemotes: []string{"https://oauth2:tok@github.com/acme/mono.git"},
+	})
+	if err != nil || len(details) != 3 {
+		t.Fatalf("ListTargetsFiltered failed: len=%d err=%v", len(details), err)
+	}
+	if !details[0].WorkspaceMatch || !details[1].WorkspaceMatch || details[2].WorkspaceMatch {
+		t.Fatalf("expected first two targets to match via git_remotes and analytics not to match: %+v", details)
+	}
+
+	// Inside /repos/mono/orders-api/sub, local workspace_paths match ranks strictly ahead of git_remotes-only match.
+	details, _, _, err = svc.ListTargetsFiltered(ctx, daemon.ListFilter{
+		WorkspaceCWD:        "/repos/mono/orders-api/sub",
+		WorkspaceGitRemotes: []string{"git@github.com:acme/mono.git"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if details[0].Target.Ref != "orders-api/dev/db" {
+		t.Fatalf("expected workspace_paths match orders-api/dev/db first, got %s", details[0].Target.Ref)
+	}
+
+	// db add without --system from a worktree matches unique existing git_remote system and merges workspace_path.
+	addResp, err := svc.AdminAddDatabase(ctx, "agent-cli", daemon.DBAddRequest{
+		Engine:              "sqlite",
+		Host:                filepath.Join(t.TempDir(), "ana.db"),
+		WorkspaceCWD:        "/tmp/wt-analytics-fix",
+		WorkspaceGitRemotes: []string{"git@github.com:acme/analytics.git"},
+		Env:                 "dev",
+	})
+	if err != nil {
+		t.Fatalf("AdminAddDatabase from worktree failed: %v", err)
+	}
+	if addResp.Target.System != "analytics" || addResp.Actions["system"] != "updated" {
+		t.Fatalf("expected db add to reuse analytics system and merge worktree path, got target=%+v actions=%+v", addResp.Target, addResp.Actions)
+	}
+
+	// db add without --system in a brand-new git repo derives slug from git repo name rather than worktree folder name.
+	newResp, err := svc.AdminAddDatabase(ctx, "agent-cli", daemon.DBAddRequest{
+		Engine:              "sqlite",
+		Host:                filepath.Join(t.TempDir(), "pay.db"),
+		WorkspaceCWD:        "/tmp/wt-999",
+		WorkspaceGitRemotes: []string{"ssh://git@github.com/acme/payment-gateway.git"},
+		Env:                 "dev",
+	})
+	if err != nil {
+		t.Fatalf("AdminAddDatabase new git repo failed: %v", err)
+	}
+	if newResp.Target.System != "payment-gateway" {
+		t.Fatalf("expected repo-derived slug payment-gateway, got %q", newResp.Target.System)
+	}
+	gotPaySys, err := svc.Store().ResolveSystem(ctx, "payment-gateway")
+	if err != nil || !reflect.DeepEqual(gotPaySys.GitRemotes, []string{"github.com/acme/payment-gateway"}) {
+		t.Fatalf("expected normalized git_remote persisted on payment-gateway, got %+v err=%v", gotPaySys, err)
 	}
 }

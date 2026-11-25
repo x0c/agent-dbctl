@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/policy"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
@@ -20,7 +21,7 @@ var (
 // ListSystems returns all business systems ordered by slug.
 func (s *Store) ListSystems(ctx context.Context) ([]types.System, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, slug, name, owner, description, tags_json, workspace_paths_json, default_policy_id, created_at_utc, updated_at_utc
+		SELECT id, slug, name, owner, description, tags_json, workspace_paths_json, git_remotes_json, default_policy_id, created_at_utc, updated_at_utc
 		FROM systems ORDER BY slug ASC`)
 	if err != nil {
 		return nil, err
@@ -30,17 +31,21 @@ func (s *Store) ListSystems(ctx context.Context) ([]types.System, error) {
 	var out []types.System
 	for rows.Next() {
 		var sys types.System
-		var tagsJSON, wsJSON string
-		if err := rows.Scan(&sys.ID, &sys.Slug, &sys.Name, &sys.Owner, &sys.Description, &tagsJSON, &wsJSON, &sys.DefaultPolicyID, &sys.CreatedAtUTC, &sys.UpdatedAtUTC); err != nil {
+		var tagsJSON, wsJSON, gitJSON string
+		if err := rows.Scan(&sys.ID, &sys.Slug, &sys.Name, &sys.Owner, &sys.Description, &tagsJSON, &wsJSON, &gitJSON, &sys.DefaultPolicyID, &sys.CreatedAtUTC, &sys.UpdatedAtUTC); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(tagsJSON), &sys.Tags)
 		_ = json.Unmarshal([]byte(wsJSON), &sys.WorkspacePaths)
+		_ = json.Unmarshal([]byte(gitJSON), &sys.GitRemotes)
 		if sys.Tags == nil {
 			sys.Tags = []string{}
 		}
 		if sys.WorkspacePaths == nil {
 			sys.WorkspacePaths = []string{}
+		}
+		if sys.GitRemotes == nil {
+			sys.GitRemotes = []string{}
 		}
 		out = append(out, sys)
 	}
@@ -75,8 +80,10 @@ func (s *Store) upsertSystemTx(ctx context.Context, tx *sql.Tx, actor string, sy
 	if sys.WorkspacePaths == nil {
 		sys.WorkspacePaths = []string{}
 	}
+	sys.GitRemotes = config.NormalizeGitRemotes(sys.GitRemotes)
 	tagsJSON, _ := json.Marshal(sys.Tags)
 	wsJSON, _ := json.Marshal(sys.WorkspacePaths)
+	gitJSON, _ := json.Marshal(sys.GitRemotes)
 
 	var existingCreated string
 	err := tx.QueryRowContext(ctx, `SELECT created_at_utc FROM systems WHERE id = ?`, sys.ID).Scan(&existingCreated)
@@ -94,8 +101,8 @@ func (s *Store) upsertSystemTx(ctx context.Context, tx *sql.Tx, actor string, sy
 	}
 	sys.UpdatedAtUTC = now
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO systems(id, slug, name, owner, description, tags_json, workspace_paths_json, default_policy_id, created_at_utc, updated_at_utc)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO systems(id, slug, name, owner, description, tags_json, workspace_paths_json, git_remotes_json, default_policy_id, created_at_utc, updated_at_utc)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			slug = excluded.slug,
 			name = excluded.name,
@@ -103,9 +110,10 @@ func (s *Store) upsertSystemTx(ctx context.Context, tx *sql.Tx, actor string, sy
 			description = excluded.description,
 			tags_json = excluded.tags_json,
 			workspace_paths_json = excluded.workspace_paths_json,
+			git_remotes_json = excluded.git_remotes_json,
 			default_policy_id = excluded.default_policy_id,
 			updated_at_utc = excluded.updated_at_utc`,
-		sys.ID, sys.Slug, sys.Name, sys.Owner, sys.Description, string(tagsJSON), string(wsJSON), sys.DefaultPolicyID, sys.CreatedAtUTC, sys.UpdatedAtUTC)
+		sys.ID, sys.Slug, sys.Name, sys.Owner, sys.Description, string(tagsJSON), string(wsJSON), string(gitJSON), sys.DefaultPolicyID, sys.CreatedAtUTC, sys.UpdatedAtUTC)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return sys, fmt.Errorf("%w: duplicate system slug %q", ErrConflict, sys.Slug)

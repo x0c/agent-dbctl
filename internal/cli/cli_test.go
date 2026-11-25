@@ -766,3 +766,108 @@ func TestCLIOnboardingCatalogPolicyAndAuditActor(t *testing.T) {
 		t.Fatalf("audit verify failed: code=%d env=%+v", code, env)
 	}
 }
+
+func TestCLISystemGitRemoteAndWorktreeResolution(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not available")
+	}
+	bin := buildTestCLI(t)
+	cfgHome := t.TempDir()
+	t.Cleanup(func() {
+		_, _, _ = runCLI(t, bin, cfgHome, "daemon", "stop", "--json")
+	})
+
+	repoBase := t.TempDir()
+	mainRepo := filepath.Join(repoBase, "orders-repo")
+	wtRepo := filepath.Join(repoBase, "wt-hotfix-77")
+	runGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test",
+			"GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=Test",
+			"GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.MkdirAll(mainRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(mainRepo, "init")
+	runGit(mainRepo, "remote", "add", "origin", "git@github.com:acme/orders-service.git")
+	if err := os.WriteFile(filepath.Join(mainRepo, "README.md"), []byte("orders\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(mainRepo, "add", "README.md")
+	runGit(mainRepo, "commit", "-m", "init")
+	runGit(mainRepo, "worktree", "add", "-b", "hotfix-77", wtRepo)
+
+	dbFile := filepath.Join(t.TempDir(), "orders.sqlite")
+	if err := os.WriteFile(dbFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run `db add` inside mainRepo without --system: should derive slug from git repo and bind normalized remote.
+	runInDir := func(dir string, args ...string) (int, types.Envelope) {
+		t.Helper()
+		cmd := exec.Command(bin, args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			config.EnvConfigHome+"="+cfgHome,
+			config.EnvSecretBackend+"=file",
+			config.EnvNoBrowser+"=1",
+			config.EnvSession+"=cli-test",
+			config.EnvNoSkillSync+"=1",
+		)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		code := 0
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				code = ee.ExitCode()
+			} else {
+				t.Fatalf("run cli in %s: %v", dir, err)
+			}
+		}
+		var env types.Envelope
+		if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+			t.Fatalf("invalid json in %s: %v\nstdout=%s\nstderr=%s", dir, err, stdout.String(), stderr.String())
+		}
+		return code, env
+	}
+
+	code, env := runInDir(mainRepo, "db", "add", "--engine", "sqlite", "--host", dbFile, "--env", "dev", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("db add in git repo failed: code=%d env=%+v", code, env)
+	}
+	targetMap := env.Data.(map[string]any)["target"].(map[string]any)
+	if targetMap["system"] != "orders-service" {
+		t.Fatalf("expected system=orders-service, got %+v", targetMap)
+	}
+
+	// Run `db list` inside the separate git worktree: workspace_match must be true!
+	code, env = runInDir(wtRepo, "db", "list", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("db list in worktree failed: code=%d env=%+v", code, env)
+	}
+	items := env.Data.(map[string]any)["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["workspace_match"] != true {
+		t.Fatalf("expected workspace_match=true in git worktree, got %+v", items)
+	}
+
+	// Verify `system set --git-remote` normalizes and persists remotes cleanly.
+	code, env = runInDir(wtRepo, "system", "set", "orders-service", "--git-remote", "https://github.com/acme/orders-service.git", "--git-remote", "ssh://git@git.example.com:2222/acme/orders-alt.git", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("system set --git-remote failed: code=%d env=%+v", code, env)
+	}
+	sysItem := env.Data.(map[string]any)["item"].(map[string]any)
+	remotes := sysItem["git_remotes"].([]any)
+	if len(remotes) != 2 || remotes[0] != "github.com/acme/orders-service" || remotes[1] != "git.example.com:2222/acme/orders-alt" {
+		t.Fatalf("unexpected normalized git_remotes: %+v", remotes)
+	}
+}

@@ -89,7 +89,7 @@ make install-local
 
 | Capability | Behavior |
 |---|---|
-| **Four-Layer Enterprise Catalog** | Organize `System` (with `workspace_paths` auto-priority) -> `Environment` -> `NetworkProfile` / `CredentialProfile` -> `Instance` / `Target` (`ro_credential_id` & `rw_credential_id` split). Export/import sanitized topology as YAML/JSON. |
+| **Four-Layer Enterprise Catalog** | Organize `System` (with `workspace_paths` + `git_remotes` auto-priority across clones & worktrees) -> `Environment` -> `NetworkProfile` / `CredentialProfile` -> `Instance` / `Target` (`ro_credential_id` & `rw_credential_id` split). Export/import sanitized topology as YAML/JSON. |
 | **Environment Safety Tiers** | **`dev` (`yolo`)** runs freely; **`staging` (`guarded`)** & **`prod` (`strict`)** run EXPLAIN preflight and trigger bilingual (English / 中文) Web approvals (requiring `--reason` by default) on writes, DDL, full table scans, or high-cost Redis/Mongo commands. Custom `Policies -> High-Risk Patterns` rules can enforce secondary confirmation or denials even on `dev` targets. |
 | **Verbatim Dialect Forwarding** | Native PostgreSQL, MySQL/MariaDB/TiDB, SQLite, ClickHouse, SQL Server, Oracle, MongoDB (`RunCommand` JSON), Elasticsearch/OpenSearch, and Redis commands forwarded verbatim—no lossy ORM or SQL translation. |
 | **Agent-Friendly CLI Contract** | Dual-audience TTY tables + `--json` `{ok, data, error, meta}` envelope, single-source `describe`, bounded row/byte truncation on intact boundaries, atomic `--out`, and non-replayable write timeouts. |

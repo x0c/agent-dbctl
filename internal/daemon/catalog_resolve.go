@@ -15,12 +15,13 @@ import (
 
 // ListFilter narrows db list results.
 type ListFilter struct {
-	System       string `json:"system,omitempty"`
-	Env          string `json:"env,omitempty"`
-	Engine       string `json:"engine,omitempty"`
-	Tag          string `json:"tag,omitempty"`
-	Search       string `json:"search,omitempty"`
-	WorkspaceCWD string `json:"workspace_cwd,omitempty"`
+	System              string   `json:"system,omitempty"`
+	Env                 string   `json:"env,omitempty"`
+	Engine              string   `json:"engine,omitempty"`
+	Tag                 string   `json:"tag,omitempty"`
+	Search              string   `json:"search,omitempty"`
+	WorkspaceCWD        string   `json:"workspace_cwd,omitempty"`
+	WorkspaceGitRemotes []string `json:"workspace_git_remotes,omitempty"`
 }
 
 // TargetLookupError provides structured ambiguity or zero-hit recovery metadata.
@@ -37,7 +38,7 @@ func (e *TargetLookupError) Error() string {
 }
 
 // BuildTargetDetails enriches all targets with system, env, instance, network, credentials (secret-free), and effective policy.
-func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string) ([]types.TargetDetail, error) {
+func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string, gitRemotes ...string) ([]types.TargetDetail, error) {
 	global, err := s.store.GetGlobalSecurityConfig(ctx)
 	if err != nil {
 		return nil, err
@@ -97,9 +98,15 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string) (
 		instMap[item.ID] = item
 	}
 
-	out := make([]types.TargetDetail, 0, len(targets))
+	normRemotes := config.NormalizeGitRemotes(gitRemotes)
+	type rankedTarget struct {
+		detail types.TargetDetail
+		rank   int
+	}
+	ranked := make([]rankedTarget, 0, len(targets))
 	for _, t := range targets {
 		d := types.TargetDetail{Target: t}
+		rank := 0
 		var ownerPtr *types.System
 		if sys, ok := sysMap[t.OwnerSystemID]; ok {
 			sysCopy := sys
@@ -107,6 +114,10 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string) (
 			d.OwnerSystem = ownerPtr
 			if matchesWorkspace(workspaceCWD, sys.WorkspacePaths) {
 				d.WorkspaceMatch = true
+				rank = 2
+			} else if matchesGitRemotes(normRemotes, sys.GitRemotes) {
+				d.WorkspaceMatch = true
+				rank = 1
 			}
 		}
 		for _, lid := range t.LinkedSystemIDs {
@@ -114,6 +125,14 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string) (
 				d.LinkedSystems = append(d.LinkedSystems, lsys)
 				if matchesWorkspace(workspaceCWD, lsys.WorkspacePaths) {
 					d.WorkspaceMatch = true
+					if rank < 2 {
+						rank = 2
+					}
+				} else if matchesGitRemotes(normRemotes, lsys.GitRemotes) {
+					d.WorkspaceMatch = true
+					if rank < 1 {
+						rank = 1
+					}
 				}
 			}
 		}
@@ -154,26 +173,30 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string) (
 			}
 			d.EffectivePolicy.PatternRules = policy.ResolveEffectivePatternRulesWithSystems(envPtr, ownerPtr, d.LinkedSystems, t, eng, fam, patternRules)
 		}
-		out = append(out, d)
+		ranked = append(ranked, rankedTarget{detail: d, rank: rank})
 	}
 
-	// Prioritize workspace-matched targets, then environment sort order, then ref.
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].WorkspaceMatch != out[j].WorkspaceMatch {
-			return out[i].WorkspaceMatch
+	// Prioritize workspace-matched targets (local path match ahead of git remote match), then environment sort order, then ref.
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].rank != ranked[j].rank {
+			return ranked[i].rank > ranked[j].rank
 		}
 		oi, oj := 999, 999
-		if out[i].Environment != nil {
-			oi = out[i].Environment.SortOrder
+		if ranked[i].detail.Environment != nil {
+			oi = ranked[i].detail.Environment.SortOrder
 		}
-		if out[j].Environment != nil {
-			oj = out[j].Environment.SortOrder
+		if ranked[j].detail.Environment != nil {
+			oj = ranked[j].detail.Environment.SortOrder
 		}
 		if oi != oj {
 			return oi < oj
 		}
-		return out[i].Target.Ref < out[j].Target.Ref
+		return ranked[i].detail.Target.Ref < ranked[j].detail.Target.Ref
 	})
+	out := make([]types.TargetDetail, len(ranked))
+	for i := range ranked {
+		out[i] = ranked[i].detail
+	}
 	return out, nil
 }
 
@@ -354,7 +377,7 @@ func BuildEngineGuides(drivers []types.DriverMetadata) []EngineGuide {
 
 // ListTargetsFiltered filters targets and populates recovery hints when zero hits occur.
 func (s *Service) ListTargetsFiltered(ctx context.Context, f ListFilter) ([]types.TargetDetail, []string, []string, error) {
-	all, err := s.BuildTargetDetails(ctx, f.WorkspaceCWD)
+	all, err := s.BuildTargetDetails(ctx, f.WorkspaceCWD, f.WorkspaceGitRemotes...)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -438,8 +461,8 @@ func (s *Service) ListTargetsFiltered(ctx context.Context, f ListFilter) ([]type
 }
 
 // ResolveTarget resolves ref/alias using tiered matching: exact > prefix > substring.
-func (s *Service) ResolveTarget(ctx context.Context, query, workspaceCWD string) (types.TargetDetail, error) {
-	all, err := s.BuildTargetDetails(ctx, workspaceCWD)
+func (s *Service) ResolveTarget(ctx context.Context, query, workspaceCWD string, gitRemotes ...string) (types.TargetDetail, error) {
+	all, err := s.BuildTargetDetails(ctx, workspaceCWD, gitRemotes...)
 	if err != nil {
 		return types.TargetDetail{}, err
 	}
@@ -537,6 +560,21 @@ func matchesWorkspace(cwd string, paths []string) bool {
 		cleanP := filepath.Clean(p)
 		if cleanCWD == cleanP || strings.HasPrefix(cleanCWD, cleanP+string(filepath.Separator)) {
 			return true
+		}
+	}
+	return false
+}
+
+func matchesGitRemotes(detectedNorm, configured []string) bool {
+	if len(detectedNorm) == 0 || len(configured) == 0 {
+		return false
+	}
+	normConfigured := config.NormalizeGitRemotes(configured)
+	for _, d := range detectedNorm {
+		for _, c := range normConfigured {
+			if strings.EqualFold(d, c) {
+				return true
+			}
 		}
 	}
 	return false

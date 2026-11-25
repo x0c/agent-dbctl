@@ -55,6 +55,7 @@ export interface SystemRecord {
   description: string
   tags: string[]
   workspace_paths: string[]
+  git_remotes: string[]
   default_policy_id?: string
   created_at_utc?: string
   updated_at_utc?: string

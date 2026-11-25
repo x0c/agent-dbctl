@@ -63,14 +63,15 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 
 	mux.HandleFunc("POST /rpc/v1/db/show", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Target       string `json:"target"`
-			WorkspaceCWD string `json:"workspace_cwd"`
+			Target              string   `json:"target"`
+			WorkspaceCWD        string   `json:"workspace_cwd"`
+			WorkspaceGitRemotes []string `json:"workspace_git_remotes"`
 		}
 		if err := decodeJSONBody(r, &req); err != nil {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		d, err := svc.ResolveTarget(r.Context(), req.Target, req.WorkspaceCWD)
+		d, err := svc.ResolveTarget(r.Context(), req.Target, req.WorkspaceCWD, req.WorkspaceGitRemotes...)
 		if err != nil {
 			writeLookupErr(w, err)
 			return
@@ -80,17 +81,18 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 
 	mux.HandleFunc("POST /rpc/v1/db/schema", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Target       string `json:"target"`
-			Table        string `json:"table"`
-			Search       string `json:"search"`
-			Limit        int    `json:"limit"`
-			WorkspaceCWD string `json:"workspace_cwd"`
+			Target              string   `json:"target"`
+			Table               string   `json:"table"`
+			Search              string   `json:"search"`
+			Limit               int      `json:"limit"`
+			WorkspaceCWD        string   `json:"workspace_cwd"`
+			WorkspaceGitRemotes []string `json:"workspace_git_remotes"`
 		}
 		if err := decodeJSONBody(r, &req); err != nil {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		res, err := svc.InspectSchema(r.Context(), req.Target, req.WorkspaceCWD, req.Table, req.Search, req.Limit)
+		res, err := svc.InspectSchema(r.Context(), req.Target, req.WorkspaceCWD, req.Table, req.Search, req.Limit, req.WorkspaceGitRemotes...)
 		if err != nil {
 			writeLookupErr(w, err)
 			return
@@ -118,7 +120,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 			writeJSONResp(w, http.StatusOK, map[string]any{"results": results})
 			return
 		}
-		d, err := svc.ResolveTarget(r.Context(), req.Target, req.Filter.WorkspaceCWD)
+		d, err := svc.ResolveTarget(r.Context(), req.Target, req.Filter.WorkspaceCWD, req.Filter.WorkspaceGitRemotes...)
 		if err != nil {
 			writeLookupErr(w, err)
 			return

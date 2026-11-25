@@ -585,8 +585,8 @@ func (s *Service) DiscoverInstance(ctx context.Context, instanceID, credID, dbNa
 }
 
 // InspectSchema lists tables/collections/key prefixes or describes one object on a target using read-only credentials.
-func (s *Service) InspectSchema(ctx context.Context, targetRefOrAlias, workspaceCWD, table, search string, limit int) (any, error) {
-	detail, err := s.ResolveTarget(ctx, targetRefOrAlias, workspaceCWD)
+func (s *Service) InspectSchema(ctx context.Context, targetRefOrAlias, workspaceCWD, table, search string, limit int, gitRemotes ...string) (any, error) {
+	detail, err := s.ResolveTarget(ctx, targetRefOrAlias, workspaceCWD, gitRemotes...)
 	if err != nil {
 		return nil, err
 	}
@@ -668,7 +668,7 @@ func (s *Service) InspectSchema(ctx context.Context, targetRefOrAlias, workspace
 
 // Execute runs the full dry-run / preflight / policy / approval / driver execution pipeline.
 func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.ExecResponse, error) {
-	detail, err := s.ResolveTarget(ctx, req.TargetRefOrAlias, req.WorkspaceCWD)
+	detail, err := s.ResolveTarget(ctx, req.TargetRefOrAlias, req.WorkspaceCWD, req.WorkspaceGitRemotes...)
 	if err != nil {
 		return types.ExecResponse{}, err
 	}

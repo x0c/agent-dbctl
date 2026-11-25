@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/policy"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
@@ -461,10 +462,16 @@ func prepareTopologyBundle(b types.TopologyBundle, snap *topologySnapshot, assig
 			if len(sys.WorkspacePaths) == 0 && len(existing.WorkspacePaths) > 0 {
 				sys.WorkspacePaths = append([]string(nil), existing.WorkspacePaths...)
 			}
+			if sys.GitRemotes == nil && len(existing.GitRemotes) > 0 {
+				sys.GitRemotes = append([]string(nil), existing.GitRemotes...)
+			}
 		} else if existing, ok := snap.sysByS[strings.ToLower(sys.Slug)]; ok {
 			sys.ID = existing.ID
 			if len(sys.WorkspacePaths) == 0 && len(existing.WorkspacePaths) > 0 {
 				sys.WorkspacePaths = append([]string(nil), existing.WorkspacePaths...)
+			}
+			if sys.GitRemotes == nil && len(existing.GitRemotes) > 0 {
+				sys.GitRemotes = append([]string(nil), existing.GitRemotes...)
 			}
 		} else if sys.ID == "" {
 			sys.ID = makeID("sys", sys.Slug, i)
@@ -475,6 +482,7 @@ func prepareTopologyBundle(b types.TopologyBundle, snap *topologySnapshot, assig
 		if sys.WorkspacePaths == nil {
 			sys.WorkspacePaths = []string{}
 		}
+		sys.GitRemotes = config.NormalizeGitRemotes(sys.GitRemotes)
 		if origID != "" {
 			sysMap[origID] = sys.ID
 		}
@@ -1236,7 +1244,7 @@ func (q *txSnapshotQuerier) ListEnvironments(ctx context.Context) ([]types.Envir
 }
 
 func (q *txSnapshotQuerier) ListSystems(ctx context.Context) ([]types.System, error) {
-	rows, err := q.tx.QueryContext(ctx, `SELECT id, slug, name, owner, description, tags_json, workspace_paths_json, default_policy_id, created_at_utc, updated_at_utc FROM systems ORDER BY slug ASC`)
+	rows, err := q.tx.QueryContext(ctx, `SELECT id, slug, name, owner, description, tags_json, workspace_paths_json, git_remotes_json, default_policy_id, created_at_utc, updated_at_utc FROM systems ORDER BY slug ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1244,17 +1252,21 @@ func (q *txSnapshotQuerier) ListSystems(ctx context.Context) ([]types.System, er
 	var out []types.System
 	for rows.Next() {
 		var sys types.System
-		var tagsJSON, wsJSON string
-		if err := rows.Scan(&sys.ID, &sys.Slug, &sys.Name, &sys.Owner, &sys.Description, &tagsJSON, &wsJSON, &sys.DefaultPolicyID, &sys.CreatedAtUTC, &sys.UpdatedAtUTC); err != nil {
+		var tagsJSON, wsJSON, gitJSON string
+		if err := rows.Scan(&sys.ID, &sys.Slug, &sys.Name, &sys.Owner, &sys.Description, &tagsJSON, &wsJSON, &gitJSON, &sys.DefaultPolicyID, &sys.CreatedAtUTC, &sys.UpdatedAtUTC); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(tagsJSON), &sys.Tags)
 		_ = json.Unmarshal([]byte(wsJSON), &sys.WorkspacePaths)
+		_ = json.Unmarshal([]byte(gitJSON), &sys.GitRemotes)
 		if sys.Tags == nil {
 			sys.Tags = []string{}
 		}
 		if sys.WorkspacePaths == nil {
 			sys.WorkspacePaths = []string{}
+		}
+		if sys.GitRemotes == nil {
+			sys.GitRemotes = []string{}
 		}
 		out = append(out, sys)
 	}
@@ -1478,6 +1490,8 @@ func systemEqual(a, b types.System) bool {
 	if b.WorkspacePaths == nil {
 		b.WorkspacePaths = []string{}
 	}
+	a.GitRemotes = config.NormalizeGitRemotes(a.GitRemotes)
+	b.GitRemotes = config.NormalizeGitRemotes(b.GitRemotes)
 	return reflect.DeepEqual(a, b)
 }
 

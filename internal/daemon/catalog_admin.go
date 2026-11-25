@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/x0c/agent-dbctl/internal/classify"
+	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/policy"
 	"github.com/x0c/agent-dbctl/internal/store"
 	"github.com/x0c/agent-dbctl/internal/types"
@@ -50,6 +51,8 @@ type DBAddRequest struct {
 	SystemName            string            `json:"system_name,omitempty"`
 	WorkspaceCWD          string            `json:"workspace_cwd,omitempty"`
 	WorkspacePaths        []string          `json:"workspace_paths,omitempty"`
+	WorkspaceGitRemotes   []string          `json:"workspace_git_remotes,omitempty"`
+	GitRemotes            []string          `json:"git_remotes,omitempty"`
 	NoWorkspace           bool              `json:"no_workspace,omitempty"`
 	Env                   string            `json:"env,omitempty"`
 	Instance              string            `json:"instance,omitempty"`
@@ -167,6 +170,15 @@ func (s *Service) AdminUpsertSystem(ctx context.Context, actor string, sys types
 		} else {
 			sys.WorkspacePaths = []string{}
 		}
+	}
+	if sys.GitRemotes == nil {
+		if existing != nil {
+			sys.GitRemotes = config.NormalizeGitRemotes(existing.GitRemotes)
+		} else {
+			sys.GitRemotes = []string{}
+		}
+	} else {
+		sys.GitRemotes = config.NormalizeGitRemotes(sys.GitRemotes)
 	}
 
 	action := "created"
@@ -905,11 +917,28 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 	}
 
 	// 1. System resolution / auto-creation.
+	sysGitRemotes := config.NormalizeGitRemotes(req.GitRemotes)
+	if len(sysGitRemotes) == 0 && !req.NoWorkspace && len(req.WorkspaceGitRemotes) > 0 {
+		sysGitRemotes = config.NormalizeGitRemotes(req.WorkspaceGitRemotes)
+	}
+
 	sysSlug := strings.TrimSpace(req.System)
-	if sysSlug == "" && !req.NoWorkspace && strings.TrimSpace(req.WorkspaceCWD) != "" {
-		base := sanitizeSlug(filepath.Base(filepath.Clean(req.WorkspaceCWD)))
-		if base != "" && base != "." {
-			sysSlug = base
+	if sysSlug == "" && !req.NoWorkspace {
+		if matched := s.resolveSystemByWorkspace(ctx, req.WorkspaceCWD, sysGitRemotes); matched != nil {
+			sysSlug = matched.Slug
+		}
+	}
+	if sysSlug == "" && !req.NoWorkspace {
+		if len(sysGitRemotes) > 0 {
+			if repoSlug := sanitizeSlug(config.RepoNameFromGitRemote(sysGitRemotes[0])); repoSlug != "" {
+				sysSlug = repoSlug
+			}
+		}
+		if sysSlug == "" && strings.TrimSpace(req.WorkspaceCWD) != "" {
+			base := sanitizeSlug(filepath.Base(filepath.Clean(req.WorkspaceCWD)))
+			if base != "" && base != "." {
+				sysSlug = base
+			}
 		}
 	}
 	if sysSlug == "" {
@@ -931,6 +960,8 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 	if existingSys, err := s.store.ResolveSystem(ctx, sysSlug); err == nil {
 		sysObj = existingSys
 		mergedWS := mergeUniqueStrings(existingSys.WorkspacePaths, sysWS)
+		existingRemotes := config.NormalizeGitRemotes(existingSys.GitRemotes)
+		mergedRemotes := config.NormalizeGitRemotes(append(append([]string(nil), existingRemotes...), sysGitRemotes...))
 		nameChanged := req.SystemName != "" && req.SystemName != existingSys.Name
 		if nameChanged {
 			sysObj.Name = req.SystemName
@@ -939,7 +970,11 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 		if wsChanged {
 			sysObj.WorkspacePaths = mergedWS
 		}
-		if nameChanged || wsChanged {
+		gitChanged := !reflect.DeepEqual(mergedRemotes, existingRemotes)
+		if gitChanged {
+			sysObj.GitRemotes = mergedRemotes
+		}
+		if nameChanged || wsChanged || gitChanged {
 			sysAction = "updated"
 		} else {
 			sysAction = "unchanged"
@@ -950,6 +985,7 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 			Slug:           sysSlug,
 			Name:           sysName,
 			WorkspacePaths: sysWS,
+			GitRemotes:     sysGitRemotes,
 			Tags:           []string{},
 		}
 	}
@@ -1248,7 +1284,7 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 	}
 	actions["target"] = tgtRes.Action
 
-	detail, err := s.ResolveTarget(ctx, tgtRes.Item.Ref, req.WorkspaceCWD)
+	detail, err := s.ResolveTarget(ctx, tgtRes.Item.Ref, req.WorkspaceCWD, req.WorkspaceGitRemotes...)
 	if err != nil {
 		return DBAddResponse{}, err
 	}
@@ -1744,6 +1780,38 @@ func planOrUnchanged(action string) string {
 	return "planned"
 }
 
+func (s *Service) resolveSystemByWorkspace(ctx context.Context, cwd string, gitRemotes []string) *types.System {
+	systems, err := s.store.ListSystems(ctx)
+	if err != nil {
+		return nil
+	}
+	var pathMatches []types.System
+	for _, sys := range systems {
+		if matchesWorkspace(cwd, sys.WorkspacePaths) {
+			pathMatches = append(pathMatches, sys)
+		}
+	}
+	if len(pathMatches) == 1 {
+		match := pathMatches[0]
+		return &match
+	}
+	if len(pathMatches) > 1 {
+		return nil
+	}
+	normRemotes := config.NormalizeGitRemotes(gitRemotes)
+	var remoteMatches []types.System
+	for _, sys := range systems {
+		if matchesGitRemotes(normRemotes, sys.GitRemotes) {
+			remoteMatches = append(remoteMatches, sys)
+		}
+	}
+	if len(remoteMatches) == 1 {
+		match := remoteMatches[0]
+		return &match
+	}
+	return nil
+}
+
 func systemsEqual(a, b types.System) bool {
 	a.CreatedAtUTC, a.UpdatedAtUTC = "", ""
 	b.CreatedAtUTC, b.UpdatedAtUTC = "", ""
@@ -1759,6 +1827,8 @@ func systemsEqual(a, b types.System) bool {
 	if b.WorkspacePaths == nil {
 		b.WorkspacePaths = []string{}
 	}
+	a.GitRemotes = config.NormalizeGitRemotes(a.GitRemotes)
+	b.GitRemotes = config.NormalizeGitRemotes(b.GitRemotes)
 	return reflect.DeepEqual(a, b)
 }
 

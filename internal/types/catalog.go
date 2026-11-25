@@ -63,6 +63,7 @@ type System struct {
 	Description     string   `json:"description" yaml:"description"`
 	Tags            []string `json:"tags" yaml:"tags"`
 	WorkspacePaths  []string `json:"workspace_paths" yaml:"workspace_paths"`
+	GitRemotes      []string `json:"git_remotes" yaml:"git_remotes"`
 	DefaultPolicyID string   `json:"default_policy_id,omitempty" yaml:"default_policy_id,omitempty"`
 	CreatedAtUTC    string   `json:"created_at_utc" yaml:"created_at_utc,omitempty"`
 	UpdatedAtUTC    string   `json:"updated_at_utc" yaml:"updated_at_utc,omitempty"`

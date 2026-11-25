@@ -107,6 +107,7 @@ const EN_MESSAGES = {
   'catalog.col.name': 'Name',
   'catalog.col.owner': 'Owner',
   'catalog.col.workspaces': 'Workspaces',
+  'catalog.col.gitRemotes': 'Git Remotes',
   'catalog.col.instance': 'Instance',
   'catalog.col.endpoint': 'Endpoint',
   'catalog.col.role': 'Role',
@@ -144,6 +145,7 @@ const EN_MESSAGES = {
   'catalog.field.description': 'Description',
   'catalog.field.tags': 'Tags (comma separated)',
   'catalog.field.workspaces': 'Workspace Paths (one per line, auto-prioritizes matching cwd)',
+  'catalog.field.gitRemotes': 'Git Remotes (one per line, auto-matches clones & worktrees)',
 
   'catalog.dialog.editInstance': 'Edit Instance',
   'catalog.dialog.newInstance': 'New Instance',
@@ -502,6 +504,7 @@ const ZH_MESSAGES: Record<TranslationKey, string> = {
   'catalog.col.name': '名称',
   'catalog.col.owner': '负责人',
   'catalog.col.workspaces': '绑定工作区',
+  'catalog.col.gitRemotes': 'Git 仓库',
   'catalog.col.instance': '实例',
   'catalog.col.endpoint': '地址',
   'catalog.col.role': '角色',
@@ -539,6 +542,7 @@ const ZH_MESSAGES: Record<TranslationKey, string> = {
   'catalog.field.description': '描述',
   'catalog.field.tags': '标签（逗号分隔）',
   'catalog.field.workspaces': '工作区路径（每行一个，自动优先匹配当前工作目录）',
+  'catalog.field.gitRemotes': 'Git Remote（每行一个，自动匹配多副本与 worktree）',
 
   'catalog.dialog.editInstance': '编辑实例',
   'catalog.dialog.newInstance': '新建实例',

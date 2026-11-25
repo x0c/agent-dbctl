@@ -105,19 +105,20 @@ Typical agent workflow:
 				exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
-			cwd, _ := os.Getwd()
+			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
 			var res struct {
 				Items             []types.TargetDetail `json:"items"`
 				SimilarNames      []string             `json:"similar_names"`
 				UnsearchedSources []string             `json:"unsearched_sources"`
 			}
 			err = client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/list", daemon.ListFilter{
-				System:       dbListOpts.system,
-				Env:          dbListOpts.env,
-				Engine:       dbListOpts.engine,
-				Tag:          dbListOpts.tag,
-				Search:       dbListOpts.search,
-				WorkspaceCWD: cwd,
+				System:              dbListOpts.system,
+				Env:                 dbListOpts.env,
+				Engine:              dbListOpts.engine,
+				Tag:                 dbListOpts.tag,
+				Search:              dbListOpts.search,
+				WorkspaceCWD:        cwd,
+				WorkspaceGitRemotes: gitRemotes,
 			}, &res)
 			if err != nil {
 				exitCode = writeRPCErr(ic, err)
@@ -201,11 +202,12 @@ Typical agent workflow:
 				exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
-			cwd, _ := os.Getwd()
+			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
 			var detail types.TargetDetail
-			err = client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/show", map[string]string{
-				"target":        args[0],
-				"workspace_cwd": cwd,
+			err = client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/show", map[string]any{
+				"target":                args[0],
+				"workspace_cwd":         cwd,
+				"workspace_git_remotes": gitRemotes,
 			}, &detail)
 			if err != nil {
 				exitCode = writeRPCErr(ic, err)
@@ -275,17 +277,18 @@ Typical agent workflow:
 				exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
-			cwd, _ := os.Getwd()
+			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
 			table := ""
 			if len(args) == 2 {
 				table = args[1]
 			}
 			reqBody := map[string]any{
-				"target":        args[0],
-				"table":         table,
-				"search":        dbSchemaOpts.search,
-				"limit":         dbSchemaOpts.limit,
-				"workspace_cwd": cwd,
+				"target":                args[0],
+				"table":                 table,
+				"search":                dbSchemaOpts.search,
+				"limit":                 dbSchemaOpts.limit,
+				"workspace_cwd":         cwd,
+				"workspace_git_remotes": gitRemotes,
 			}
 
 			if table == "" {
@@ -438,7 +441,7 @@ Typical agent workflow:
 				exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
-			cwd, _ := os.Getwd()
+			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
 			target := ""
 			if len(args) == 1 {
 				target = args[0]
@@ -449,7 +452,7 @@ Typical agent workflow:
 			err = client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/test", map[string]any{
 				"target": target,
 				"all":    dbTestAll,
-				"filter": daemon.ListFilter{System: dbTestSys, Env: dbTestEnv, WorkspaceCWD: cwd},
+				"filter": daemon.ListFilter{System: dbTestSys, Env: dbTestEnv, WorkspaceCWD: cwd, WorkspaceGitRemotes: gitRemotes},
 			}, &res)
 			if err != nil {
 				exitCode = writeRPCErr(ic, err)
@@ -563,7 +566,7 @@ Agent defaults:
 				exitCode = writeClientInitErr(ic, err)
 				return nil
 			}
-			cwd, _ := os.Getwd()
+			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
 			tSec := int(execOpts.timeout.Seconds())
 			waitVal := execOpts.wait
 			if !cmd.Flags().Changed("wait") && ic.NoInput {
@@ -573,17 +576,18 @@ Agent defaults:
 
 			var resp types.ExecResponse
 			err = client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/exec", types.ExecRequest{
-				TargetRefOrAlias: execOpts.db,
-				Query:            query,
-				Reason:           execOpts.reason,
-				Actor:            "agent-cli",
-				WorkspaceCWD:     cwd,
-				DryRun:           execOpts.dryRun,
-				Preflight:        execOpts.preflight,
-				MaxRows:          execOpts.maxRows,
-				MaxBytes:         execOpts.maxBytes,
-				TimeoutSec:       tSec,
-				Wait:             waitVal,
+				TargetRefOrAlias:    execOpts.db,
+				Query:               query,
+				Reason:              execOpts.reason,
+				Actor:               "agent-cli",
+				WorkspaceCWD:        cwd,
+				WorkspaceGitRemotes: gitRemotes,
+				DryRun:              execOpts.dryRun,
+				Preflight:           execOpts.preflight,
+				MaxRows:             execOpts.maxRows,
+				MaxBytes:            execOpts.maxBytes,
+				TimeoutSec:          tSec,
+				Wait:                waitVal,
 			}, &resp)
 			if err != nil {
 				exitCode = writeRPCErr(ic, err)
@@ -1969,4 +1973,12 @@ func inspectFilePermissions(paths config.Paths) (dirMode string, dbMode string, 
 		}
 	}
 	return dirMode, dbMode, ok
+}
+
+func detectWorkspaceContext(ctx context.Context, noWorkspace bool) (string, []string) {
+	if noWorkspace {
+		return "", nil
+	}
+	cwd, _ := os.Getwd()
+	return cwd, config.DetectGitRemotes(ctx, cwd)
 }

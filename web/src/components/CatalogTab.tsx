@@ -30,7 +30,7 @@ import {
   Textarea,
   toast,
 } from '@x0c/ui'
-import { Download, FolderGit2, Plus, RefreshCw, Search, Upload, Wifi } from 'lucide-react'
+import { Download, FolderGit2, GitBranch, Plus, RefreshCw, Search, Upload, Wifi } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   api,
@@ -99,7 +99,7 @@ export function CatalogTab({
   const [saving, setSaving] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
 
-  const [sysForm, setSysForm] = useState({ id: '', slug: '', name: '', owner: '', description: '', tags: '', workspace_paths: '' })
+  const [sysForm, setSysForm] = useState({ id: '', slug: '', name: '', owner: '', description: '', tags: '', workspace_paths: '', git_remotes: '' })
   const [envForm, setEnvForm] = useState<EnvironmentRecord>({
     code: '',
     safety_tier: 'guarded',
@@ -298,7 +298,7 @@ export function CatalogTab({
   const openCreate = () => {
     setFormError(null)
     if (subTab === 'systems') {
-      setSysForm({ id: '', slug: '', name: '', owner: '', description: '', tags: '', workspace_paths: '' })
+      setSysForm({ id: '', slug: '', name: '', owner: '', description: '', tags: '', workspace_paths: '', git_remotes: '' })
     } else if (subTab === 'environments') {
       setEnvForm({ code: '', safety_tier: 'guarded', labels: { en: '', zh: '' }, color: '#D97706', sort_order: 25 })
     } else if (subTab === 'networks') {
@@ -341,6 +341,7 @@ export function CatalogTab({
           description: sysForm.description.trim(),
           tags: sysForm.tags.split(',').map((s) => s.trim()).filter(Boolean),
           workspace_paths: sysForm.workspace_paths.split('\n').map((s) => s.trim()).filter(Boolean),
+          git_remotes: sysForm.git_remotes.split('\n').map((s) => s.trim()).filter(Boolean),
         })
       } else if (dialog === 'environments') {
         await api.saveEnvironment(envForm)
@@ -498,9 +499,25 @@ export function CatalogTab({
       id: 'workspaces',
       header: t('catalog.col.workspaces'),
       cell: ({ row }) => (
-        <span className="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground">
+        <span
+          className="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground"
+          title={(row.original.workspace_paths ?? []).join('\n')}
+        >
           <FolderGit2 className="size-3.5" />
           {row.original.workspace_paths?.length ?? 0}
+        </span>
+      ),
+    },
+    {
+      id: 'git_remotes',
+      header: t('catalog.col.gitRemotes'),
+      cell: ({ row }) => (
+        <span
+          className="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground"
+          title={(row.original.git_remotes ?? []).join('\n')}
+        >
+          <GitBranch className="size-3.5" />
+          {row.original.git_remotes?.length ?? 0}
         </span>
       ),
     },
@@ -522,6 +539,7 @@ export function CatalogTab({
                 description: row.original.description,
                 tags: (row.original.tags ?? []).join(', '),
                 workspace_paths: (row.original.workspace_paths ?? []).join('\n'),
+                git_remotes: (row.original.git_remotes ?? []).join('\n'),
               })
               setDialog('systems')
             }}
@@ -845,6 +863,9 @@ export function CatalogTab({
         </FormField>
         <FormField label={t('catalog.field.workspaces')}>
           <Textarea rows={3} value={sysForm.workspace_paths} onChange={(e) => setSysForm((p) => ({ ...p, workspace_paths: e.target.value }))} placeholder="~/Codes/order-core" />
+        </FormField>
+        <FormField label={t('catalog.field.gitRemotes')}>
+          <Textarea rows={2} value={sysForm.git_remotes} onChange={(e) => setSysForm((p) => ({ ...p, git_remotes: e.target.value }))} placeholder="github.com/org/order-core" />
         </FormField>
       </FormDialog>
 

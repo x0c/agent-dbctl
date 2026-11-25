@@ -46,6 +46,7 @@ func registerDBWriteCommands(
 		system      string
 		systemName  string
 		workspaces  []string
+		gitRemotes  []string
 		noWorkspace bool
 		env         string
 		instance    string
@@ -93,10 +94,7 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 				setExitCode(ic.WriteError(types.ErrCodeInvalidUsage, false, err.Error(), "Use --param key=value.", nil, nil, types.Meta{}))
 				return nil
 			}
-			cwd := ""
-			if !addOpts.noWorkspace {
-				cwd, _ = os.Getwd()
-			}
+			cwd, detectedRemotes := detectWorkspaceContext(cmd.Context(), addOpts.noWorkspace)
 			req := daemon.DBAddRequest{
 				DSN:                   dsnVal,
 				InlinePasswordWarning: inlineDSNUsed,
@@ -112,6 +110,8 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 				SystemName:            addOpts.systemName,
 				WorkspaceCWD:          cwd,
 				WorkspacePaths:        addOpts.workspaces,
+				WorkspaceGitRemotes:   detectedRemotes,
+				GitRemotes:            addOpts.gitRemotes,
 				NoWorkspace:           addOpts.noWorkspace,
 				Env:                   addOpts.env,
 				Instance:              addOpts.instance,
@@ -181,10 +181,11 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 	dbAddCmd.Flags().StringArrayVar(&addOpts.params, "param", nil, "Extra driver parameter as key=value (repeatable)")
 	dbAddCmd.Flags().StringVar(&addOpts.ref, "ref", "", "Target ref (default: <system>/<env>/<db>)")
 	dbAddCmd.Flags().StringVar(&addOpts.alias, "alias", "", "Short alias for the target")
-	dbAddCmd.Flags().StringVar(&addOpts.system, "system", "", "System slug or ID (default: current directory name or 'default')")
+	dbAddCmd.Flags().StringVar(&addOpts.system, "system", "", "System slug or ID (default: matched workspace/Git repo or directory name)")
 	dbAddCmd.Flags().StringVar(&addOpts.systemName, "system-name", "", "Display name if creating a new system")
 	dbAddCmd.Flags().StringArrayVar(&addOpts.workspaces, "workspace-path", nil, "Workspace path to bind to the system (repeatable)")
-	dbAddCmd.Flags().BoolVar(&addOpts.noWorkspace, "no-workspace", false, "Do not bind current working directory to system")
+	dbAddCmd.Flags().StringArrayVar(&addOpts.gitRemotes, "git-remote", nil, "Git remote URL or host/org/repo to bind to the system (repeatable)")
+	dbAddCmd.Flags().BoolVar(&addOpts.noWorkspace, "no-workspace", false, "Do not bind current working directory or Git remotes to system")
 	dbAddCmd.Flags().StringVar(&addOpts.env, "env", "dev", "Environment code (default: dev)")
 	dbAddCmd.Flags().StringVar(&addOpts.instance, "instance", "", "Existing or custom Instance name/ID")
 	dbAddCmd.Flags().StringVar(&addOpts.role, "role", "", "Instance role (primary|replica|standalone)")
@@ -234,11 +235,12 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 				setExitCode(writeClientInitErr(ic, err))
 				return nil
 			}
-			cwd, _ := os.Getwd()
+			cwd, gitRemotes := detectWorkspaceContext(cmd.Context(), false)
 			var detail types.TargetDetail
-			if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/show", map[string]string{
-				"target":        args[0],
-				"workspace_cwd": cwd,
+			if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/show", map[string]any{
+				"target":                args[0],
+				"workspace_cwd":         cwd,
+				"workspace_git_remotes": gitRemotes,
 			}, &detail); err != nil {
 				setExitCode(writeRPCErr(ic, err))
 				return nil
@@ -378,9 +380,9 @@ func registerCatalogCommands(
 			}
 			rows := make([][]string, 0, len(res.Items))
 			for _, s := range res.Items {
-				rows = append(rows, []string{s.Slug, s.Name, s.Owner, strings.Join(s.Tags, ","), strings.Join(s.WorkspacePaths, ",")})
+				rows = append(rows, []string{s.Slug, s.Name, s.Owner, strings.Join(s.Tags, ","), strings.Join(s.WorkspacePaths, ","), strings.Join(s.GitRemotes, ",")})
 			}
-			renderTable(ic.Stdout, []string{"SLUG", "NAME", "OWNER", "TAGS", "WORKSPACES"}, rows)
+			renderTable(ic.Stdout, []string{"SLUG", "NAME", "OWNER", "TAGS", "WORKSPACES", "GIT_REMOTES"}, rows)
 			return nil
 		},
 	}
@@ -393,6 +395,7 @@ func registerCatalogCommands(
 		desc          string
 		tags          []string
 		workspaces    []string
+		gitRemotes    []string
 		defaultPolicy string
 		dryRun        bool
 	}
@@ -444,6 +447,9 @@ func registerCatalogCommands(
 			if cmd.Flags().Changed("workspace-path") {
 				cur.WorkspacePaths = sysSet.workspaces
 			}
+			if cmd.Flags().Changed("git-remote") {
+				cur.GitRemotes = config.NormalizeGitRemotes(sysSet.gitRemotes)
+			}
 			if cmd.Flags().Changed("default-policy") {
 				cur.DefaultPolicyID = sysSet.defaultPolicy
 			}
@@ -469,6 +475,7 @@ func registerCatalogCommands(
 	systemSetCmd.Flags().StringVar(&sysSet.desc, "description", "", "Description")
 	systemSetCmd.Flags().StringArrayVar(&sysSet.tags, "tag", nil, "System tag (repeatable)")
 	systemSetCmd.Flags().StringArrayVar(&sysSet.workspaces, "workspace-path", nil, "Bound workspace directory path (repeatable)")
+	systemSetCmd.Flags().StringArrayVar(&sysSet.gitRemotes, "git-remote", nil, "Bound Git remote URL or host/org/repo (repeatable)")
 	systemSetCmd.Flags().StringVar(&sysSet.defaultPolicy, "default-policy", "", "Default PolicyRuleSet name or ID")
 	systemSetCmd.Flags().BoolVar(&sysSet.dryRun, "dry-run", false, "Preview change without saving")
 	annotateCommand(systemSetCmd, RiskWriteLocal, "agent-dbctl system set orders --name Orders --workspace-path . --json")
@@ -1557,6 +1564,7 @@ func buildTopologyTemplate() types.TopologyBundle {
 				Owner:          "platform",
 				Tags:           []string{"core"},
 				WorkspacePaths: []string{filepath.Join("~", "Codes", "orders")},
+				GitRemotes:     []string{"github.com/org/orders"},
 			},
 		},
 		NetworkProfiles: []types.NetworkProfile{

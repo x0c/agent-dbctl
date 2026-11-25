@@ -638,3 +638,81 @@ func TestNaturalKeyTopologyPlanAndPartialApply(t *testing.T) {
 		t.Fatalf("expected unchanged on idempotent re-apply, got %+v", res2)
 	}
 }
+
+func TestSystemGitRemotesMigrationAndTopologySemantics(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "git-remotes-mig.db")
+
+	// Seed legacy systems table without git_remotes_json column.
+	rawDB, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = rawDB.ExecContext(ctx, `
+CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_utc TEXT NOT NULL);
+CREATE TABLE systems (
+	id TEXT PRIMARY KEY,
+	slug TEXT NOT NULL UNIQUE,
+	name TEXT NOT NULL,
+	owner TEXT NOT NULL DEFAULT '',
+	description TEXT NOT NULL DEFAULT '',
+	tags_json TEXT NOT NULL DEFAULT '[]',
+	workspace_paths_json TEXT NOT NULL DEFAULT '[]',
+	default_policy_id TEXT NOT NULL DEFAULT '',
+	created_at_utc TEXT NOT NULL,
+	updated_at_utc TEXT NOT NULL
+);
+INSERT INTO systems(id, slug, name, created_at_utc, updated_at_utc) VALUES ('sys_legacy', 'legacy', 'Legacy', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+`)
+	_ = rawDB.Close()
+	if err != nil {
+		t.Fatalf("seed legacy systems: %v", err)
+	}
+
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open migrated store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	saved, err := st.UpsertSystem(ctx, "admin", types.System{
+		ID:         "sys_legacy",
+		Slug:       "legacy",
+		Name:       "Legacy",
+		GitRemotes: []string{"git@github.com:acme/legacy.git", "https://github.com/acme/legacy.git"},
+	})
+	if err != nil {
+		t.Fatalf("upsert legacy system with git_remotes: %v", err)
+	}
+	if len(saved.GitRemotes) != 1 || saved.GitRemotes[0] != "github.com/acme/legacy" {
+		t.Fatalf("expected normalized/deduped git_remotes, got %+v", saved.GitRemotes)
+	}
+
+	// Omitting GitRemotes (nil) in topology apply preserves existing GitRemotes.
+	if err := st.ImportTopology(ctx, "admin", types.TopologyBundle{
+		SchemaVersion: 1,
+		Systems: []types.System{
+			{Slug: "legacy", Name: "Legacy", GitRemotes: nil},
+		},
+	}); err != nil {
+		t.Fatalf("import omitted git_remotes: %v", err)
+	}
+	syss, _ := st.ListSystems(ctx)
+	if len(syss) != 1 || len(syss[0].GitRemotes) != 1 || syss[0].GitRemotes[0] != "github.com/acme/legacy" {
+		t.Fatalf("expected omitted git_remotes to preserve existing binding, got %+v", syss)
+	}
+
+	// Explicit empty slice clears GitRemotes.
+	if err := st.ImportTopology(ctx, "admin", types.TopologyBundle{
+		SchemaVersion: 1,
+		Systems: []types.System{
+			{Slug: "legacy", Name: "Legacy", GitRemotes: []string{}},
+		},
+	}); err != nil {
+		t.Fatalf("import explicit empty git_remotes: %v", err)
+	}
+	syss, _ = st.ListSystems(ctx)
+	if len(syss) != 1 || len(syss[0].GitRemotes) != 0 {
+		t.Fatalf("expected explicit empty git_remotes to clear binding, got %+v", syss)
+	}
+}

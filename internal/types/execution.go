@@ -99,17 +99,18 @@ const (
 
 // ExecRequest represents a CLI/API execution submission.
 type ExecRequest struct {
-	TargetRefOrAlias string `json:"target"`
-	Query            string `json:"query"`
-	Reason           string `json:"reason,omitempty"`
-	Actor            string `json:"actor,omitempty"`
-	WorkspaceCWD     string `json:"workspace_cwd,omitempty"`
-	DryRun           bool   `json:"dry_run,omitempty"`
-	Preflight        bool   `json:"preflight,omitempty"`
-	MaxRows          int    `json:"max_rows,omitempty"`
-	MaxBytes         int64  `json:"max_bytes,omitempty"`
-	TimeoutSec       int    `json:"timeout_sec,omitempty"`
-	Wait             bool   `json:"wait"`
+	TargetRefOrAlias    string   `json:"target"`
+	Query               string   `json:"query"`
+	Reason              string   `json:"reason,omitempty"`
+	Actor               string   `json:"actor,omitempty"`
+	WorkspaceCWD        string   `json:"workspace_cwd,omitempty"`
+	WorkspaceGitRemotes []string `json:"workspace_git_remotes,omitempty"`
+	DryRun              bool     `json:"dry_run,omitempty"`
+	Preflight           bool     `json:"preflight,omitempty"`
+	MaxRows             int      `json:"max_rows,omitempty"`
+	MaxBytes            int64    `json:"max_bytes,omitempty"`
+	TimeoutSec          int      `json:"timeout_sec,omitempty"`
+	Wait                bool     `json:"wait"`
 }
 
 // ExecResponse is returned to the CLI for exec and op status calls.
