@@ -2,15 +2,15 @@
 
 Database execution gate, system/database asset catalog, local Web approval console, and append-only hash-chain audit log for AI coding agents and engineers. Do not store credentials, personal paths, or private infrastructure addresses in repository files.
 
-## Document Navigation
+## Document index
 
 Read the relevant document(s) before making design, protocol, CLI contract, or UI changes:
 
 - [README.md](README.md): Public overview, supported platforms, installation, and quick start.
 - [README.zh-CN.md](README.zh-CN.md): Complete Simplified Chinese overview and quick start.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): System boundaries, four-layer catalog (`System` -> `Environment` -> `Instance` -> `Target`), network/credential decoupling, driver connection/multi-version contracts, pooling/dialect primitives and pending daemon wiring, hardened classifier + custom `RiskPatternRule` + `EXPLAIN` preflight, 4-level monotonic policy inheritance, `ApprovalProvider` abstraction, append-only hash-chain audit log, and silent companion skill sync.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): System boundaries, four-layer catalog (`System` -> `Environment` -> `Instance` -> `Target`), declarative onboarding & read-only `PlanTopologyImport`, network/credential decoupling, driver connection/multi-version contracts, pooling/dialect primitives and pending daemon wiring, hardened classifier + custom `RiskPatternRule` + `EXPLAIN` preflight, 4-level monotonic policy inheritance, `ApprovalProvider` abstraction, append-only hash-chain audit log, hardened local Web session-cookie/CSRF guard, and silent companion skill sync.
 - [docs/READ_RISK_AUDIT.md](docs/READ_RISK_AUDIT.md): Empirically verified dangerous and high-load read statement matrix across PostgreSQL, MySQL, SQLite, MongoDB, and Redis, audited classifier/preflight/policy gaps, implemented remediations, and remaining boundaries.
-- [docs/CLI_CONTRACT.md](docs/CLI_CONTRACT.md): `agent-friendly-cli` contract, command hierarchy, flags and aliases, JSON envelope `{ok, data, error, meta}`, OS exit codes (`0..7`), semantic `error.code` catalog, `--dry-run` vs `--preflight`, `--wait=false` + `op status`/`wait`/`cancel`, `audit list`/`export`, `doctor --live`, `describe`, truncation & `--out`, companion skill management, and environment variable overrides.
+- [docs/CLI_CONTRACT.md](docs/CLI_CONTRACT.md): `agent-friendly-cli` contract, command hierarchy (including declarative `db add`/`set`/`delete`, `system`/`env`/`network`/`cred`/`instance`, `topology schema|export|apply`, `security`/`policy`/`pattern`, and zero-secret Keychain Web handoff `ui open --credential`), flags and aliases, JSON envelope `{ok, data, error, meta}`, OS exit codes (`0..7`), semantic `error.code` catalog, `--dry-run` vs `--preflight`, `--wait=false` + `op status`/`wait`/`cancel`, `audit list`/`export`, `doctor --live`, `describe`, truncation & `--out`, companion skill management, and environment variable overrides.
 - [docs/PLUGIN_PROTOCOL.md](docs/PLUGIN_PROTOCOL.md): Tier-3 external gRPC driver plugin protocol (`v1` `Struct` & `v2` typed Protobuf + `Cancel` RPC), `manifest.json` schema, SHA-256 verification, capability-gated dispatch, loopback tunnel bridge, and `ApprovalProvider` (`local-web`, `webhook`, custom) contract.
 - [skills/agent-dbctl/SKILL.md](skills/agent-dbctl/SKILL.md): Canonical companion coding-agent skill synced to local agent skill directories.
 - [SECURITY.md](SECURITY.md): Threat model, local execution guarantees, and private vulnerability reporting.

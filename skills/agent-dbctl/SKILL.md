@@ -36,7 +36,7 @@ When a database is not yet registered (`db list` returns empty or `db_not_found`
      "$BIN" db add --engine postgres --host 127.0.0.1 --port 5432 --database orders \
        --system order-core --env prod --user app_ro --open-secret --json
      ```
-   - **DSN / automated secret sources**: pass `--dsn` / `--dsn-env` / `--dsn-stdin`, or pair flags with `--secret-env <VAR>` / `--secret-stdin` / `--secret-file <path>`, `--cred-kind env_ref --env-var <VAR>`, or `--cred-kind exec_provider --exec-cmd "<cmd>"`. Preview first with `--dry-run`; probe immediately with `--test`.
+   - **DSN / automated secret sources**: pass `--dsn` / `--dsn-env` / `--dsn-stdin`, or pair flags with `--secret-env <VAR>` / `--secret-stdin` / `--secret-file <path>`, `--cred-kind env_ref --env-var-name <VAR>`, or `--cred-kind exec_provider --exec-command "<cmd>"`. Preview first with `--dry-run`; probe immediately with `--test`.
    - When `missing_secrets` appears in output, share `setup_url` or run `"$BIN" ui open --credential <name-or-id>` so the human enters the password into Keychain directly.
 2. **Bulk declarative topology (`topology`)**:
    - Print the exact YAML schema & field guide offline: `"$BIN" topology schema`

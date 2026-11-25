@@ -26,12 +26,12 @@ CLI (agent-dbctl) ──[Unix Socket / Loopback RPC]──▶ Local On-Demand Da
 Web Console (127.0.0.1 HTTP + SSE, go:embed) ───────────┼──▶ Catalog (SQLite WAL)
                                                         ├──▶ Secrets (Keychain / File / Env / Exec)
                                                         ├──▶ NetDial (Direct / SSH Bastion / SOCKS5 / HTTP Proxy)
-                                                        ├──▶ Classify + Preflight (SQL / Mongo / Redis)
+                                                        ├──▶ Classify + Preflight (SQL / Mongo / Elasticsearch / Redis)
                                                         ├──▶ Policy Engine (4-level monotonic inheritance)
                                                         ├──▶ ApprovalManager (ApprovalProvider: local-web / webhook / extensible)
                                                         ├──▶ Audit (Append-only Hash Chain + ResultSlot)
                                                         └──▶ Driver Execution Plane
-                                                               ├── Tier 1 Built-in Pure Go (PG, MySQL, SQLite, Mongo, Redis)
+                                                               ├── Tier 1 Built-in Pure Go (PG, MySQL, SQLite, ClickHouse, MSSQL, Oracle, Mongo, Elasticsearch, Redis)
                                                                └── Tier 3 External gRPC Subprocess (hashicorp/go-plugin)
 ```
 
@@ -56,7 +56,7 @@ Enterprise environments involve multiple business systems, shared jump hosts, pr
    - **NetworkProfile**: Reusable connectivity template (`direct`, `ssh_tunnel` bastion, `socks5`, `http_proxy`, TLS mode). Multiple instances share one bastion definition.
    - **CredentialProfile**: Reusable auth definition (`keychain`, `env_ref`, `exec_provider`), `access_level` (`read_only` | `read_write`). Actual secrets live strictly in the OS Keychain (macOS `security -i` over stdin, rejecting whitespace, quotes, and control chars on service/account names), env vars, or shell-free quote-aware external secret-manager commands (`SplitExecArgs`, 64 KiB stdout cap, no secret echo on errors)—never in SQLite or CLI output.
 4. **Instance (`instances`) & Target (`targets`)**:
-   - **Instance**: Physical/logical endpoint (`engine`, `host`, `port`, `role`: `primary` | `replica` | `standalone`, `primary_instance_id`, `network_profile_id`, cached `capabilities`). Supports live database/schema discovery (`POST /api/v1/instances/{id}/discover`) and caches detected `ServerCapabilities` (`capabilities_json`) on successful live probes (omitted from YAML topology exports). Read-only replica routing deterministically selects a matching replica and resolves that replica's own `NetworkProfile` and bastion credentials rather than reusing the primary's network path.
+   - **Instance**: Physical/logical endpoint (`engine`, `host`, `port`, `role`: `primary` | `replica` | `standalone`, `primary_instance_id`, `network_profile_id`, cached `capabilities`). Supports live database/schema discovery (`POST /api/v1/instances/{id}/discover` and `agent-dbctl instance discover`) and caches detected `ServerCapabilities` (`capabilities_json`) on successful live probes (omitted from YAML topology exports). Read-only replica routing deterministically selects a matching replica and resolves that replica's own `NetworkProfile` and bastion credentials rather than reusing the primary's network path.
    - **Target**: Logical addressable target (`ref` e.g. `order-core/prod/orders`, short `alias` e.g. `prod-orders`, `owner_system_id`, many-to-many `linked_system_ids`, `instance_id`, `database_name`, `ro_credential_id`, `rw_credential_id`, `policy_override_id`, `status`: `active` | `maintenance` | `disabled`). Targets configured with `ro_credential_id` and no `rw_credential_id` deny mutating/unknown queries at policy evaluation (`credential_missing`), aligning with `TargetSummary.Writable`. Supports concurrent fleet connectivity probing (`agent-dbctl db test --all` / `POST /api/v1/targets/test-all` via bounded 8-worker `Service.PingTargets`).
 
 ### Sanitized Topology Portability & Zero-Secret Onboarding
@@ -116,7 +116,7 @@ Lower levels can **tighten** restrictions monotonically across both numeric ceil
 
 - **Configurable High-Risk Pattern Rules (`RiskPatternRule`)**: Layered atop the built-in classifier across `global -> env -> system -> target` scopes, filtered by target engine/family. Lower scopes can add rules or tighten actions (`elevate_high_cost -> require_approval -> deny`) and enrich confirmation copy/provider overrides, but cannot disable or weaken an enabled ancestor rule. Rules persist in SQLite (`risk_pattern_rules`) with same-transaction hash-chain audit logging and `/api/v1/topology` + CLI (`security`, `policy`, `pattern`) management; execution approvals remain human-only.
 - **Multi-Modal Composable Matchers**: Rules compose `all` / `any` / `not` conditions over 8 matcher types: `function_call`, `table_ref`, `pragma_name`, `command_arg`, `json_path`, `regex` (Go RE2 with AST node & length limits, defaulting to comment-stripped normalized queries), `risk_flag`, and `preflight_metric`.
-- **Secondary Confirmation & Dry-Run Sandbox**: Matched `require_approval` rules force human approval even in `dev` (`yolo`) targets, surfacing structured `MatchedRule` details (`confirm_title`, `confirm_message`, `matched_fragment`, scope, action) in CLI JSON/hints, Web UI approval cards, webhooks, and `audit_logs`. The Web Console includes 9 official preset rule packs (`pg-side-effect`, `sqlite-pragma-blob`, `redis-single-thread`, `mongo-js-explain`, `mysql-dos-guard`, `clickhouse-heavy-scan`, `mssql-proc-dos`, `oracle-sys-guard`, `es-unbounded-scan`) and an offline dry-run test sandbox (`POST /api/v1/risk-patterns/test`).
+- **Secondary Confirmation & Dry-Run Sandbox**: Matched `require_approval` rules force human approval even in `dev` (`yolo`) targets, surfacing structured `MatchedRule` details (`confirm_title`, `confirm_message`, `matched_fragment`, scope, action) in CLI JSON/hints, Web UI approval cards, webhooks, and `audit_logs`. The Web Console and CLI include 9 official preset rule packs (`pg-side-effect`, `sqlite-pragma-blob`, `redis-single-thread`, `mongo-js-explain`, `mysql-dos-guard`, `clickhouse-heavy-scan`, `mssql-proc-dos`, `oracle-sys-guard`, `es-unbounded-scan`) and an offline dry-run test sandbox (`POST /api/v1/risk-patterns/test` and `agent-dbctl pattern test`).
 
 ---
 

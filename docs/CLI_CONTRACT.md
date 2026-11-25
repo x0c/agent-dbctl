@@ -69,33 +69,39 @@ Operating system exit codes are constrained to integers `0..125` (codes `>= 126`
 agent-dbctl db list [--system <slug>] [--env <code,...>] [--engine <eng>] [--tag <tag>] [--search <kw>] [--detail]
 agent-dbctl db show <ref_or_alias> [--detail]
 agent-dbctl db add [--dsn <uri> | --dsn-env <var> | --dsn-stdin] [--engine <eng> --host <host> --port <n> --database <db>]
-                   [--system <slug>] [--env <code|dev>] [--instance <name>] [--network <name>]
-                   [--ref <ref>] [--alias <alias>] [--user <name>] [--cred-kind keychain|env_ref|exec_provider]
-                   [--secret-env <var> | --secret-stdin | --secret-file <path>] [--env-var <var>] [--exec-cmd <cmd>]
-                   [--open-secret] [--dry-run] [--test]
+                   [--tls-mode <mode>] [--param <k=v>...] [--system <slug>] [--system-name <name>]
+                   [--workspace-path <path>...] [--no-workspace] [--env <code|dev>]
+                   [--instance <name>] [--role standalone|primary|replica] [--network <name>]
+                   [--ref <ref>] [--alias <alias>] [--user <name>] [--cred-name <name>]
+                   [--cred-kind keychain|env_ref|exec_provider] [--access-level read_only|read_write]
+                   [--ro-cred <name>] [--rw-cred <name>]
+                   [--secret-env <var> | --secret-stdin | --secret-file <path>]
+                   [--env-var-name <var>] [--exec-command <cmd>]
+                   [--status active|maintenance|disabled] [--description <txt>] [--open-secret] [--dry-run] [--test]
 agent-dbctl db set <ref_or_alias> [--ref <new_ref>] [--alias <alias>] [--system <slug>] [--env <code>]
                    [--instance <name>] [--database <db>] [--ro-cred <name>] [--rw-cred <name>]
-                   [--status active|maintenance|disabled] [--dry-run]
-agent-dbctl db delete <ref_or_alias>
+                   [--policy <name>] [--clear-rw-cred] [--clear-policy]
+                   [--status active|maintenance|disabled] [--description <txt>] [--dry-run]
+agent-dbctl db delete <ref_or_alias_or_id> [--yes|-y]
 agent-dbctl db schema <ref_or_alias> [table_or_collection] [--search <kw>] [--limit <n>] [--out <path> [--force]]
 agent-dbctl db test [<ref_or_alias> | --all] [--system <slug>] [--env <code,...>]
 
-agent-dbctl system list | set <slug> [--name <name>] [--workspace <path>...] [--dry-run] | delete <id_or_slug>
-agent-dbctl env list | set <code> [--tier yolo|guarded|strict] [--label-en <txt>] [--label-zh <txt>] [--dry-run]
-agent-dbctl network list | set <name> [--mode direct|ssh_tunnel|socks5|http_proxy] [--dry-run] | delete <id_or_name>
-agent-dbctl cred list | set <name> [--kind keychain|env_ref|exec_provider] [--access read_only|read_write] [--user <u>] [--secret-env <var> | --secret-stdin | --secret-file <path>] [--open-secret] [--dry-run] | delete <id_or_name>
-agent-dbctl instance list | set <name> [--engine <eng>] [--host <h>] [--port <p>] [--role standalone|primary|replica] [--dry-run] | delete <id_or_name> | test <id_or_name> | discover <id_or_name>
+agent-dbctl system list | set [<slug>] [--slug <slug>] [--name <name>] [--owner <owner>] [--description <txt>] [--tag <tag>...] [--workspace-path <path>...] [--default-policy <name>] [--dry-run] | delete <slug_or_id> [--yes|-y]
+agent-dbctl env list | set <code> [--safety-tier yolo|guarded|strict] [--label <k=v>...] [--color <hex>] [--sort-order <n>] [--default-policy <name>] [--dry-run]
+agent-dbctl network list | set <name_or_id> [--mode direct|ssh_tunnel|socks5|http_proxy] [--proxy-url <url>] [--bastion-host <h>] [--bastion-port <n>] [--bastion-user <u>] [--bastion-cred <id>] [--strict-host-key] [--tls-mode <m>] [--dry-run] | delete <name_or_id> [--yes|-y]
+agent-dbctl cred list | set <name_or_id> [--kind keychain|env_ref|exec_provider] [--access-level read_only|read_write] [--user <u>] [--secret-env <var> | --secret-stdin | --secret-file <path> | --clear-secret] [--env-var-name <var>] [--exec-command <cmd>] [--open-secret] [--dry-run] | delete <name_or_id> [--yes|-y]
+agent-dbctl instance list | set <name_or_id> [--engine <eng>] [--host <h>] [--port <p>] [--role primary|replica|standalone] [--primary <name>] [--network <name>] [--tls-mode <m>] [--param <k=v>...] [--dry-run] | delete <name_or_id> [--yes|-y] | test <name_or_id> [--cred <name_or_id>] [--database <db>] | discover <name_or_id> [--cred <name_or_id>] [--database <db>]
 
-agent-dbctl topology schema
+agent-dbctl topology schema [--format yaml|json] [--out <path> [--force]]
 agent-dbctl topology export [--format yaml|json] [--out <path> [--force]]
 agent-dbctl topology apply [--file <path> | --stdin] [--dry-run] [--open-secret]
 
-agent-dbctl security get | set [--exec-timeout <sec>] [--max-rows <n>] [--prod-freeze] [--dry-run]
-agent-dbctl policy list | set <name> --scope-type env|system|target --scope-id <id_or_key> [...] [--dry-run] | delete <id_or_name>
-agent-dbctl pattern list | set (--file <path> | --stdin) [--dry-run] | delete <id_or_name> [--scope-type ... --scope-id ...] | install-pack <pack_id> [--scope-type ...] [--dry-run] | test [...]
-agent-dbctl approval list [--status pending|approved|rejected|expired|cancelled|all] [--limit <n>]
+agent-dbctl security get | set [--exec-timeout-sec <sec>] [--approval-timeout-sec <sec>] [--max-rows <n>] [--max-bytes <n>] [--explain-max-rows <n>] [--prod-read-only-freeze] [--block-multi-statement-in-prod] [--default-approval-provider <p>] [--redact-audit-literals] [--require-reason-for-approval] [--dry-run]
+agent-dbctl policy list | set [<name_or_id>] [--file <path>] --scope-type env|system|target --scope-id <id_or_key> [...] [--dry-run] | delete <name_or_id> [--yes|-y]
+agent-dbctl pattern list | set [<name_or_id>] [--file <path> | --stdin] [--scope-type global|env|system|target] [--scope-id <id_or_key>] [--action elevate_high_cost|require_approval|deny] [--regex <pat>] [--engine <eng>...] [--dry-run] | delete <name_or_id> [--scope-type ... --scope-id ...] [--yes|-y] | install-pack <pack_id> [--scope-type ...] [--scope-id ...] [--dry-run] | test [--db <ref>] [--engine <eng>] [--safety-tier yolo|guarded|strict] [--query <q> | <q>]
+agent-dbctl approval list [--status pending|approved|rejected|expired|cancelled] [--limit <n>]
 agent-dbctl approval show <approval_id>
-agent-dbctl driver list
+agent-dbctl driver list [--engine <name>]
 
 agent-dbctl exec --db <ref_or_alias> [--sql <stmt> | --file <path> | --stdin | <stmt>]
                  [--reason <text>] [--dry-run | --preflight]
@@ -109,7 +115,7 @@ agent-dbctl op wait <operation_id> [--timeout <dur>] [--format auto|rows|objects
 agent-dbctl op list [--db <ref_or_alias>] [--env <code,...>] [--system <slug>] [--status <status>] [--limit <n>]
 agent-dbctl op cancel <operation_id>
 
-agent-dbctl ui open [--tab approvals|catalog|policies|audit|drivers] [--credential <id_or_name>] [--no-open]
+agent-dbctl ui open [--tab approvals|targets|catalog|policies|audit|drivers] [--credential <id_or_name>] [--no-open]
 agent-dbctl daemon start | status | stop | restart
 agent-dbctl plugin list | verify | reload
 agent-dbctl audit verify
@@ -151,7 +157,7 @@ agent-dbctl skill print
 9. **Live Diagnostics & Connectivity Failures**: `doctor --live` verifies config/DB permissions (`0700`/`0600`), webhook readiness, plugin digests, and live target connectivity; `db test` returns `ok: false` (exit `1`) when all probed targets are unreachable.
 10. **Multi-Word `describe` & Exit Codes**: `describe [command...]` accepts multi-word subcommand paths (e.g. `describe db list`) and includes the `exit_codes` catalog alongside live Cobra flags and risk metadata.
 11. **Actionable `driver_error` Recovery**: Driver execution failures surface targeted `hint` guidance and concrete `next_commands` (such as `db schema <ref>` on missing table/column errors, `db show <ref>` on permission/syntax issues, or `db test <ref>` on connectivity failures) while omitting empty approval fields from `error.context`.
-12. **Idempotent Declarative Configuration & Zero-Secret Web Handoff**: `db add`, `system set`, `env set`, `network set`, `cred set`, `instance set`, `db set`, `topology apply`, `security set`, `policy set`, and `pattern set` accept natural keys (`slug`/`name`/`ref`/`code`), support truly read-only `--dry-run`, converge to `status: "unchanged"` on repeat runs, and record `actor: "agent-cli"` in the hash-chain audit log. When a `keychain` credential has no stored secret, `db add`, `cred set`, and `topology apply` return `missing_secrets` with a deep-link `setup_url` (`/catalog?subtab=credentials&credential=<id>`); passing `--open-secret` (or `ui open --credential <name-or-id>`) opens the browser straight to the credential's password dialog without exposing secrets to the agent.
+12. **Idempotent Declarative Configuration & Zero-Secret Web Handoff**: `db add`, `system set`, `env set`, `network set`, `cred set`, `instance set`, `db set`, `topology apply`, `security set`, `policy set`, and `pattern set` accept natural keys (`slug`/`name`/`ref`/`code`), support truly read-only `--dry-run`, converge to `status: "unchanged"` on repeat runs, and record `actor: "agent-cli"` in the hash-chain audit log; target deletion/lookup also supports slash-containing natural refs (`system/env/db`). When a `keychain` credential has no stored secret, `db add`, `cred set`, and `topology apply` return `missing_secrets` with a deep-link `setup_url` (`/catalog?subtab=credentials&credential=<id>`); passing `--open-secret` (or `ui open --credential <name-or-id>`) opens the browser straight to the credential's password dialog without exposing secrets to the agent. Note that `--test` / `db test` probes use read-only connections (SQLite targets open with `mode=ro` and require an existing DB file).
 13. **Daemon Version Upgrade & Single-Instance Lifecycle**: When the running daemon is older than the CLI (or shares the same base version with a different commit / `dev` build), CLI commands serialize on a per-session startup lock and automatically restart the stale daemon—provided `AGENT_DBCTL_NO_DAEMON_SPAWN` is not `1` and no operations are currently `running` (`waiting_approval` operations rehydrate cleanly on startup). If the running daemon is strictly newer than the CLI, if `running` operations are active, or if auto-spawn is disabled, the CLI returns exit `5` (`daemon_version_mismatch`) rather than silently downgrading or aborting in-flight queries. The daemon itself holds an exclusive per-session OS lock and closes SSE streams immediately on shutdown to prevent orphaned duplicate processes or socket races.
 14. **Mandatory Approval Justification (`--reason`)**: When `GlobalSecurityConfig.RequireReasonForApproval` is enabled (default `true`), any `exec` invocation whose policy evaluation resolves to `require_approval` (and is not `--dry-run` or `--preflight`) requires a non-empty `--reason "<text>"`; omitting it fails fast with exit `2` (`reason_required`) and concrete recovery guidance without creating an empty approval ticket.
 
