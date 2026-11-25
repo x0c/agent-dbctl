@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -314,5 +315,335 @@ func TestRedisOptionsNormalizationAndCapping(t *testing.T) {
 	capped, returned := capRedisSingleResult([]any{"a", "b", "c", "d"}, &buf)
 	if returned != 2 || !buf.Truncated || buf.CutoffReason != "max_rows" {
 		t.Fatalf("expected slice capped at 2 rows, got returned=%d buf=%+v capped=%v", returned, buf, capped)
+	}
+}
+
+func TestMongoExplainPlanInspectionAndPreflightWarnings(t *testing.T) {
+	cases := []struct {
+		name        string
+		explain     any
+		wantFull    bool
+		wantBounded bool
+	}{
+		{
+			name: "winning IXSCAN ignores rejected COLLSCAN",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage": "FETCH",
+						"inputStage": map[string]any{
+							"stage":     "IXSCAN",
+							"indexName": "symbol_1",
+						},
+					},
+					"rejectedPlans": []any{
+						map[string]any{"stage": "COLLSCAN"},
+					},
+				},
+			},
+			wantFull:    false,
+			wantBounded: false,
+		},
+		{
+			name: "bounded LIMIT int32 BSON over COLLSCAN",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage":       "LIMIT",
+						"limitAmount": int32(2),
+						"inputStage": map[string]any{
+							"stage": "COLLSCAN",
+						},
+					},
+				},
+			},
+			wantFull:    false,
+			wantBounded: true,
+		},
+		{
+			name: "bounded LIMIT float64 over PROJECTION_SIMPLE and COLLSCAN",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage":       "LIMIT",
+						"limitAmount": float64(20),
+						"inputStage": map[string]any{
+							"stage": "PROJECTION_SIMPLE",
+							"inputStage": map[string]any{
+								"stage": "COLLSCAN",
+							},
+						},
+					},
+				},
+			},
+			wantFull:    false,
+			wantBounded: true,
+		},
+		{
+			name: "over-cap LIMIT 5000 over COLLSCAN stays full_scan",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage":       "LIMIT",
+						"limitAmount": int32(5000),
+						"inputStage":  map[string]any{"stage": "COLLSCAN"},
+					},
+				},
+			},
+			wantFull:    true,
+			wantBounded: false,
+		},
+		{
+			name: "zero LIMIT over COLLSCAN stays full_scan",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage":       "LIMIT",
+						"limitAmount": int32(0),
+						"inputStage":  map[string]any{"stage": "COLLSCAN"},
+					},
+				},
+			},
+			wantFull:    true,
+			wantBounded: false,
+		},
+		{
+			name: "uncapped COLLSCAN",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{"stage": "COLLSCAN"},
+				},
+			},
+			wantFull:    true,
+			wantBounded: false,
+		},
+		{
+			name: "SORT with limitAmount blocks bounded COLLSCAN",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage":       "SORT",
+						"limitAmount": int32(2),
+						"inputStage":  map[string]any{"stage": "COLLSCAN"},
+					},
+				},
+			},
+			wantFull:    true,
+			wantBounded: false,
+		},
+		{
+			name: "LIMIT over SORT over COLLSCAN stays full_scan",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage":       "LIMIT",
+						"limitAmount": int32(2),
+						"inputStage": map[string]any{
+							"stage":      "SORT",
+							"inputStage": map[string]any{"stage": "COLLSCAN"},
+						},
+					},
+				},
+			},
+			wantFull:    true,
+			wantBounded: false,
+		},
+		{
+			name: "LIMIT over GROUP over COLLSCAN stays full_scan",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage":       "LIMIT",
+						"limitAmount": int32(2),
+						"inputStage": map[string]any{
+							"stage":      "GROUP",
+							"inputStage": map[string]any{"stage": "COLLSCAN"},
+						},
+					},
+				},
+			},
+			wantFull:    true,
+			wantBounded: false,
+		},
+		{
+			name: "LIMIT over large SKIP over COLLSCAN stays full_scan",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage":       "LIMIT",
+						"limitAmount": int32(2),
+						"inputStage": map[string]any{
+							"stage":      "SKIP",
+							"skipAmount": int32(50000),
+							"inputStage": map[string]any{"stage": "COLLSCAN"},
+						},
+					},
+				},
+			},
+			wantFull:    true,
+			wantBounded: false,
+		},
+		{
+			name: "SBE winningPlan.queryPlan bounded LIMIT",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"queryPlan": map[string]any{
+							"stage":       "LIMIT",
+							"limitAmount": int32(5),
+							"inputStage":  map[string]any{"stage": "COLLSCAN"},
+						},
+					},
+				},
+			},
+			wantFull:    false,
+			wantBounded: true,
+		},
+		{
+			name: "SBE winningPlan.queryPlan SORT over COLLSCAN",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"queryPlan": map[string]any{
+							"stage":      "SORT",
+							"inputStage": map[string]any{"stage": "COLLSCAN"},
+						},
+					},
+				},
+			},
+			wantFull:    true,
+			wantBounded: false,
+		},
+		{
+			name: "sharded SHARD_MERGE with bounded/IXSCAN shards",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage": "SHARD_MERGE",
+						"shards": []any{
+							map[string]any{
+								"winningPlan": map[string]any{
+									"stage":       "LIMIT",
+									"limitAmount": int32(2),
+									"inputStage":  map[string]any{"stage": "COLLSCAN"},
+								},
+							},
+							map[string]any{
+								"winningPlan": map[string]any{"stage": "IXSCAN"},
+							},
+						},
+					},
+				},
+			},
+			wantFull:    false,
+			wantBounded: true,
+		},
+		{
+			name: "sharded SHARD_MERGE with uncapped shard",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage": "SHARD_MERGE",
+						"shards": []any{
+							map[string]any{
+								"winningPlan": map[string]any{"stage": "COLLSCAN"},
+							},
+							map[string]any{
+								"winningPlan": map[string]any{"stage": "IXSCAN"},
+							},
+						},
+					},
+				},
+			},
+			wantFull:    true,
+			wantBounded: false,
+		},
+		{
+			name: "sharded SHARD_MERGE_SORT over COLLSCAN",
+			explain: map[string]any{
+				"queryPlanner": map[string]any{
+					"winningPlan": map[string]any{
+						"stage": "SHARD_MERGE_SORT",
+						"shards": []any{
+							map[string]any{
+								"winningPlan": map[string]any{
+									"stage":       "LIMIT",
+									"limitAmount": int32(2),
+									"inputStage":  map[string]any{"stage": "COLLSCAN"},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantFull:    true,
+			wantBounded: false,
+		},
+		{
+			name: "aggregation cursor IXSCAN ignores rejected COLLSCAN",
+			explain: map[string]any{
+				"stages": []any{
+					map[string]any{
+						"$cursor": map[string]any{
+							"queryPlanner": map[string]any{
+								"winningPlan": map[string]any{"stage": "IXSCAN"},
+								"rejectedPlans": []any{
+									map[string]any{"stage": "COLLSCAN"},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantFull:    false,
+			wantBounded: false,
+		},
+		{
+			name: "aggregation cursor uncapped COLLSCAN",
+			explain: map[string]any{
+				"stages": []any{
+					map[string]any{
+						"$cursor": map[string]any{
+							"queryPlanner": map[string]any{
+								"winningPlan": map[string]any{"stage": "COLLSCAN"},
+							},
+						},
+					},
+				},
+			},
+			wantFull:    true,
+			wantBounded: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotFull, gotBounded, _ := inspectMongoExplain(tc.explain)
+			if gotFull != tc.wantFull || gotBounded != tc.wantBounded {
+				t.Fatalf("inspectMongoExplain() = (fullScan=%v, bounded=%v), want (%v, %v)",
+					gotFull, gotBounded, tc.wantFull, tc.wantBounded)
+			}
+		})
+	}
+
+	mc := &mongoConn{dbName: "alphaforge"}
+	rep, err := mc.Preflight(context.Background(), "db.instrument_master.find({}).limit(2)", driver.PreflightOpts{})
+	if err != nil {
+		t.Fatalf("Preflight mongosh syntax: %v", err)
+	}
+	if rep.Supported || len(rep.Warnings) == 0 {
+		t.Fatalf("expected Supported=false with warning for mongosh syntax, got %+v", rep)
+	}
+	warn := rep.Warnings[0]
+	if !strings.Contains(warn, "JSON RunCommand") || !strings.Contains(warn, `{"find": "coll", "filter": {}, "limit": 20}`) {
+		t.Fatalf("unexpected RunCommand warning: %q", warn)
+	}
+
+	showRep, err := mc.Preflight(context.Background(), "show collections", driver.PreflightOpts{})
+	if err != nil {
+		t.Fatalf("Preflight show collections: %v", err)
+	}
+	if showRep.Supported || len(showRep.Warnings) != 0 {
+		t.Fatalf("expected metadata command preflight Supported=false without warnings, got %+v", showRep)
 	}
 }

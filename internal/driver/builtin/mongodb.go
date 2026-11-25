@@ -300,15 +300,25 @@ func (c *mongoConn) ListDatabases(ctx context.Context) ([]string, error) {
 	return nil, err
 }
 
+const mongoBoundedLimitCap int64 = 1000
+
 func (c *mongoConn) Preflight(ctx context.Context, raw string, _ driver.PreflightOpts) (*types.PreflightReport, error) {
 	report := &types.PreflightReport{
 		Supported: true,
 		Executed:  false,
 		Format:    "mongo_queryPlanner",
 	}
-	cmdDoc, err := parseMongoCommandDoc(raw)
+	trimmed := strings.TrimSpace(raw)
+	lower := strings.ToLower(trimmed)
+	if lower == "show dbs" || lower == "show databases" || lower == "show collections" || lower == "show tables" {
+		report.Supported = false
+		report.PlanSummary = "metadata command (no explain needed)"
+		return report, nil
+	}
+	cmdDoc, err := parseMongoCommandDoc(trimmed)
 	if err != nil {
-		report.Warnings = append(report.Warnings, "Preflight requires JSON RunCommand format; static classification still enforced")
+		report.Supported = false
+		report.Warnings = append(report.Warnings, `Execution requires JSON RunCommand syntax (e.g. {"find": "coll", "filter": {}, "limit": 20}); non-JSON/mongosh syntax cannot be explained or executed (static classification only)`)
 		return report, nil
 	}
 	explainCmd := bson.D{{Key: "explain", Value: cmdDoc}, {Key: "verbosity", Value: "queryPlanner"}}
@@ -319,12 +329,230 @@ func (c *mongoConn) Preflight(ctx context.Context, raw string, _ driver.Prefligh
 	}
 	norm := normalizeBSON(res)
 	report.PlanRaw = norm
-	rawBytes, _ := json.Marshal(norm)
-	if strings.Contains(string(rawBytes), "COLLSCAN") {
-		report.FullScan = true
+	fullScan, boundedCollScan, topStage := inspectMongoExplain(norm)
+	report.FullScan = fullScan
+	switch {
+	case topStage != "" && !fullScan && boundedCollScan:
+		report.PlanSummary = fmt.Sprintf("queryPlanner top_stage=%s full_scan=false (bounded COLLSCAN <= %d)", topStage, mongoBoundedLimitCap)
+	case topStage != "":
+		report.PlanSummary = fmt.Sprintf("queryPlanner top_stage=%s full_scan=%v", topStage, fullScan)
+	default:
+		report.PlanSummary = fmt.Sprintf("queryPlanner full_scan=%v", fullScan)
 	}
-	report.PlanSummary = fmt.Sprintf("queryPlanner full_scan=%v", report.FullScan)
 	return report, nil
+}
+
+func inspectMongoExplain(norm any) (fullScan bool, boundedCollScan bool, topStage string) {
+	doc, ok := norm.(map[string]any)
+	if !ok {
+		return false, false, ""
+	}
+
+	merge := func(fs, bc bool, ts string) {
+		if fs {
+			fullScan = true
+		}
+		if bc {
+			boundedCollScan = true
+		}
+		if topStage == "" && ts != "" {
+			topStage = ts
+		}
+	}
+
+	if qp, ok := doc["queryPlanner"].(map[string]any); ok {
+		if wp, ok := qp["winningPlan"].(map[string]any); ok {
+			fs, bc, ts := walkMongoPlanStage(wp, false, false)
+			merge(fs, bc, ts)
+		}
+	}
+
+	if stages, ok := doc["stages"].([]any); ok {
+		for _, item := range stages {
+			st, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if cur, ok := st["$cursor"].(map[string]any); ok {
+				fs, bc, ts := inspectMongoExplain(cur)
+				merge(fs, bc, ts)
+			}
+		}
+	}
+
+	switch shards := doc["shards"].(type) {
+	case map[string]any:
+		for _, sv := range shards {
+			fs, bc, ts := inspectMongoShardEntry(sv)
+			merge(fs, bc, ts)
+		}
+	case []any:
+		for _, sv := range shards {
+			fs, bc, ts := inspectMongoShardEntry(sv)
+			merge(fs, bc, ts)
+		}
+	}
+
+	return fullScan, boundedCollScan, topStage
+}
+
+func inspectMongoShardEntry(v any) (bool, bool, string) {
+	shard, ok := v.(map[string]any)
+	if !ok {
+		return false, false, ""
+	}
+	if wp, ok := shard["winningPlan"].(map[string]any); ok {
+		return walkMongoPlanStage(wp, false, false)
+	}
+	return inspectMongoExplain(shard)
+}
+
+func walkMongoPlanStage(node map[string]any, boundedLimit bool, blocked bool) (fullScan bool, boundedCollScan bool, topStage string) {
+	if node == nil {
+		return false, false, ""
+	}
+	stage := strings.ToUpper(strings.TrimSpace(mongoAsString(node["stage"])))
+	if stage == "" {
+		if qp, ok := node["queryPlan"].(map[string]any); ok {
+			return walkMongoPlanStage(qp, boundedLimit, blocked)
+		}
+	}
+	topStage = stage
+
+	childBlocked := blocked
+	childBounded := boundedLimit
+	if isMongoBlockingStage(stage) {
+		childBlocked = true
+		childBounded = false
+	}
+	if stage == "SKIP" {
+		if skipAmt, ok := mongoAsInt64(node["skipAmount"]); !ok || skipAmt > mongoBoundedLimitCap {
+			childBlocked = true
+			childBounded = false
+		}
+	}
+	if stage == "LIMIT" && !childBlocked {
+		amt, ok := mongoAsInt64(node["limitAmount"])
+		if !ok {
+			amt, ok = mongoAsInt64(node["limit"])
+		}
+		if ok && amt > 0 && amt <= mongoBoundedLimitCap {
+			childBounded = true
+		}
+	}
+
+	if stage == "COLLSCAN" {
+		if childBounded && !childBlocked {
+			return false, true, stage
+		}
+		return true, false, stage
+	}
+
+	merge := func(fs, bc bool, ts string) {
+		if fs {
+			fullScan = true
+		}
+		if bc {
+			boundedCollScan = true
+		}
+		if topStage == "" && ts != "" {
+			topStage = ts
+		}
+	}
+
+	for _, key := range []string{"inputStage", "queryPlan", "outerStage", "innerStage", "thenStage", "elseStage"} {
+		if child, ok := node[key].(map[string]any); ok {
+			fs, bc, ts := walkMongoPlanStage(child, childBounded, childBlocked)
+			merge(fs, bc, ts)
+		}
+	}
+	if children, ok := node["inputStages"].([]any); ok {
+		for _, ch := range children {
+			if child, ok := ch.(map[string]any); ok {
+				fs, bc, ts := walkMongoPlanStage(child, childBounded, childBlocked)
+				merge(fs, bc, ts)
+			}
+		}
+	}
+
+	walkShard := func(sv any) {
+		shard, ok := sv.(map[string]any)
+		if !ok {
+			return
+		}
+		if wp, ok := shard["winningPlan"].(map[string]any); ok {
+			fs, bc, ts := walkMongoPlanStage(wp, childBounded, childBlocked)
+			merge(fs, bc, ts)
+			return
+		}
+		if qp, ok := shard["queryPlanner"].(map[string]any); ok {
+			if wp, ok := qp["winningPlan"].(map[string]any); ok {
+				fs, bc, ts := walkMongoPlanStage(wp, childBounded, childBlocked)
+				merge(fs, bc, ts)
+				return
+			}
+		}
+		fs, bc, ts := walkMongoPlanStage(shard, childBounded, childBlocked)
+		merge(fs, bc, ts)
+	}
+	switch shards := node["shards"].(type) {
+	case []any:
+		for _, sv := range shards {
+			walkShard(sv)
+		}
+	case map[string]any:
+		for _, sv := range shards {
+			walkShard(sv)
+		}
+	}
+
+	return fullScan, boundedCollScan, topStage
+}
+
+func isMongoBlockingStage(stage string) bool {
+	switch stage {
+	case "SORT", "SORT_DEFAULT", "SORT_KEY_GENERATOR", "SHARD_MERGE_SORT", "GROUP", "COUNT", "SPOOL", "FACET", "SET_WINDOW_FIELDS":
+		return true
+	default:
+		return strings.Contains(stage, "GROUP")
+	}
+}
+
+func mongoAsString(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func mongoAsInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int32:
+		return int64(n), true
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case uint32:
+		return int64(n), true
+	case uint64:
+		if n <= math.MaxInt64 {
+			return int64(n), true
+		}
+		return 0, false
+	case float64:
+		return int64(n), true
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i, true
+		}
+		if f, err := n.Float64(); err == nil {
+			return int64(f), true
+		}
+	case string:
+		if i, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 func (c *mongoConn) Execute(ctx context.Context, raw string, opts driver.ExecOpts) (*types.ExecResult, error) {
