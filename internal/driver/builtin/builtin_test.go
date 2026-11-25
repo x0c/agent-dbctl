@@ -142,6 +142,18 @@ func TestPostgresMultiVersionConfigAndPlans(t *testing.T) {
 		t.Fatalf("expected Parallel Seq Scan FullScan=true EstimatedRows=42000, got %+v", report)
 	}
 
+	// Catalog-only Seq Scan (pg_catalog / pg_class) must not trigger false-positive FullScan.
+	catReport := &types.PreflightReport{}
+	walkPGPlan(map[string]any{
+		"Node Type":     "Seq Scan",
+		"Schema":        "pg_catalog",
+		"Relation Name": "pg_class",
+		"Plan Rows":     float64(90),
+	}, catReport)
+	if catReport.FullScan {
+		t.Fatalf("expected pg_catalog Seq Scan not to flag FullScan, got %+v", catReport)
+	}
+
 	// Fallback text EXPLAIN parsing.
 	textReport := &types.PreflightReport{}
 	parsePGTextPlan([]string{"Seq Scan on orders  (cost=0.00..25.00 rows=1234 width=32)"}, textReport)

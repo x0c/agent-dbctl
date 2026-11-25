@@ -147,3 +147,20 @@ func ValidateRegularFile(path string) error {
 	}
 	return nil
 }
+
+// ExpandHomePath expands a leading "~" or "~/" to the current user's home directory.
+func ExpandHomePath(p string) string {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return trimmed
+	}
+	if strings.HasPrefix(trimmed, "~/") || strings.HasPrefix(trimmed, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, trimmed[2:])
+		}
+	}
+	return trimmed
+}

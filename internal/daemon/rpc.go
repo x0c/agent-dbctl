@@ -90,10 +90,7 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 				writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			results := make([]types.PingResult, 0, len(items))
-			for _, d := range items {
-				results = append(results, svc.PingTarget(r.Context(), d))
-			}
+			results := svc.PingTargets(r.Context(), items)
 			writeJSONResp(w, http.StatusOK, map[string]any{"results": results})
 			return
 		}

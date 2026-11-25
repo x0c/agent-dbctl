@@ -190,10 +190,10 @@ func Evaluate(
 		EffectivePolicy: eff,
 	}
 
-	if cls.IsReadOnly && (tgt.ROCredentialID != "" || tgt.RWCredentialID == "") {
+	if cls.IsReadOnly {
 		eval.CredentialMode = types.AccessReadOnly
 		eval.PreferReplica = true
-	} else if !cls.IsReadOnly && tgt.RWCredentialID == "" && tgt.ROCredentialID != "" {
+	} else if tgt.RWCredentialID == "" && tgt.ROCredentialID != "" {
 		eval.CredentialMode = types.AccessReadOnly
 	}
 

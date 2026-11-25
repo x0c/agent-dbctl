@@ -92,4 +92,12 @@ func TestMonotonicInheritanceAndEvaluation(t *testing.T) {
 	if evDev.Decision != types.DecisionAllow {
 		t.Fatalf("expected dev YOLO allow, got %+v", evDev)
 	}
+
+	// Single RW-only target must still enforce AccessReadOnly on read-only queries.
+	singleCredTgt := tgt
+	singleCredTgt.ROCredentialID = ""
+	evSingleRO := policy.Evaluate(singleCredTgt, eff, types.Classification{RiskLevel: types.RiskSafeRead, IsReadOnly: true, StatementCount: 1}, nil)
+	if evSingleRO.CredentialMode != types.AccessReadOnly || !evSingleRO.PreferReplica {
+		t.Fatalf("expected AccessReadOnly even when only RWCredentialID is set, got %+v", evSingleRO)
+	}
 }

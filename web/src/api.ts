@@ -374,6 +374,7 @@ export const api = {
   deleteTarget: (id: string) =>
     request<{ deleted: boolean }>(`/api/v1/targets/${id}`, { method: 'DELETE' }),
   testTarget: (id: string) => request<PingResult>(`/api/v1/targets/${id}/test`, { method: 'POST', body: '{}' }),
+  testAllTargets: () => request<{ results: PingResult[] }>('/api/v1/targets/test-all', { method: 'POST', body: '{}' }),
 
   exportTopologyYAML: async () => {
     const resp = await fetch('/api/v1/topology?format=yaml', { credentials: 'same-origin' })

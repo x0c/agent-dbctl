@@ -383,6 +383,31 @@ func (s *Service) PingTarget(ctx context.Context, detail types.TargetDetail) typ
 	return res
 }
 
+// PingTargets probes multiple targets concurrently while preserving input order.
+func (s *Service) PingTargets(ctx context.Context, details []types.TargetDetail) []types.PingResult {
+	results := make([]types.PingResult, len(details))
+	if len(details) == 0 {
+		return results
+	}
+	workers := 8
+	if len(details) < workers {
+		workers = len(details)
+	}
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for i, d := range details {
+		wg.Add(1)
+		go func(idx int, detail types.TargetDetail) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[idx] = s.PingTarget(ctx, detail)
+		}(i, d)
+	}
+	wg.Wait()
+	return results
+}
+
 // PingInstance tests an instance directly and discovers databases on it.
 func (s *Service) PingInstance(ctx context.Context, instanceID, credID, dbName string) (types.PingResult, error) {
 	inst, err := s.store.GetInstance(ctx, instanceID)
@@ -485,6 +510,16 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 
 	// 2. Remote Read-Only Preflight (non-mutating EXPLAIN, zero approval popup).
 	var pf *types.PreflightReport
+	var preflightConn driver.Conn
+	var preflightOpenErr error
+	closePreflightConn := func() {
+		if preflightConn != nil {
+			_ = preflightConn.Close()
+			preflightConn = nil
+		}
+	}
+	defer closePreflightConn()
+
 	if req.Preflight || (eff.SafetyTier != types.SafetyTierYOLO && cls.IsReadOnly && cls.RiskLevel == types.RiskSafeRead) {
 		pfCtx, cancel := context.WithTimeout(ctx, time.Duration(minPositive(req.TimeoutSec, eff.ExecTimeoutSec))*time.Second)
 		conn, openErr := s.openDriverConn(pfCtx, detail, types.AccessReadOnly, true)
@@ -492,10 +527,16 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 			pf, _ = driver.ExecuteWithCancelGuard(pfCtx, conn, func(cctx context.Context) (*types.PreflightReport, error) {
 				return conn.Preflight(cctx, req.Query, driver.PreflightOpts{})
 			})
-			_ = conn.Close()
+			if req.Preflight {
+				_ = conn.Close()
+			} else {
+				preflightConn = conn
+			}
 		} else if req.Preflight {
 			cancel()
 			return types.ExecResponse{}, openErr
+		} else {
+			preflightOpenErr = openErr
 		}
 		cancel()
 	}
@@ -503,6 +544,9 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 	eval := policy.Evaluate(detail.Target, eff, cls, pf)
 	if req.Preflight {
 		return buildExecResponseSkeleton(detail, cls, pf, eval, types.OpPending), nil
+	}
+	if eval.Decision != types.DecisionAllow {
+		closePreflightConn()
 	}
 
 	globalCfg, _ := s.store.GetGlobalSecurityConfig(ctx)
@@ -603,7 +647,9 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 	}
 
 	// Direct allow (dev YOLO or prod safe read).
-	resp := s.runExecution(ctx, op, detail, eval, req.MaxRows, req.MaxBytes, req.TimeoutSec)
+	reusedConn := preflightConn
+	preflightConn = nil
+	resp := s.runExecutionWithConn(ctx, op, detail, eval, req.MaxRows, req.MaxBytes, req.TimeoutSec, reusedConn, preflightOpenErr)
 	return resp, nil
 }
 
@@ -653,6 +699,10 @@ func (s *Service) driveApprovalLifecycle(op types.Operation, detail types.Target
 }
 
 func (s *Service) runExecution(parentCtx context.Context, op types.Operation, detail types.TargetDetail, eval types.PolicyEvaluation, reqMaxRows int, reqMaxBytes int64, reqTimeout int) types.ExecResponse {
+	return s.runExecutionWithConn(parentCtx, op, detail, eval, reqMaxRows, reqMaxBytes, reqTimeout, nil, nil)
+}
+
+func (s *Service) runExecutionWithConn(parentCtx context.Context, op types.Operation, detail types.TargetDetail, eval types.PolicyEvaluation, reqMaxRows int, reqMaxBytes int64, reqTimeout int, conn driver.Conn, preErr error) types.ExecResponse {
 	eff := eval.EffectivePolicy
 	timeoutSec := minPositive(reqTimeout, eff.ExecTimeoutSec)
 	maxRows := minPositive(reqMaxRows, eff.MaxRows)
@@ -669,7 +719,10 @@ func (s *Service) runExecution(parentCtx context.Context, op types.Operation, de
 		s.clearOpCancel(op.ID)
 	}()
 
-	conn, err := s.openDriverConn(execCtx, detail, eval.CredentialMode, eval.PreferReplica)
+	err := preErr
+	if conn == nil && err == nil {
+		conn, err = s.openDriverConn(execCtx, detail, eval.CredentialMode, eval.PreferReplica)
+	}
 	if err != nil {
 		op.Status = types.OpFailed
 		op.ErrorCode = types.ErrCodeDriverError
@@ -773,6 +826,14 @@ func (s *Service) CancelOperation(ctx context.Context, opID, actor string) (type
 	}
 	if op.ApprovalID != "" && op.Status == types.OpWaitingApproval {
 		_, _ = s.approvals.Cancel(ctx, op.ApprovalID, actor)
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			cur, getErr := s.store.GetOperation(ctx, opID)
+			if getErr == nil && cur.Status != types.OpWaitingApproval {
+				break
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
 	}
 	s.opMu.Lock()
 	cancelFn := s.opActive[opID]

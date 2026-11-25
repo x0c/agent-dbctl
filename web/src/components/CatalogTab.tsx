@@ -7,6 +7,7 @@ import {
   FormDialog,
   FormField,
   Input,
+  LoadingButton,
   Notice,
   PageHeader,
   Panel,
@@ -20,6 +21,7 @@ import {
   SheetContent,
   SheetHeader,
   SheetTitle,
+  StatusDot,
   Switch,
   Tabs,
   TabsContent,
@@ -37,6 +39,7 @@ import {
   type EnvironmentRecord,
   type InstanceRecord,
   type NetworkProfileRecord,
+  type PingResult,
   type SystemRecord,
   type TargetDetail,
   type TargetRecord,
@@ -47,15 +50,29 @@ type SubTab = 'targets' | 'systems' | 'instances' | 'networks' | 'credentials' |
 
 const ALL_SYSTEMS = '__all__'
 
+const DEFAULT_ENGINE_PORTS: Record<string, number> = {
+  postgres: 5432,
+  mysql: 3306,
+  mongodb: 27017,
+  redis: 6379,
+  sqlite: 0,
+}
+
 export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCatalog; onRefreshBootstrap: () => Promise<void> }) {
   const [subTab, setSubTab] = useState<SubTab>('targets')
   const [systemFilter, setSystemFilter] = useState<string>(ALL_SYSTEMS)
+  const [searchQuery, setSearchQuery] = useState<string>('')
   const [systems, setSystems] = useState<SystemRecord[]>([])
   const [envs, setEnvs] = useState<EnvironmentRecord[]>([])
   const [networks, setNetworks] = useState<NetworkProfileRecord[]>([])
   const [credentials, setCredentials] = useState<CredentialProfileRecord[]>([])
   const [instances, setInstances] = useState<InstanceRecord[]>([])
   const [targets, setTargets] = useState<TargetDetail[]>([])
+  const [pingByTargetRef, setPingByTargetRef] = useState<Record<string, PingResult>>({})
+  const [testingAll, setTestingAll] = useState(false)
+  const [testingTargetId, setTestingTargetId] = useState<string | null>(null)
+  const [testingInstanceId, setTestingInstanceId] = useState<string | null>(null)
+  const [multilineSecret, setMultilineSecret] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -119,7 +136,13 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
     description: '',
   })
 
-  const [discoverSheet, setDiscoverSheet] = useState<{ instance: InstanceRecord; databases: string[] } | null>(null)
+  const [discoverSheet, setDiscoverSheet] = useState<{
+    instance: InstanceRecord
+    credentialId: string
+    databases: string[]
+    loading: boolean
+    error: string | null
+  } | null>(null)
   const [topologyText, setTopologyText] = useState('')
 
   const loadAll = async () => {
@@ -152,13 +175,76 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
   }, [])
 
   const filteredTargets = useMemo(() => {
-    if (systemFilter === ALL_SYSTEMS) return targets
-    return targets.filter(
-      (d) =>
-        d.target.owner_system_id === systemFilter ||
-        (d.target.linked_system_ids ?? []).includes(systemFilter),
-    )
-  }, [targets, systemFilter])
+    const q = searchQuery.trim().toLowerCase()
+    return targets.filter((d) => {
+      if (
+        systemFilter !== ALL_SYSTEMS &&
+        d.target.owner_system_id !== systemFilter &&
+        !(d.target.linked_system_ids ?? []).includes(systemFilter)
+      ) {
+        return false
+      }
+      if (!q) return true
+      const hay = `${d.target.ref} ${d.target.alias ?? ''} ${d.target.database_name} ${d.instance?.host ?? ''} ${d.owner_system?.slug ?? ''}`.toLowerCase()
+      return hay.includes(q)
+    })
+  }, [targets, systemFilter, searchQuery])
+
+  const defaultTargetForInstance = (instId: string): TargetRecord | undefined =>
+    targets.find((t) => t.target.instance_id === instId && (t.target.ro_credential_id || t.target.rw_credential_id))?.target
+
+  const defaultCredForInstance = (instId: string): string => {
+    const t = defaultTargetForInstance(instId)
+    return t?.ro_credential_id || t?.rw_credential_id || ''
+  }
+
+  const runTestAll = async () => {
+    setTestingAll(true)
+    try {
+      const res = await api.testAllTargets()
+      const next: Record<string, PingResult> = {}
+      let okCount = 0
+      for (const r of res.results ?? []) {
+        next[r.target_ref] = r
+        if (r.reachable) okCount++
+      }
+      setPingByTargetRef((prev) => ({ ...prev, ...next }))
+      const total = (res.results ?? []).length
+      if (okCount === total) toast.success(`All ${total} targets reachable`)
+      else toast.info(`${okCount}/${total} targets reachable`)
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Batch test failed')
+    } finally {
+      setTestingAll(false)
+    }
+  }
+
+  const runDiscover = async (inst: InstanceRecord, credId: string) => {
+    const defTgt = targets.find((t) => t.target.instance_id === inst.id && (t.target.ro_credential_id === credId || t.target.rw_credential_id === credId))
+    const dbName = defTgt?.target.database_name || ''
+    setDiscoverSheet({ instance: inst, credentialId: credId, databases: [], loading: true, error: null })
+    try {
+      const res = await api.discoverInstance(inst.id, {
+        ...(credId ? { credential_id: credId } : {}),
+        ...(dbName ? { database_name: dbName } : {}),
+      })
+      setDiscoverSheet({
+        instance: inst,
+        credentialId: credId,
+        databases: res.databases ?? [],
+        loading: false,
+        error: null,
+      })
+    } catch (e) {
+      setDiscoverSheet({
+        instance: inst,
+        credentialId: credId,
+        databases: [],
+        loading: false,
+        error: e instanceof Error ? e.message : 'Discovery failed',
+      })
+    }
+  }
 
   const openCreate = () => {
     setFormError(null)
@@ -169,6 +255,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
     } else if (subTab === 'networks') {
       setNetForm({ id: '', name: '', mode: 'direct', proxy_url: '', bastion_host: '', bastion_port: 22, bastion_user: '', bastion_credential_id: '', ssh_strict_host_key: true, tls_mode: 'prefer' })
     } else if (subTab === 'credentials') {
+      setMultilineSecret(false)
       setCredForm({ id: '', name: '', kind: 'keychain', access_level: 'read_only', username: '', env_var_name: '', exec_command: '', secret_value: '' })
     } else if (subTab === 'instances') {
       setInstForm({ id: '', name: '', engine: 'postgres', host: '127.0.0.1', port: 5432, role: 'standalone', primary_instance_id: '', network_profile_id: '', tls_mode: 'prefer' })
@@ -236,7 +323,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       accessorKey: 'target.ref',
       header: 'Target',
       cell: ({ row }) => (
-        <div className="flex max-w-[320px] items-center gap-1.5" title={row.original.target.database_name}>
+        <div className="flex max-w-[250px] items-center gap-1.5" title={row.original.target.database_name}>
           <span className="truncate font-mono text-xs font-semibold">{row.original.target.ref}</span>
           {row.original.target.alias && (
             <Badge variant="outline" className="shrink-0 font-mono text-[11px]">{row.original.target.alias}</Badge>
@@ -248,7 +335,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       id: 'system',
       header: 'System',
       cell: ({ row }) => (
-        <span className="block max-w-[100px] truncate font-mono text-xs">
+        <span className="block max-w-[110px] truncate font-mono text-xs">
           {row.original.owner_system?.slug ?? row.original.target.owner_system_id}
           {(row.original.linked_systems?.length ?? 0) > 0 && ` (+${row.original.linked_systems?.length})`}
         </span>
@@ -266,26 +353,54 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
         row.original.instance ? <MetaBadge items={catalog.engines} code={row.original.instance.engine} /> : '—',
     },
     {
+      id: 'health',
+      header: 'Status',
+      cell: ({ row }) => {
+        const p = pingByTargetRef[row.original.target.ref]
+        if (!p) {
+          return <span className="font-mono text-xs text-muted-foreground">{row.original.target.status}</span>
+        }
+        return p.reachable ? (
+          <StatusDot tone="success">
+            <span className="font-mono text-xs" title={p.server_version || 'Reachable'}>
+              {p.latency_ms}ms
+            </span>
+          </StatusDot>
+        ) : (
+          <StatusDot tone="danger">
+            <span className="max-w-[110px] truncate font-mono text-xs text-red-700" title={p.error || 'Unreachable'}>
+              Unreachable
+            </span>
+          </StatusDot>
+        )
+      },
+    },
+    {
       id: 'actions',
       header: '',
       cell: ({ row }) => (
         <div className="flex justify-end gap-1.5">
-          <Button
+          <LoadingButton
             size="sm"
             variant="outline"
+            pending={testingTargetId === row.original.target.id}
             onClick={async () => {
+              setTestingTargetId(row.original.target.id)
               try {
                 const res = await api.testTarget(row.original.target.id)
+                setPingByTargetRef((prev) => ({ ...prev, [row.original.target.ref]: res }))
                 if (res.reachable) toast.success(`Reachable (${res.latency_ms}ms, v${res.server_version || '?'})`)
                 else toast.error(res.error || 'Unreachable')
               } catch (e) {
                 toast.error(e instanceof Error ? e.message : 'Ping failed')
+              } finally {
+                setTestingTargetId(null)
               }
             }}
           >
             <Wifi className="size-3.5" />
             Test
-          </Button>
+          </LoadingButton>
           <Button
             size="sm"
             variant="outline"
@@ -385,7 +500,11 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
     {
       accessorKey: 'name',
       header: 'Instance',
-      cell: ({ row }) => <span className="font-mono text-xs font-semibold">{row.original.name}</span>,
+      cell: ({ row }) => (
+        <span className="block max-w-[150px] truncate font-mono text-xs font-semibold" title={row.original.name}>
+          {row.original.name}
+        </span>
+      ),
     },
     {
       accessorKey: 'engine',
@@ -395,11 +514,18 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
     {
       id: 'endpoint',
       header: 'Endpoint',
-      cell: ({ row }) => (
-        <span className="font-mono text-xs text-muted-foreground">
-          {row.original.host}:{row.original.port || 'default'}
-        </span>
-      ),
+      cell: ({ row }) => {
+        const isSQLite = row.original.engine === 'sqlite'
+        const raw = isSQLite
+          ? row.original.host
+          : `${row.original.host}:${row.original.port || DEFAULT_ENGINE_PORTS[row.original.engine] || 'default'}`
+        const display = isSQLite ? raw.replace(/^\/Users\/[^/]+/, '~') : raw
+        return (
+          <span className="block max-w-[230px] truncate font-mono text-xs text-muted-foreground" title={raw}>
+            {display}
+          </span>
+        )
+      },
     },
     {
       accessorKey: 'role',
@@ -411,20 +537,34 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       header: '',
       cell: ({ row }) => (
         <div className="flex justify-end gap-1.5">
-          <Button
+          <LoadingButton
             size="sm"
             variant="outline"
+            pending={testingInstanceId === row.original.id}
             onClick={async () => {
+              setTestingInstanceId(row.original.id)
               try {
-                const res = await api.discoverInstance(row.original.id, {})
-                setDiscoverSheet({ instance: row.original, databases: res.databases ?? [] })
+                const credId = defaultCredForInstance(row.original.id)
+                const res = await api.testInstance(row.original.id, credId ? { credential_id: credId } : {})
+                if (res.reachable) toast.success(`Reachable (${res.latency_ms}ms, v${res.server_version || '?'})`)
+                else toast.error(res.error || 'Unreachable')
               } catch (e) {
-                toast.error(e instanceof Error ? e.message : 'Discovery failed')
+                toast.error(e instanceof Error ? e.message : 'Ping failed')
+              } finally {
+                setTestingInstanceId(null)
               }
             }}
           >
+            <Wifi className="size-3.5" />
+            Test
+          </LoadingButton>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void runDiscover(row.original, defaultCredForInstance(row.original.id))}
+          >
             <Search className="size-3.5" />
-            Discover DBs
+            Discover
           </Button>
           <Button
             size="sm"
@@ -483,7 +623,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       header: '',
       cell: ({ row }) => (
         <div className="flex justify-end gap-1.5">
-          <Button size="sm" variant="outline" onClick={() => { setFormError(null); setCredForm({ ...row.original, secret_value: '' }); setDialog('credentials') }}>Edit</Button>
+          <Button size="sm" variant="outline" onClick={() => { setFormError(null); setMultilineSecret(false); setCredForm({ ...row.original, secret_value: '' }); setDialog('credentials') }}>Edit</Button>
           <ConfirmAction trigger={<Button size="sm" variant="ghost">Delete</Button>} title={`Delete ${row.original.name}?`} confirmLabel="Delete" destructive onConfirm={async () => { await api.deleteCredential(row.original.id); await loadAll() }} />
         </div>
       ),
@@ -542,24 +682,6 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
 
       {error && <Notice tone="error">{error}</Notice>}
 
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="w-60">
-          <Select value={systemFilter} onValueChange={setSystemFilter}>
-            <SelectTrigger>
-              <SelectValue placeholder="Filter by system" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={ALL_SYSTEMS}>All Systems ({systems.length})</SelectItem>
-              {systems.map((s) => (
-                <SelectItem key={s.id} value={s.id}>
-                  {s.name} ({s.slug})
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-      </div>
-
       <Tabs value={subTab} onValueChange={(v) => setSubTab(v as SubTab)}>
         <TabsList>
           <TabsTrigger value="targets">Databases ({filteredTargets.length})</TabsTrigger>
@@ -571,6 +693,42 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
         </TabsList>
 
         <TabsContent value="targets">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="w-60">
+                <Input
+                  placeholder="Search ref, alias, database, host..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+              </div>
+              <div className="w-56">
+                <Select value={systemFilter} onValueChange={setSystemFilter}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Filter by system" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={ALL_SYSTEMS}>All Systems ({systems.length})</SelectItem>
+                    {systems.map((s) => (
+                      <SelectItem key={s.id} value={s.id}>
+                        {s.name} ({s.slug})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+            <LoadingButton
+              variant="outline"
+              size="sm"
+              pending={testingAll}
+              disabled={targets.length === 0}
+              onClick={() => void runTestAll()}
+            >
+              <Wifi className="size-3.5" />
+              Test All
+            </LoadingButton>
+          </div>
           <Panel flush>
             <DataTable columns={targetColumns} data={filteredTargets} emptyLabel="No database targets configured." />
           </Panel>
@@ -643,7 +801,22 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
         </FormField>
         <div className="grid grid-cols-2 gap-3">
           <FormField label="Engine">
-            <Select value={instForm.engine ?? 'postgres'} onValueChange={(v) => setInstForm((p) => ({ ...p, engine: v }))}>
+            <Select
+              value={instForm.engine ?? 'postgres'}
+              onValueChange={(v) =>
+                setInstForm((p) => {
+                  const prevDef = DEFAULT_ENGINE_PORTS[p.engine ?? 'postgres'] ?? 0
+                  const nextDef = DEFAULT_ENGINE_PORTS[v] ?? 0
+                  const keepCustomPort = p.port && p.port !== prevDef && v !== 'sqlite'
+                  return {
+                    ...p,
+                    engine: v,
+                    port: v === 'sqlite' ? 0 : keepCustomPort ? p.port : nextDef,
+                    host: v === 'sqlite' && p.host === '127.0.0.1' ? '' : p.host,
+                  }
+                })
+              }
+            >
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 {catalog.engines.map((e) => (
@@ -663,25 +836,51 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
             </Select>
           </FormField>
         </div>
-        <div className="grid grid-cols-[1fr_110px] gap-3">
-          <FormField label="Host (or SQLite file path)">
-            <Input value={instForm.host ?? ''} onChange={(e) => setInstForm((p) => ({ ...p, host: e.target.value }))} />
+        {instForm.engine === 'sqlite' ? (
+          <FormField label="SQLite File Path">
+            <Input
+              value={instForm.host ?? ''}
+              onChange={(e) => setInstForm((p) => ({ ...p, host: e.target.value, port: 0 }))}
+              placeholder="~/.config/app/data.db"
+            />
           </FormField>
-          <FormField label="Port">
-            <Input type="number" value={instForm.port ?? 0} onChange={(e) => setInstForm((p) => ({ ...p, port: Number(e.target.value) }))} />
-          </FormField>
-        </div>
-        <FormField label="Network Profile">
-          <Select value={instForm.network_profile_id || '__direct'} onValueChange={(v) => setInstForm((p) => ({ ...p, network_profile_id: v === '__direct' ? '' : v }))}>
-            <SelectTrigger><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__direct">Direct (default)</SelectItem>
-              {networks.map((n) => (
-                <SelectItem key={n.id} value={n.id}>{n.name} ({n.mode})</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </FormField>
+        ) : (
+          <>
+            <div className="grid grid-cols-[1fr_110px] gap-3">
+              <FormField label="Host">
+                <Input value={instForm.host ?? ''} onChange={(e) => setInstForm((p) => ({ ...p, host: e.target.value }))} />
+              </FormField>
+              <FormField label="Port">
+                <Input type="number" value={instForm.port ?? 0} onChange={(e) => setInstForm((p) => ({ ...p, port: Number(e.target.value) }))} />
+              </FormField>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <FormField label="Network Profile">
+                <Select value={instForm.network_profile_id || '__direct'} onValueChange={(v) => setInstForm((p) => ({ ...p, network_profile_id: v === '__direct' ? '' : v }))}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__direct">Direct (default)</SelectItem>
+                    {networks.map((n) => (
+                      <SelectItem key={n.id} value={n.id}>{n.name} ({n.mode})</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FormField>
+              <FormField label="TLS Mode">
+                <Select value={instForm.tls_mode || 'prefer'} onValueChange={(v) => setInstForm((p) => ({ ...p, tls_mode: v }))}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="prefer">prefer</SelectItem>
+                    <SelectItem value="disable">disable</SelectItem>
+                    <SelectItem value="require">require</SelectItem>
+                    <SelectItem value="verify-ca">verify-ca</SelectItem>
+                    <SelectItem value="verify-full">verify-full</SelectItem>
+                  </SelectContent>
+                </Select>
+              </FormField>
+            </div>
+          </>
+        )}
       </FormDialog>
 
       <FormDialog
@@ -802,11 +1001,11 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               <FormField label="Port"><Input type="number" value={netForm.bastion_port ?? 22} onChange={(e) => setNetForm((p) => ({ ...p, bastion_port: Number(e.target.value) }))} /></FormField>
             </div>
             <FormField label="Bastion User"><Input value={netForm.bastion_user ?? ''} onChange={(e) => setNetForm((p) => ({ ...p, bastion_user: e.target.value }))} /></FormField>
-            <FormField label="Bastion Credential">
+            <FormField label="Bastion Credential (uses SSH_AUTH_SOCK if None)">
               <Select value={netForm.bastion_credential_id || '__none'} onValueChange={(v) => setNetForm((p) => ({ ...p, bastion_credential_id: v === '__none' ? '' : v }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__none">None</SelectItem>
+                  <SelectItem value="__none">None (SSH Agent)</SelectItem>
                   {credentials.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
                 </SelectContent>
               </Select>
@@ -858,9 +1057,31 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
           <Input value={credForm.username ?? ''} onChange={(e) => setCredForm((p) => ({ ...p, username: e.target.value }))} />
         </FormField>
         {credForm.kind === 'keychain' && (
-          <FormField label="Secret / Password / Private Key (write-only)">
-            <Input type="password" value={credForm.secret_value ?? ''} onChange={(e) => setCredForm((p) => ({ ...p, secret_value: e.target.value }))} placeholder={credForm.id ? 'Leave blank to keep existing' : 'Stored securely in Keychain'} />
-          </FormField>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">Secret / Password / Private Key (write-only)</span>
+              <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+                <Switch checked={multilineSecret} onCheckedChange={setMultilineSecret} />
+                <span>Private Key (multiline)</span>
+              </label>
+            </div>
+            {multilineSecret ? (
+              <Textarea
+                rows={5}
+                className="font-mono text-xs"
+                value={credForm.secret_value ?? ''}
+                onChange={(e) => setCredForm((p) => ({ ...p, secret_value: e.target.value }))}
+                placeholder={credForm.id ? 'Leave blank to keep existing' : 'Paste SSH private key (PEM / OpenSSH)'}
+              />
+            ) : (
+              <Input
+                type="password"
+                value={credForm.secret_value ?? ''}
+                onChange={(e) => setCredForm((p) => ({ ...p, secret_value: e.target.value }))}
+                placeholder={credForm.id ? 'Leave blank to keep existing' : 'Stored securely in Keychain'}
+              />
+            )}
+          </div>
         )}
         {credForm.kind === 'env_ref' && (
           <FormField label="Environment Variable Name">
@@ -953,36 +1174,77 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
             <SheetTitle>Discovered Databases · {discoverSheet?.instance.name}</SheetTitle>
           </SheetHeader>
           <SheetBody>
-            <div className="space-y-2">
-              {(discoverSheet?.databases ?? []).map((dbName) => (
-                <div key={dbName} className="flex items-center justify-between rounded-md border border-border px-3 py-2">
-                  <span className="truncate font-mono text-xs">{dbName}</span>
-                  <Button
+            {discoverSheet && (
+              <div className="space-y-3">
+                <div className="flex items-end gap-2">
+                  <div className="flex-1">
+                    <FormField label="Credential">
+                      <Select
+                        value={discoverSheet.credentialId || '__none'}
+                        onValueChange={(v) => {
+                          const cid = v === '__none' ? '' : v
+                          void runDiscover(discoverSheet.instance, cid)
+                        }}
+                      >
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="__none">None</SelectItem>
+                          {credentials.map((c) => (
+                            <SelectItem key={c.id} value={c.id}>{c.name} ({c.access_level})</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </FormField>
+                  </div>
+                  <LoadingButton
                     size="sm"
                     variant="outline"
-                    onClick={() => {
-                      const inst = discoverSheet!.instance
-                      const defSys = systemFilter !== ALL_SYSTEMS ? systemFilter : (systems[0]?.id ?? '')
-                      const sysSlug = systems.find((s) => s.id === defSys)?.slug ?? 'system'
-                      setTargetForm({
-                        id: '',
-                        ref: `${sysSlug}/dev/${dbName.replace(/[^A-Za-z0-9_-]/g, '_')}`,
-                        alias: '',
-                        owner_system_id: defSys,
-                        environment_code: envs[0]?.code ?? 'dev',
-                        instance_id: inst.id,
-                        database_name: dbName,
-                        status: 'active',
-                      })
-                      setDiscoverSheet(null)
-                      setDialog('targets')
-                    }}
+                    pending={discoverSheet.loading}
+                    onClick={() => void runDiscover(discoverSheet.instance, discoverSheet.credentialId)}
                   >
-                    Attach
-                  </Button>
+                    <RefreshCw className="size-3.5" />
+                    Scan
+                  </LoadingButton>
                 </div>
-              ))}
-            </div>
+
+                {discoverSheet.error && <Notice tone="error">{discoverSheet.error}</Notice>}
+
+                <div className="space-y-2">
+                  {discoverSheet.databases.map((dbName) => (
+                    <div key={dbName} className="flex items-center justify-between rounded-md border border-border px-3 py-2">
+                      <span className="truncate font-mono text-xs">{dbName}</span>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          const inst = discoverSheet.instance
+                          const defSys = systemFilter !== ALL_SYSTEMS ? systemFilter : (systems[0]?.id ?? '')
+                          const sysSlug = systems.find((s) => s.id === defSys)?.slug ?? 'system'
+                          setTargetForm({
+                            id: '',
+                            ref: `${sysSlug}/dev/${dbName.replace(/[^A-Za-z0-9_-]/g, '_')}`,
+                            alias: '',
+                            owner_system_id: defSys,
+                            environment_code: envs[0]?.code ?? 'dev',
+                            instance_id: inst.id,
+                            database_name: dbName,
+                            ro_credential_id: discoverSheet.credentialId || '',
+                            status: 'active',
+                          })
+                          setDiscoverSheet(null)
+                          setDialog('targets')
+                        }}
+                      >
+                        Attach
+                      </Button>
+                    </div>
+                  ))}
+                  {!discoverSheet.loading && !discoverSheet.error && discoverSheet.databases.length === 0 && (
+                    <div className="py-6 text-center text-xs text-muted-foreground">No databases discovered.</div>
+                  )}
+                </div>
+              </div>
+            )}
           </SheetBody>
         </SheetContent>
       </Sheet>

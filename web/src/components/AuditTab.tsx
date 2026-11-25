@@ -104,7 +104,7 @@ export function AuditTab({ catalog }: { catalog: DisplayCatalog }) {
       accessorKey: 'target_ref',
       header: 'Target',
       cell: ({ row }) => (
-        <span className="block max-w-[210px] truncate font-mono text-xs font-semibold" title={row.original.target_ref}>
+        <span className="block max-w-[170px] truncate font-mono text-xs font-semibold" title={row.original.target_ref}>
           {row.original.target_ref}
         </span>
       ),
@@ -129,7 +129,7 @@ export function AuditTab({ catalog }: { catalog: DisplayCatalog }) {
       header: 'Query',
       cell: ({ row }) => (
         <span
-          className="block max-w-[220px] truncate font-mono text-xs text-muted-foreground"
+          className="block max-w-[170px] truncate font-mono text-xs text-muted-foreground"
           title={row.original.query_redacted}
         >
           {row.original.query_redacted}

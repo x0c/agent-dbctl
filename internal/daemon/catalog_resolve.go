@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/policy"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
@@ -340,7 +341,7 @@ func matchesWorkspace(cwd string, paths []string) bool {
 	}
 	cleanCWD := filepath.Clean(cwd)
 	for _, p := range paths {
-		p = strings.TrimSpace(p)
+		p = config.ExpandHomePath(p)
 		if p == "" {
 			continue
 		}

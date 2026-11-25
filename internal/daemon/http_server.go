@@ -311,6 +311,15 @@ func NewWebHandler(svc *Service) http.Handler {
 		}
 		writeHTTPErr(w, http.StatusNotFound, "target not found")
 	})
+	mux.HandleFunc("POST /api/v1/targets/test-all", func(w http.ResponseWriter, r *http.Request) {
+		details, err := svc.BuildTargetDetails(r.Context(), "")
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		results := svc.PingTargets(r.Context(), details)
+		writeJSONResp(w, http.StatusOK, map[string]any{"results": results})
+	})
 
 	// Topology Export / Import (YAML or JSON, secret-free)
 	mux.HandleFunc("GET /api/v1/topology", func(w http.ResponseWriter, r *http.Request) {

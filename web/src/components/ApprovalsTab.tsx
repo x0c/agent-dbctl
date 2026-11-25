@@ -247,7 +247,7 @@ export function ApprovalsTab({
                 <div>
                   <div className="text-muted-foreground">Workspace</div>
                   <div className="mt-0.5 truncate font-mono" title={selected.workspace_cwd}>
-                    {selected.workspace_cwd || '—'}
+                    {selected.workspace_cwd ? selected.workspace_cwd.replace(/^\/Users\/[^/]+/, '~') : '—'}
                   </div>
                 </div>
               </div>
@@ -271,7 +271,7 @@ export function ApprovalsTab({
                     ))}
                   </div>
                 </div>
-                <pre className="max-h-60 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all">
+                <pre className="max-h-40 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all">
                   {selected.query_text}
                 </pre>
               </div>
@@ -288,7 +288,7 @@ export function ApprovalsTab({
                     </span>
                   </div>
                   {selected.preflight.plan_summary && (
-                    <pre className="overflow-auto font-mono text-xs text-muted-foreground whitespace-pre-wrap">
+                    <pre className="max-h-28 overflow-auto font-mono text-xs text-muted-foreground whitespace-pre-wrap">
                       {selected.preflight.plan_summary}
                     </pre>
                   )}

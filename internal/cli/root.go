@@ -180,11 +180,35 @@ func Execute(version, commit string) int {
 				exitCode = ic.WriteSuccess(detail, types.Meta{})
 				return nil
 			}
-			_, _ = fmt.Fprintf(ic.Stdout, "Ref: %s (alias: %s)\nEnv: %s (%s)\nTimeout: %ds (%s)\nMaxRows: %d (%s)\n",
-				detail.Target.Ref, detail.Target.Alias, detail.Target.EnvironmentCode,
-				detail.EffectivePolicy.SafetyTier, detail.EffectivePolicy.ExecTimeoutSec,
-				detail.EffectivePolicy.Sources["exec_timeout_sec"], detail.EffectivePolicy.MaxRows,
-				detail.EffectivePolicy.Sources["max_rows"])
+			eng, endpoint, netLabel := "—", "—", "direct"
+			if detail.Instance != nil {
+				eng = detail.Instance.Engine
+				if eng == "sqlite" {
+					endpoint = detail.Instance.Host
+				} else {
+					endpoint = fmt.Sprintf("%s:%d", detail.Instance.Host, detail.Instance.Port)
+				}
+			}
+			if detail.NetworkProfile != nil {
+				netLabel = fmt.Sprintf("%s (%s)", detail.NetworkProfile.Name, detail.NetworkProfile.Mode)
+			}
+			roName, rwName := "—", "—"
+			if detail.ROCredential != nil {
+				roName = detail.ROCredential.Name
+			}
+			if detail.RWCredential != nil {
+				rwName = detail.RWCredential.Name
+			}
+			_, _ = fmt.Fprintf(ic.Stdout,
+				"Ref:       %s (alias: %s)\nStatus:    %s\nEnv:       %s (%s)\nEngine:    %s\nEndpoint:  %s\nDatabase:  %s\nNetwork:   %s\nCreds:     ro=%s, rw=%s\nTimeout:   %ds (%s)\nMaxRows:   %d (%s)\nMaxBytes:  %d (%s)\nExplain:   max_rows=%d (%s)\nMultiStmt: %v\n",
+				detail.Target.Ref, detail.Target.Alias, detail.Target.Status,
+				detail.Target.EnvironmentCode, detail.EffectivePolicy.SafetyTier,
+				eng, endpoint, detail.Target.DatabaseName, netLabel, roName, rwName,
+				detail.EffectivePolicy.ExecTimeoutSec, detail.EffectivePolicy.Sources["exec_timeout_sec"],
+				detail.EffectivePolicy.MaxRows, detail.EffectivePolicy.Sources["max_rows"],
+				detail.EffectivePolicy.MaxBytes, detail.EffectivePolicy.Sources["max_bytes"],
+				detail.EffectivePolicy.ExplainMaxRows, detail.EffectivePolicy.Sources["explain_max_rows"],
+				detail.EffectivePolicy.AllowMultiStatement)
 			return nil
 		},
 	}
@@ -1051,6 +1075,29 @@ func renderExecOutcome(ic IOContext, resp types.ExecResponse, outPath string, fo
 		if resp.Result.Truncated {
 			_, _ = fmt.Fprintf(ic.Stderr, "(truncated at %s: returned %d of %d fetched rows)\n", resp.Result.CutoffReason, resp.Result.ReturnedRows, resp.Result.FetchedRows)
 		}
+		return types.ExitSuccess
+	}
+
+	if resp.Result != nil && len(resp.Result.Documents) > 0 {
+		b, _ := json.MarshalIndent(resp.Result.Documents, "", "  ")
+		_, _ = fmt.Fprintln(ic.Stdout, string(b))
+		if resp.Result.Truncated {
+			_, _ = fmt.Fprintf(ic.Stderr, "(truncated at %s: returned %d of %d fetched docs)\n", resp.Result.CutoffReason, resp.Result.ReturnedRows, resp.Result.FetchedRows)
+		}
+		return types.ExitSuccess
+	}
+
+	if resp.Result != nil && resp.Result.Family == types.FamilyKV {
+		b, _ := json.MarshalIndent(resp.Result.KVResult, "", "  ")
+		_, _ = fmt.Fprintln(ic.Stdout, string(b))
+		if resp.Result.Truncated {
+			_, _ = fmt.Fprintf(ic.Stderr, "(truncated at %s: returned %d of %d fetched items)\n", resp.Result.CutoffReason, resp.Result.ReturnedRows, resp.Result.FetchedRows)
+		}
+		return types.ExitSuccess
+	}
+
+	if resp.Result != nil && resp.Result.AffectedRows != nil {
+		_, _ = fmt.Fprintf(ic.Stdout, "OK (%d row(s) affected, %dms)\n", *resp.Result.AffectedRows, resp.Result.LatencyMs)
 		return types.ExitSuccess
 	}
 

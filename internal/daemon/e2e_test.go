@@ -247,6 +247,57 @@ func TestE2EExecApprovalRejectTruncationAndSameOrigin(t *testing.T) {
 	if err != nil || !verify.Valid {
 		t.Fatalf("expected intact audit hash chain, got %+v err=%v", verify, err)
 	}
+
+	// Workspace tilde expansion & synchronous CancelOperation status.
+	home, err := os.UserHomeDir()
+	if err == nil {
+		subDir := filepath.Join(home, ".config")
+		tildeSys, err := svc.Store().UpsertSystem(ctx, "test", types.System{
+			Slug:           "tilde-sys",
+			Name:           "Tilde Sys",
+			WorkspacePaths: []string{"~/.config"},
+		})
+		if err != nil {
+			t.Fatalf("upsert tilde sys: %v", err)
+		}
+		_, err = svc.Store().UpsertTarget(ctx, "test", types.Target{
+			Ref:             "tilde-sys/dev/main",
+			OwnerSystemID:   tildeSys.ID,
+			EnvironmentCode: "dev",
+			InstanceID:      devInst.ID,
+			DatabaseName:    devDB,
+		})
+		if err != nil {
+			t.Fatalf("upsert tilde target: %v", err)
+		}
+		details, err := svc.BuildTargetDetails(ctx, subDir)
+		if err != nil {
+			t.Fatalf("build target details: %v", err)
+		}
+		matched := false
+		for _, d := range details {
+			if d.Target.Ref == "tilde-sys/dev/main" && d.WorkspaceMatch {
+				matched = true
+			}
+		}
+		if !matched {
+			t.Fatalf("expected ~/ workspace path to match %s", subDir)
+		}
+	}
+
+	cancelAsync, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: prodTgt.Alias,
+		Query:            "DELETE FROM items WHERE id = 999",
+		Reason:           "Test cancel status",
+		Wait:             false,
+	})
+	if err != nil || cancelAsync.Status != types.OpWaitingApproval {
+		t.Fatalf("expected waiting_approval, got %+v err=%v", cancelAsync, err)
+	}
+	cancelled, err := svc.CancelOperation(ctx, cancelAsync.OperationID, "tester")
+	if err != nil || cancelled.Status != types.OpCancelled {
+		t.Fatalf("expected immediate cancelled status, got %+v err=%v", cancelled, err)
+	}
 }
 
 func TestTier3ExternalGRPCPluginAndChecksumGuard(t *testing.T) {
