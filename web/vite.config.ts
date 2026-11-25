@@ -17,6 +17,29 @@ export default defineConfig({
     target: 'es2022',
     cssMinify: 'lightningcss',
     sourcemap: false,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: 'react-vendor',
+              test: /node_modules[/\\](?:react|react-dom|scheduler)[/\\]/,
+              priority: 30,
+            },
+            {
+              name: 'icons-vendor',
+              test: /node_modules[/\\]lucide-react[/\\]/,
+              priority: 20,
+            },
+            {
+              name: 'ui-vendor',
+              test: /node_modules[/\\]@x0c[/\\]/,
+              priority: 15,
+            },
+          ],
+        },
+      },
+    },
   },
   server: {
     port: 5176,
