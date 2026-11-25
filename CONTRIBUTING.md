@@ -22,7 +22,7 @@ Do not include credentials, private network addresses, or personal home-director
 
 ### Live Multi-Database Integration Tests
 
-To run `TestLiveMultiDatabaseEngines` against real database instances (PostgreSQL, MySQL, MongoDB, Redis, ClickHouse, SQL Server, Oracle, Elasticsearch) over your private test host, supply credentials strictly through environment variables:
+To run `TestLiveMultiDatabaseEngines` against real database instances (PostgreSQL, MySQL, MongoDB, Redis, ClickHouse, SQL Server, Oracle, Elasticsearch, openGauss, Dameng DM8, TDengine, Easysearch) over your private test host, supply credentials strictly through environment variables (`AGENT_DBCTL_TEST_TDENGINE_PASS` defaults to `taosdata`):
 
 ```sh
 AGENT_DBCTL_LIVE_TEST=1 \
