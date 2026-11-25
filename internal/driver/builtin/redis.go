@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +31,7 @@ func (d *RedisDriver) Metadata() types.DriverMetadata {
 		Family:       types.FamilyKV,
 		Tier:         "builtin",
 		Version:      "1.1.0",
-		Capabilities: []string{"ping", "list_databases", "preflight", "execute"},
+		Capabilities: []string{"ping", "list_databases", "schema", "preflight", "execute"},
 		Verified:     true,
 		Labels:       map[string]string{"en": "Redis", "zh": "Redis"},
 	}
@@ -385,6 +386,105 @@ func normalizeRedisValue(v any) any {
 	default:
 		return x
 	}
+}
+
+func (c *redisConn) ListTables(ctx context.Context, opts driver.SchemaListOpts) (*types.SchemaListResult, error) {
+	match := "*"
+	if s := strings.TrimSpace(opts.Search); s != "" {
+		if strings.ContainsAny(s, "*?[") {
+			match = s
+		} else {
+			match = "*" + s + "*"
+		}
+	}
+	keys, _, err := c.client.Scan(ctx, 0, match, 200).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	counts := map[string]int{}
+	for _, k := range keys {
+		p := driver.RedisKeyPrefix(k)
+		counts[p]++
+	}
+	prefixes := make([]string, 0, len(counts))
+	for p := range counts {
+		prefixes = append(prefixes, p)
+	}
+	sort.Strings(prefixes)
+
+	all := make([]types.SchemaObjectSummary, 0, len(prefixes))
+	for _, p := range prefixes {
+		all = append(all, types.SchemaObjectSummary{
+			Name:        p,
+			Type:        "key_prefix",
+			SampleCount: counts[p],
+		})
+	}
+	items, total, truncated := driver.FilterAndCapSchemaObjects(all, opts.Search, opts.Limit)
+	dialect := "redis"
+	if caps := c.Capabilities(); caps != nil && caps.Dialect != "" {
+		dialect = caps.Dialect
+	}
+	return &types.SchemaListResult{
+		Engine:        "redis",
+		Dialect:       dialect,
+		Database:      c.cfg.DatabaseName,
+		Items:         items,
+		TotalCount:    total,
+		ReturnedCount: len(items),
+		Truncated:     truncated,
+		Notes:         []string{fmt.Sprintf("Sampled %d key(s) via bounded single-pass SCAN (COUNT 200).", len(keys))},
+	}, nil
+}
+
+func (c *redisConn) DescribeTable(ctx context.Context, name string) (*types.TableSchema, error) {
+	pattern := strings.TrimSpace(name)
+	if pattern == "" {
+		return nil, fmt.Errorf("key or prefix pattern is required")
+	}
+	if !strings.ContainsAny(pattern, "*?[") {
+		pattern += "*"
+	}
+	keys, _, err := c.client.Scan(ctx, 0, pattern, 100).Result()
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(keys)
+	if len(keys) > 10 {
+		keys = keys[:10]
+	}
+	samples := make([]types.RedisKeySample, 0, len(keys))
+	for _, k := range keys {
+		kt, _ := c.client.Type(ctx, k).Result()
+		ttlDur, ttlErr := c.client.TTL(ctx, k).Result()
+		ttlSec := int64(-1)
+		if ttlErr == nil {
+			if ttlDur >= 0 {
+				ttlSec = int64(ttlDur.Seconds())
+			} else if ttlDur == -2*time.Second || ttlDur == -2 {
+				ttlSec = -2
+			}
+		}
+		samples = append(samples, types.RedisKeySample{
+			Key:  k,
+			Type: kt,
+			TTL:  ttlSec,
+		})
+	}
+	dialect := "redis"
+	if caps := c.Capabilities(); caps != nil && caps.Dialect != "" {
+		dialect = caps.Dialect
+	}
+	return &types.TableSchema{
+		Engine:     "redis",
+		Dialect:    dialect,
+		Database:   c.cfg.DatabaseName,
+		Name:       pattern,
+		ObjectType: "key_pattern",
+		KeySamples: samples,
+		Notes:      []string{"Bounded SCAN sample (up to 10 matching keys)."},
+	}, nil
 }
 
 func (c *redisConn) CancelAndDiscard() error {

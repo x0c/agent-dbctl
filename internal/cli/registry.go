@@ -99,7 +99,12 @@ func BuildDescribeSpecs(root *cobra.Command, filterPath string) []CommandSpec {
 				collectFlags(c.InheritedFlags())
 				var examples []string
 				if ex := c.Annotations[exampleAnnotationKey]; ex != "" {
-					examples = []string{ex}
+					for _, line := range strings.Split(ex, "\n") {
+						line = strings.TrimSpace(line)
+						if line != "" {
+							examples = append(examples, line)
+						}
+					}
 				}
 				specs = append(specs, CommandSpec{
 					Path:     p,

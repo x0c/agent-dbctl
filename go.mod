@@ -3,11 +3,14 @@ module github.com/x0c/agent-dbctl
 go 1.26.11
 
 require (
+	github.com/ClickHouse/clickhouse-go/v2 v2.51.0
 	github.com/go-sql-driver/mysql v1.10.2
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/go-plugin v1.8.0
 	github.com/jackc/pgx/v5 v5.13.0
+	github.com/microsoft/go-mssqldb v1.12.0
 	github.com/redis/go-redis/v9 v9.24.0
+	github.com/sijms/go-ora/v2 v2.9.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.1.0
 	go.mongodb.org/mongo-driver/v2 v2.10.1
@@ -22,9 +25,15 @@ require (
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
+	github.com/ClickHouse/ch-go v0.75.0 // indirect
+	github.com/andybalholm/brotli v1.2.7 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/fatih/color v1.13.0 // indirect
+	github.com/go-faster/city v1.0.1 // indirect
+	github.com/go-faster/errors v0.8.0 // indirect
+	github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9 // indirect
+	github.com/golang-sql/sqlexp v0.1.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
@@ -37,11 +46,17 @@ require (
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect
 	github.com/oklog/run v1.1.0 // indirect
+	github.com/paulmach/orb v0.14.0 // indirect
+	github.com/pierrec/lz4/v4 v4.1.33 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rogpeppe/go-internal v1.16.0 // indirect
+	github.com/segmentio/asm v1.2.1 // indirect
+	github.com/shopspring/decimal v1.6.0 // indirect
 	github.com/xdg-go/scram v1.4.0 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
+	go.opentelemetry.io/otel v1.47.0 // indirect
+	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	go.uber.org/atomic v1.12.0 // indirect
 	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect

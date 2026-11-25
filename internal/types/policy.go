@@ -32,6 +32,7 @@ type GlobalSecurityConfig struct {
 	BlockMultiStatementInProd bool   `json:"block_multi_statement_in_prod"`
 	DefaultApprovalProvider   string `json:"default_approval_provider"`
 	RedactAuditLiterals       bool   `json:"redact_audit_literals"`
+	RequireReasonForApproval  bool   `json:"require_reason_for_approval"`
 	UpdatedAtUTC              string `json:"updated_at_utc"`
 }
 

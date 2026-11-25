@@ -19,6 +19,7 @@ import (
 type Server struct {
 	svc        *Service
 	paths      config.Paths
+	lockFile   *os.File
 	webLn      net.Listener
 	rpcLn      net.Listener
 	webSrv     *http.Server
@@ -29,6 +30,20 @@ type Server struct {
 
 // StartServer binds loopback Web UI + session RPC socket/port and serves until stopped.
 func StartServer(ctx context.Context, paths config.Paths, version, commit, webPort string) (*Server, error) {
+	lockFile, err := AcquireFileLock(paths.DaemonLock, false)
+	if err != nil {
+		return nil, fmt.Errorf("daemon session %q is already running (lock %s): %w", paths.Session, paths.DaemonLock, err)
+	}
+	releaseOnErr := true
+	defer func() {
+		if releaseOnErr {
+			ReleaseFileLock(lockFile)
+		}
+	}()
+	_ = lockFile.Truncate(0)
+	_, _ = lockFile.Seek(0, 0)
+	_, _ = fmt.Fprintf(lockFile, "%d\n", os.Getpid())
+
 	svc, err := NewService(ctx, paths, version, commit)
 	if err != nil {
 		return nil, err
@@ -65,6 +80,7 @@ func StartServer(ctx context.Context, paths config.Paths, version, commit, webPo
 	srv := &Server{
 		svc:        svc,
 		paths:      paths,
+		lockFile:   lockFile,
 		webLn:      webLn,
 		rpcLn:      rpcLn,
 		shutdownCh: make(chan struct{}),
@@ -96,6 +112,7 @@ func StartServer(ctx context.Context, paths config.Paths, version, commit, webPo
 		return nil, err
 	}
 
+	releaseOnErr = false
 	return srv, nil
 }
 
@@ -147,13 +164,21 @@ func (s *Server) Run(ctx context.Context) error {
 		runErr = e
 	}
 
-	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	s.svc.CancelBackground()
+	shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_ = s.rpcSrv.Shutdown(shutCtx)
-	_ = s.webSrv.Shutdown(shutCtx)
+	if err := s.rpcSrv.Shutdown(shutCtx); err != nil {
+		_ = s.rpcSrv.Close()
+	}
+	if err := s.webSrv.Shutdown(shutCtx); err != nil {
+		_ = s.webSrv.Close()
+	}
 	wg.Wait()
-	_ = os.Remove(s.paths.SocketPath)
-	_ = os.Remove(s.paths.DaemonMeta)
+	if meta, err := ReadDaemonMeta(s.paths); err != nil || meta.PID == os.Getpid() {
+		_ = os.Remove(s.paths.SocketPath)
+		_ = os.Remove(s.paths.DaemonMeta)
+	}
 	s.svc.Shutdown()
+	ReleaseFileLock(s.lockFile)
 	return runErr
 }

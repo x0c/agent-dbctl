@@ -31,7 +31,7 @@ import {
   toast,
 } from '@x0c/ui'
 import { Download, FolderGit2, Plus, RefreshCw, Search, Upload, Wifi } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   api,
   type CredentialProfileRecord,
@@ -44,9 +44,12 @@ import {
   type TargetDetail,
   type TargetRecord,
 } from '../api'
+import { resolveDisplayItem } from '../lib/catalog'
+import { useI18n } from '../lib/i18n'
 import { MetaBadge } from './MetaBadge'
 
-type SubTab = 'targets' | 'systems' | 'instances' | 'networks' | 'credentials' | 'environments'
+export type CatalogSubTab = 'targets' | 'systems' | 'instances' | 'networks' | 'credentials' | 'environments'
+type SubTab = CatalogSubTab
 
 const ALL_SYSTEMS = '__all__'
 
@@ -55,11 +58,27 @@ const DEFAULT_ENGINE_PORTS: Record<string, number> = {
   mysql: 3306,
   mongodb: 27017,
   redis: 6379,
+  clickhouse: 9000,
+  mssql: 1433,
+  oracle: 1521,
+  elasticsearch: 9200,
   sqlite: 0,
 }
 
-export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCatalog; onRefreshBootstrap: () => Promise<void> }) {
-  const [subTab, setSubTab] = useState<SubTab>('targets')
+export function CatalogTab({
+  catalog,
+  onRefreshBootstrap,
+  initialSubTab = 'targets',
+  deepLinkCredential = null,
+}: {
+  catalog: DisplayCatalog
+  onRefreshBootstrap: () => Promise<void>
+  initialSubTab?: CatalogSubTab
+  deepLinkCredential?: string | null
+}) {
+  const { locale, t } = useI18n()
+  const [subTab, setSubTab] = useState<SubTab>(deepLinkCredential ? 'credentials' : initialSubTab)
+  const handledDeepLinkRef = useRef<string | null>(null)
   const [systemFilter, setSystemFilter] = useState<string>(ALL_SYSTEMS)
   const [searchQuery, setSearchQuery] = useState<string>('')
   const [systems, setSystems] = useState<SystemRecord[]>([])
@@ -164,7 +183,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       setInstances(iRes.items ?? [])
       setTargets(tRes.items ?? [])
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load catalog')
+      setError(e instanceof Error ? e.message : t('catalog.loadFailed'))
     } finally {
       setLoading(false)
     }
@@ -173,6 +192,36 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
   useEffect(() => {
     void loadAll()
   }, [])
+
+  useEffect(() => {
+    const es = new EventSource('/api/v1/events')
+    const onCatalogUpdated = () => {
+      void loadAll()
+    }
+    es.addEventListener('catalog_updated', onCatalogUpdated)
+    return () => {
+      es.removeEventListener('catalog_updated', onCatalogUpdated)
+      es.close()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!deepLinkCredential || handledDeepLinkRef.current === deepLinkCredential) {
+      return
+    }
+    const found = credentials.find(
+      (c) => c.id === deepLinkCredential || c.name.toLowerCase() === deepLinkCredential.toLowerCase(),
+    )
+    if (!found) {
+      return
+    }
+    handledDeepLinkRef.current = deepLinkCredential
+    setSubTab('credentials')
+    setCredForm({ ...found, secret_value: '' })
+    setMultilineSecret(false)
+    setFormError(null)
+    setDialog('credentials')
+  }, [deepLinkCredential, credentials])
 
   const filteredTargets = useMemo(() => {
     const q = searchQuery.trim().toLowerCase()
@@ -210,10 +259,10 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       }
       setPingByTargetRef((prev) => ({ ...prev, ...next }))
       const total = (res.results ?? []).length
-      if (okCount === total) toast.success(`All ${total} targets reachable`)
-      else toast.info(`${okCount}/${total} targets reachable`)
+      if (okCount === total) toast.success(t('catalog.allReachable', { total }))
+      else toast.info(t('catalog.partialReachable', { ok: okCount, total }))
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Batch test failed')
+      toast.error(e instanceof Error ? e.message : t('catalog.batchTestFailed'))
     } finally {
       setTestingAll(false)
     }
@@ -241,7 +290,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
         credentialId: credId,
         databases: [],
         loading: false,
-        error: e instanceof Error ? e.message : 'Discovery failed',
+        error: e instanceof Error ? e.message : t('catalog.discoveryFailed'),
       })
     }
   }
@@ -309,10 +358,10 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
         await onRefreshBootstrap()
       }
       setDialog(null)
-      toast.success('Saved')
+      toast.success(t('common.saved'))
       await loadAll()
     } catch (e) {
-      setFormError(e instanceof Error ? e.message : 'Save failed')
+      setFormError(e instanceof Error ? e.message : t('common.saveFailed'))
     } finally {
       setSaving(false)
     }
@@ -321,7 +370,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
   const targetColumns: ColumnDef<TargetDetail, unknown>[] = [
     {
       accessorKey: 'target.ref',
-      header: 'Target',
+      header: t('catalog.col.target'),
       cell: ({ row }) => (
         <div className="flex max-w-[250px] items-center gap-1.5" title={row.original.target.database_name}>
           <span className="truncate font-mono text-xs font-semibold">{row.original.target.ref}</span>
@@ -333,7 +382,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
     },
     {
       id: 'system',
-      header: 'System',
+      header: t('catalog.col.system'),
       cell: ({ row }) => (
         <span className="block max-w-[110px] truncate font-mono text-xs">
           {row.original.owner_system?.slug ?? row.original.target.owner_system_id}
@@ -343,18 +392,18 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
     },
     {
       id: 'env',
-      header: 'Env',
+      header: t('catalog.col.env'),
       cell: ({ row }) => <MetaBadge items={catalog.environments} code={row.original.target.environment_code} />,
     },
     {
       id: 'engine',
-      header: 'Engine',
+      header: t('catalog.col.engine'),
       cell: ({ row }) =>
         row.original.instance ? <MetaBadge items={catalog.engines} code={row.original.instance.engine} /> : '—',
     },
     {
       id: 'health',
-      header: 'Status',
+      header: t('catalog.col.status'),
       cell: ({ row }) => {
         const p = pingByTargetRef[row.original.target.ref]
         if (!p) {
@@ -362,14 +411,14 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
         }
         return p.reachable ? (
           <StatusDot tone="success">
-            <span className="font-mono text-xs" title={p.server_version || 'Reachable'}>
+            <span className="font-mono text-xs" title={p.server_version || ''}>
               {p.latency_ms}ms
             </span>
           </StatusDot>
         ) : (
           <StatusDot tone="danger">
-            <span className="max-w-[110px] truncate font-mono text-xs text-red-700" title={p.error || 'Unreachable'}>
-              Unreachable
+            <span className="max-w-[110px] truncate font-mono text-xs text-red-700" title={p.error || t('catalog.unreachable')}>
+              {t('catalog.unreachable')}
             </span>
           </StatusDot>
         )
@@ -389,17 +438,20 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               try {
                 const res = await api.testTarget(row.original.target.id)
                 setPingByTargetRef((prev) => ({ ...prev, [row.original.target.ref]: res }))
-                if (res.reachable) toast.success(`Reachable (${res.latency_ms}ms, v${res.server_version || '?'})`)
-                else toast.error(res.error || 'Unreachable')
+                if (res.reachable) {
+                  toast.success(t('catalog.reachableToast', { ms: res.latency_ms, ver: res.server_version || '?' }))
+                } else {
+                  toast.error(res.error || t('catalog.unreachable'))
+                }
               } catch (e) {
-                toast.error(e instanceof Error ? e.message : 'Ping failed')
+                toast.error(e instanceof Error ? e.message : t('catalog.pingFailed'))
               } finally {
                 setTestingTargetId(null)
               }
             }}
           >
             <Wifi className="size-3.5" />
-            Test
+            {t('catalog.test')}
           </LoadingButton>
           <Button
             size="sm"
@@ -410,17 +462,18 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               setDialog('targets')
             }}
           >
-            Edit
+            {t('common.edit')}
           </Button>
           <ConfirmAction
-            trigger={<Button size="sm" variant="ghost">Delete</Button>}
-            title={`Delete ${row.original.target.ref}?`}
-            description="Historical audit logs remain intact."
-            confirmLabel="Delete"
+            trigger={<Button size="sm" variant="ghost">{t('common.delete')}</Button>}
+            title={t('catalog.deleteTargetTitle', { ref: row.original.target.ref })}
+            description={t('catalog.deleteTargetDesc')}
+            confirmLabel={t('common.delete')}
+            cancelLabel={t('common.cancel')}
             destructive
             onConfirm={async () => {
               await api.deleteTarget(row.original.target.id)
-              toast.success('Target deleted')
+              toast.success(t('catalog.targetDeleted'))
               await loadAll()
             }}
           />
@@ -432,18 +485,18 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
   const systemColumns: ColumnDef<SystemRecord, unknown>[] = [
     {
       accessorKey: 'slug',
-      header: 'Slug',
+      header: t('catalog.col.slug'),
       cell: ({ row }) => <span className="font-mono text-xs font-semibold">{row.original.slug}</span>,
     },
-    { accessorKey: 'name', header: 'Name' },
+    { accessorKey: 'name', header: t('catalog.col.name') },
     {
       accessorKey: 'owner',
-      header: 'Owner',
+      header: t('catalog.col.owner'),
       cell: ({ row }) => <span className="text-xs text-muted-foreground">{row.original.owner || '—'}</span>,
     },
     {
       id: 'workspaces',
-      header: 'Workspaces',
+      header: t('catalog.col.workspaces'),
       cell: ({ row }) => (
         <span className="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground">
           <FolderGit2 className="size-3.5" />
@@ -473,21 +526,22 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               setDialog('systems')
             }}
           >
-            Edit
+            {t('common.edit')}
           </Button>
           <ConfirmAction
-            trigger={<Button size="sm" variant="ghost">Delete</Button>}
-            title={`Delete system ${row.original.slug}?`}
-            description="Systems with attached targets cannot be deleted."
-            confirmLabel="Delete"
+            trigger={<Button size="sm" variant="ghost">{t('common.delete')}</Button>}
+            title={t('catalog.deleteSystemTitle', { slug: row.original.slug })}
+            description={t('catalog.deleteSystemDesc')}
+            confirmLabel={t('common.delete')}
+            cancelLabel={t('common.cancel')}
             destructive
             onConfirm={async () => {
               try {
                 await api.deleteSystem(row.original.id)
-                toast.success('System deleted')
+                toast.success(t('catalog.systemDeleted'))
                 await loadAll()
               } catch (e) {
-                toast.error(e instanceof Error ? e.message : 'Delete failed')
+                toast.error(e instanceof Error ? e.message : t('common.deleteFailed'))
               }
             }}
           />
@@ -499,7 +553,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
   const instanceColumns: ColumnDef<InstanceRecord, unknown>[] = [
     {
       accessorKey: 'name',
-      header: 'Instance',
+      header: t('catalog.col.instance'),
       cell: ({ row }) => (
         <span className="block max-w-[150px] truncate font-mono text-xs font-semibold" title={row.original.name}>
           {row.original.name}
@@ -508,12 +562,12 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
     },
     {
       accessorKey: 'engine',
-      header: 'Engine',
+      header: t('catalog.col.engine'),
       cell: ({ row }) => <MetaBadge items={catalog.engines} code={row.original.engine} />,
     },
     {
       id: 'endpoint',
-      header: 'Endpoint',
+      header: t('catalog.col.endpoint'),
       cell: ({ row }) => {
         const isSQLite = row.original.engine === 'sqlite'
         const raw = isSQLite
@@ -529,7 +583,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
     },
     {
       accessorKey: 'role',
-      header: 'Role',
+      header: t('catalog.col.role'),
       cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.role}</Badge>,
     },
     {
@@ -546,17 +600,20 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               try {
                 const credId = defaultCredForInstance(row.original.id)
                 const res = await api.testInstance(row.original.id, credId ? { credential_id: credId } : {})
-                if (res.reachable) toast.success(`Reachable (${res.latency_ms}ms, v${res.server_version || '?'})`)
-                else toast.error(res.error || 'Unreachable')
+                if (res.reachable) {
+                  toast.success(t('catalog.reachableToast', { ms: res.latency_ms, ver: res.server_version || '?' }))
+                } else {
+                  toast.error(res.error || t('catalog.unreachable'))
+                }
               } catch (e) {
-                toast.error(e instanceof Error ? e.message : 'Ping failed')
+                toast.error(e instanceof Error ? e.message : t('catalog.pingFailed'))
               } finally {
                 setTestingInstanceId(null)
               }
             }}
           >
             <Wifi className="size-3.5" />
-            Test
+            {t('catalog.test')}
           </LoadingButton>
           <Button
             size="sm"
@@ -564,7 +621,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
             onClick={() => void runDiscover(row.original, defaultCredForInstance(row.original.id))}
           >
             <Search className="size-3.5" />
-            Discover
+            {t('catalog.discover')}
           </Button>
           <Button
             size="sm"
@@ -575,20 +632,21 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               setDialog('instances')
             }}
           >
-            Edit
+            {t('common.edit')}
           </Button>
           <ConfirmAction
-            trigger={<Button size="sm" variant="ghost">Delete</Button>}
-            title={`Delete instance ${row.original.name}?`}
-            confirmLabel="Delete"
+            trigger={<Button size="sm" variant="ghost">{t('common.delete')}</Button>}
+            title={t('catalog.deleteInstanceTitle', { name: row.original.name })}
+            confirmLabel={t('common.delete')}
+            cancelLabel={t('common.cancel')}
             destructive
             onConfirm={async () => {
               try {
                 await api.deleteInstance(row.original.id)
-                toast.success('Instance deleted')
+                toast.success(t('catalog.instanceDeleted'))
                 await loadAll()
               } catch (e) {
-                toast.error(e instanceof Error ? e.message : 'Delete failed')
+                toast.error(e instanceof Error ? e.message : t('common.deleteFailed'))
               }
             }}
           />
@@ -598,48 +656,48 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
   ]
 
   const netColumns: ColumnDef<NetworkProfileRecord, unknown>[] = [
-    { accessorKey: 'name', header: 'Name', cell: ({ row }) => <span className="font-mono text-xs font-semibold">{row.original.name}</span> },
-    { accessorKey: 'mode', header: 'Mode', cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.mode}</Badge> },
-    { id: 'detail', header: 'Endpoint', cell: ({ row }) => <span className="font-mono text-xs text-muted-foreground">{row.original.bastion_host || row.original.proxy_url || 'Direct'}</span> },
+    { accessorKey: 'name', header: t('catalog.col.name'), cell: ({ row }) => <span className="font-mono text-xs font-semibold">{row.original.name}</span> },
+    { accessorKey: 'mode', header: t('catalog.col.mode'), cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.mode}</Badge> },
+    { id: 'detail', header: t('catalog.col.endpoint'), cell: ({ row }) => <span className="font-mono text-xs text-muted-foreground">{row.original.bastion_host || row.original.proxy_url || t('catalog.direct')}</span> },
     {
       id: 'actions',
       header: '',
       cell: ({ row }) => (
         <div className="flex justify-end gap-1.5">
-          <Button size="sm" variant="outline" onClick={() => { setFormError(null); setNetForm({ ...row.original }); setDialog('networks') }}>Edit</Button>
-          <ConfirmAction trigger={<Button size="sm" variant="ghost">Delete</Button>} title={`Delete ${row.original.name}?`} confirmLabel="Delete" destructive onConfirm={async () => { await api.deleteNetworkProfile(row.original.id); await loadAll() }} />
+          <Button size="sm" variant="outline" onClick={() => { setFormError(null); setNetForm({ ...row.original }); setDialog('networks') }}>{t('common.edit')}</Button>
+          <ConfirmAction trigger={<Button size="sm" variant="ghost">{t('common.delete')}</Button>} title={t('catalog.deleteItemTitle', { name: row.original.name })} confirmLabel={t('common.delete')} cancelLabel={t('common.cancel')} destructive onConfirm={async () => { await api.deleteNetworkProfile(row.original.id); await loadAll() }} />
         </div>
       ),
     },
   ]
 
   const credColumns: ColumnDef<CredentialProfileRecord, unknown>[] = [
-    { accessorKey: 'name', header: 'Name', cell: ({ row }) => <span className="font-mono text-xs font-semibold">{row.original.name}</span> },
-    { accessorKey: 'kind', header: 'Backend', cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.kind}</Badge> },
-    { accessorKey: 'access_level', header: 'Access', cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.access_level}</Badge> },
-    { id: 'state', header: 'Secret', cell: ({ row }) => <span className="text-xs">{row.original.has_secret ? 'Configured' : 'Missing'}</span> },
+    { accessorKey: 'name', header: t('catalog.col.name'), cell: ({ row }) => <span className="font-mono text-xs font-semibold">{row.original.name}</span> },
+    { accessorKey: 'kind', header: t('catalog.col.backend'), cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.kind}</Badge> },
+    { accessorKey: 'access_level', header: t('catalog.col.access'), cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.access_level}</Badge> },
+    { id: 'state', header: t('catalog.col.secret'), cell: ({ row }) => <span className="text-xs">{row.original.has_secret ? t('catalog.secretConfigured') : t('catalog.secretMissing')}</span> },
     {
       id: 'actions',
       header: '',
       cell: ({ row }) => (
         <div className="flex justify-end gap-1.5">
-          <Button size="sm" variant="outline" onClick={() => { setFormError(null); setMultilineSecret(false); setCredForm({ ...row.original, secret_value: '' }); setDialog('credentials') }}>Edit</Button>
-          <ConfirmAction trigger={<Button size="sm" variant="ghost">Delete</Button>} title={`Delete ${row.original.name}?`} confirmLabel="Delete" destructive onConfirm={async () => { await api.deleteCredential(row.original.id); await loadAll() }} />
+          <Button size="sm" variant="outline" onClick={() => { setFormError(null); setMultilineSecret(false); setCredForm({ ...row.original, secret_value: '' }); setDialog('credentials') }}>{t('common.edit')}</Button>
+          <ConfirmAction trigger={<Button size="sm" variant="ghost">{t('common.delete')}</Button>} title={t('catalog.deleteItemTitle', { name: row.original.name })} confirmLabel={t('common.delete')} cancelLabel={t('common.cancel')} destructive onConfirm={async () => { await api.deleteCredential(row.original.id); await loadAll() }} />
         </div>
       ),
     },
   ]
 
   const envColumns: ColumnDef<EnvironmentRecord, unknown>[] = [
-    { accessorKey: 'code', header: 'Code', cell: ({ row }) => <MetaBadge items={catalog.environments} code={row.original.code} /> },
-    { accessorKey: 'safety_tier', header: 'Safety Tier', cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.safety_tier}</Badge> },
-    { accessorKey: 'sort_order', header: 'Order' },
+    { accessorKey: 'code', header: t('catalog.col.code'), cell: ({ row }) => <MetaBadge items={catalog.environments} code={row.original.code} /> },
+    { accessorKey: 'safety_tier', header: t('catalog.col.safetyTier'), cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.safety_tier}</Badge> },
+    { accessorKey: 'sort_order', header: t('catalog.col.order') },
     {
       id: 'actions',
       header: '',
       cell: ({ row }) => (
         <div className="flex justify-end">
-          <Button size="sm" variant="outline" onClick={() => { setFormError(null); setEnvForm({ ...row.original }); setDialog('environments') }}>Edit</Button>
+          <Button size="sm" variant="outline" onClick={() => { setFormError(null); setEnvForm({ ...row.original }); setDialog('environments') }}>{t('common.edit')}</Button>
         </div>
       ),
     },
@@ -648,7 +706,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Systems & Databases"
+        title={t('catalog.title')}
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <Button
@@ -661,20 +719,20 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
                   setFormError(null)
                   setDialog('topology')
                 } catch (e) {
-                  toast.error(e instanceof Error ? e.message : 'Export failed')
+                  toast.error(e instanceof Error ? e.message : t('catalog.exportFailed'))
                 }
               }}
             >
               <Download className="size-3.5" />
-              Topology YAML
+              {t('catalog.topologyYaml')}
             </Button>
             <Button variant="outline" size="sm" onClick={() => void loadAll()} disabled={loading}>
               <RefreshCw className={loading ? 'animate-spin' : undefined} />
-              Refresh
+              {t('common.refresh')}
             </Button>
             <Button size="sm" onClick={openCreate}>
               <Plus />
-              New
+              {t('common.new')}
             </Button>
           </div>
         }
@@ -684,12 +742,12 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
 
       <Tabs value={subTab} onValueChange={(v) => setSubTab(v as SubTab)}>
         <TabsList>
-          <TabsTrigger value="targets">Databases ({filteredTargets.length})</TabsTrigger>
-          <TabsTrigger value="systems">Systems ({systems.length})</TabsTrigger>
-          <TabsTrigger value="instances">Instances ({instances.length})</TabsTrigger>
-          <TabsTrigger value="networks">Networks ({networks.length})</TabsTrigger>
-          <TabsTrigger value="credentials">Credentials ({credentials.length})</TabsTrigger>
-          <TabsTrigger value="environments">Environments ({envs.length})</TabsTrigger>
+          <TabsTrigger value="targets">{t('catalog.tabs.targets', { count: filteredTargets.length })}</TabsTrigger>
+          <TabsTrigger value="systems">{t('catalog.tabs.systems', { count: systems.length })}</TabsTrigger>
+          <TabsTrigger value="instances">{t('catalog.tabs.instances', { count: instances.length })}</TabsTrigger>
+          <TabsTrigger value="networks">{t('catalog.tabs.networks', { count: networks.length })}</TabsTrigger>
+          <TabsTrigger value="credentials">{t('catalog.tabs.credentials', { count: credentials.length })}</TabsTrigger>
+          <TabsTrigger value="environments">{t('catalog.tabs.environments', { count: envs.length })}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="targets">
@@ -697,7 +755,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
             <div className="flex flex-wrap items-center gap-2">
               <div className="w-60">
                 <Input
-                  placeholder="Search ref, alias, database, host..."
+                  placeholder={t('catalog.searchPlaceholder')}
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                 />
@@ -705,10 +763,10 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               <div className="w-56">
                 <Select value={systemFilter} onValueChange={setSystemFilter}>
                   <SelectTrigger>
-                    <SelectValue placeholder="Filter by system" />
+                    <SelectValue placeholder={t('catalog.filterSystem')} />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value={ALL_SYSTEMS}>All Systems ({systems.length})</SelectItem>
+                    <SelectItem value={ALL_SYSTEMS}>{t('catalog.allSystems', { count: systems.length })}</SelectItem>
                     {systems.map((s) => (
                       <SelectItem key={s.id} value={s.id}>
                         {s.name} ({s.slug})
@@ -726,36 +784,36 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               onClick={() => void runTestAll()}
             >
               <Wifi className="size-3.5" />
-              Test All
+              {t('catalog.testAll')}
             </LoadingButton>
           </div>
           <Panel flush>
-            <DataTable columns={targetColumns} data={filteredTargets} emptyLabel="No database targets configured." />
+            <DataTable columns={targetColumns} data={filteredTargets} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.targets')} />
           </Panel>
         </TabsContent>
         <TabsContent value="systems">
           <Panel flush>
-            <DataTable columns={systemColumns} data={systems} emptyLabel="No systems configured." />
+            <DataTable columns={systemColumns} data={systems} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.systems')} />
           </Panel>
         </TabsContent>
         <TabsContent value="instances">
           <Panel flush>
-            <DataTable columns={instanceColumns} data={instances} emptyLabel="No instances configured." />
+            <DataTable columns={instanceColumns} data={instances} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.instances')} />
           </Panel>
         </TabsContent>
         <TabsContent value="networks">
           <Panel flush>
-            <DataTable columns={netColumns} data={networks} emptyLabel="No network profiles configured." />
+            <DataTable columns={netColumns} data={networks} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.networks')} />
           </Panel>
         </TabsContent>
         <TabsContent value="credentials">
           <Panel flush>
-            <DataTable columns={credColumns} data={credentials} emptyLabel="No credentials configured." />
+            <DataTable columns={credColumns} data={credentials} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.credentials')} />
           </Panel>
         </TabsContent>
         <TabsContent value="environments">
           <Panel flush>
-            <DataTable columns={envColumns} data={envs} emptyLabel="No environments configured." />
+            <DataTable columns={envColumns} data={envs} searchPlaceholder={t('common.search')} emptyLabel={t('catalog.empty.environments')} />
           </Panel>
         </TabsContent>
       </Tabs>
@@ -763,27 +821,29 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       <FormDialog
         open={dialog === 'systems'}
         onOpenChange={(o) => !o && setDialog(null)}
-        title={sysForm.id ? 'Edit System' : 'New System'}
+        title={sysForm.id ? t('catalog.dialog.editSystem') : t('catalog.dialog.newSystem')}
+        submitLabel={t('common.save')}
+        cancelLabel={t('common.cancel')}
         error={formError}
         pending={saving}
         onSubmit={handleSave}
       >
-        <FormField label="Slug">
+        <FormField label={t('catalog.field.slug')}>
           <Input value={sysForm.slug} onChange={(e) => setSysForm((p) => ({ ...p, slug: e.target.value }))} placeholder="order-core" />
         </FormField>
-        <FormField label="Name">
+        <FormField label={t('catalog.field.name')}>
           <Input value={sysForm.name} onChange={(e) => setSysForm((p) => ({ ...p, name: e.target.value }))} placeholder="Order Core" />
         </FormField>
-        <FormField label="Owner">
+        <FormField label={t('catalog.field.owner')}>
           <Input value={sysForm.owner} onChange={(e) => setSysForm((p) => ({ ...p, owner: e.target.value }))} placeholder="commerce-platform" />
         </FormField>
-        <FormField label="Description">
+        <FormField label={t('catalog.field.description')}>
           <Input value={sysForm.description} onChange={(e) => setSysForm((p) => ({ ...p, description: e.target.value }))} />
         </FormField>
-        <FormField label="Tags (comma separated)">
+        <FormField label={t('catalog.field.tags')}>
           <Input value={sysForm.tags} onChange={(e) => setSysForm((p) => ({ ...p, tags: e.target.value }))} placeholder="core, payments" />
         </FormField>
-        <FormField label="Workspace Paths (one per line, auto-prioritizes matching cwd)">
+        <FormField label={t('catalog.field.workspaces')}>
           <Textarea rows={3} value={sysForm.workspace_paths} onChange={(e) => setSysForm((p) => ({ ...p, workspace_paths: e.target.value }))} placeholder="~/Codes/order-core" />
         </FormField>
       </FormDialog>
@@ -791,16 +851,18 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       <FormDialog
         open={dialog === 'instances'}
         onOpenChange={(o) => !o && setDialog(null)}
-        title={instForm.id ? 'Edit Instance' : 'New Instance'}
+        title={instForm.id ? t('catalog.dialog.editInstance') : t('catalog.dialog.newInstance')}
+        submitLabel={t('common.save')}
+        cancelLabel={t('common.cancel')}
         error={formError}
         pending={saving}
         onSubmit={handleSave}
       >
-        <FormField label="Name">
+        <FormField label={t('catalog.field.name')}>
           <Input value={instForm.name ?? ''} onChange={(e) => setInstForm((p) => ({ ...p, name: e.target.value }))} placeholder="rds-order-prod-01" />
         </FormField>
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Engine">
+          <FormField label={t('catalog.field.engine')}>
             <Select
               value={instForm.engine ?? 'postgres'}
               onValueChange={(v) =>
@@ -820,12 +882,14 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 {catalog.engines.map((e) => (
-                  <SelectItem key={e.code} value={e.code}>{e.code}</SelectItem>
+                  <SelectItem key={e.code} value={e.code}>
+                    {resolveDisplayItem(catalog.engines, e.code, locale).label}
+                  </SelectItem>
                 ))}
               </SelectContent>
             </Select>
           </FormField>
-          <FormField label="Role">
+          <FormField label={t('catalog.field.role')}>
             <Select
               value={instForm.role ?? 'standalone'}
               onValueChange={(v) =>
@@ -846,14 +910,14 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
           </FormField>
         </div>
         {instForm.role === 'replica' && (
-          <FormField label="Primary Instance">
+          <FormField label={t('catalog.field.primaryInstance')}>
             <Select
               value={instForm.primary_instance_id || '__none'}
               onValueChange={(v) => setInstForm((p) => ({ ...p, primary_instance_id: v === '__none' ? '' : v }))}
             >
-              <SelectTrigger><SelectValue placeholder="Select primary instance" /></SelectTrigger>
+              <SelectTrigger><SelectValue placeholder={t('catalog.field.selectPrimary')} /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="__none">None</SelectItem>
+                <SelectItem value="__none">{t('common.none')}</SelectItem>
                 {instances
                   .filter((candidate) => candidate.id !== instForm.id && candidate.role === 'primary')
                   .map((candidate) => (
@@ -866,7 +930,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
           </FormField>
         )}
         {instForm.engine === 'sqlite' ? (
-          <FormField label="SQLite File Path">
+          <FormField label={t('catalog.field.sqlitePath')}>
             <Input
               value={instForm.host ?? ''}
               onChange={(e) => setInstForm((p) => ({ ...p, host: e.target.value, port: 0 }))}
@@ -876,26 +940,26 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
         ) : (
           <>
             <div className="grid grid-cols-[1fr_110px] gap-3">
-              <FormField label="Host">
+              <FormField label={t('catalog.field.host')}>
                 <Input value={instForm.host ?? ''} onChange={(e) => setInstForm((p) => ({ ...p, host: e.target.value }))} />
               </FormField>
-              <FormField label="Port">
+              <FormField label={t('catalog.field.port')}>
                 <Input type="number" value={instForm.port ?? 0} onChange={(e) => setInstForm((p) => ({ ...p, port: Number(e.target.value) }))} />
               </FormField>
             </div>
             <div className="grid grid-cols-2 gap-3">
-              <FormField label="Network Profile">
+              <FormField label={t('catalog.field.networkProfile')}>
                 <Select value={instForm.network_profile_id || '__direct'} onValueChange={(v) => setInstForm((p) => ({ ...p, network_profile_id: v === '__direct' ? '' : v }))}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="__direct">Direct (default)</SelectItem>
+                    <SelectItem value="__direct">{t('catalog.field.directDefault')}</SelectItem>
                     {networks.map((n) => (
                       <SelectItem key={n.id} value={n.id}>{n.name} ({n.mode})</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               </FormField>
-              <FormField label="TLS Mode">
+              <FormField label={t('catalog.field.tlsMode')}>
                 <Select value={instForm.tls_mode || 'prefer'} onValueChange={(v) => setInstForm((p) => ({ ...p, tls_mode: v }))}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
@@ -915,21 +979,23 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       <FormDialog
         open={dialog === 'targets'}
         onOpenChange={(o) => !o && setDialog(null)}
-        title={targetForm.id ? 'Edit Database Target' : 'New Database Target'}
+        title={targetForm.id ? t('catalog.dialog.editTarget') : t('catalog.dialog.newTarget')}
+        submitLabel={t('common.save')}
+        cancelLabel={t('common.cancel')}
         error={formError}
         pending={saving}
         onSubmit={handleSave}
       >
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Ref">
+          <FormField label={t('catalog.field.ref')}>
             <Input value={targetForm.ref ?? ''} onChange={(e) => setTargetForm((p) => ({ ...p, ref: e.target.value }))} placeholder="order-core/prod/orders" />
           </FormField>
-          <FormField label="Alias">
+          <FormField label={t('catalog.field.alias')}>
             <Input value={targetForm.alias ?? ''} onChange={(e) => setTargetForm((p) => ({ ...p, alias: e.target.value }))} placeholder="prod-orders" />
           </FormField>
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Owner System">
+          <FormField label={t('catalog.field.ownerSystem')}>
             <Select
               value={targetForm.owner_system_id ?? ''}
               onValueChange={(v) =>
@@ -940,7 +1006,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
                 }))
               }
             >
-              <SelectTrigger><SelectValue placeholder="Select system" /></SelectTrigger>
+              <SelectTrigger><SelectValue placeholder={t('catalog.field.selectSystem')} /></SelectTrigger>
               <SelectContent>
                 {systems.map((s) => (
                   <SelectItem key={s.id} value={s.id}>{s.name} ({s.slug})</SelectItem>
@@ -948,19 +1014,21 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               </SelectContent>
             </Select>
           </FormField>
-          <FormField label="Environment">
+          <FormField label={t('catalog.field.environment')}>
             <Select value={targetForm.environment_code ?? 'dev'} onValueChange={(v) => setTargetForm((p) => ({ ...p, environment_code: v }))}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 {envs.map((e) => (
-                  <SelectItem key={e.code} value={e.code}>{e.code} ({e.safety_tier})</SelectItem>
+                  <SelectItem key={e.code} value={e.code}>
+                    {resolveDisplayItem(catalog.environments, e.code, locale).label} ({e.safety_tier})
+                  </SelectItem>
                 ))}
               </SelectContent>
             </Select>
           </FormField>
         </div>
         {systems.some((s) => s.id !== targetForm.owner_system_id) && (
-          <FormField label="Linked Systems (inherits strictest policy & workspace priority)">
+          <FormField label={t('catalog.field.linkedSystems')}>
             <div className="flex flex-wrap gap-1.5">
               {systems
                 .filter((s) => s.id !== targetForm.owner_system_id)
@@ -989,9 +1057,9 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
           </FormField>
         )}
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Instance">
+          <FormField label={t('catalog.field.instance')}>
             <Select value={targetForm.instance_id ?? ''} onValueChange={(v) => setTargetForm((p) => ({ ...p, instance_id: v }))}>
-              <SelectTrigger><SelectValue placeholder="Select instance" /></SelectTrigger>
+              <SelectTrigger><SelectValue placeholder={t('catalog.field.selectInstance')} /></SelectTrigger>
               <SelectContent>
                 {instances.map((i) => (
                   <SelectItem key={i.id} value={i.id}>{i.name} ({i.engine})</SelectItem>
@@ -999,27 +1067,27 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               </SelectContent>
             </Select>
           </FormField>
-          <FormField label="Database / Schema / DB Index">
+          <FormField label={t('catalog.field.databaseName')}>
             <Input value={targetForm.database_name ?? ''} onChange={(e) => setTargetForm((p) => ({ ...p, database_name: e.target.value }))} />
           </FormField>
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Read-Only Credential">
+          <FormField label={t('catalog.field.roCredential')}>
             <Select value={targetForm.ro_credential_id || '__none'} onValueChange={(v) => setTargetForm((p) => ({ ...p, ro_credential_id: v === '__none' ? '' : v }))}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="__none">None</SelectItem>
+                <SelectItem value="__none">{t('common.none')}</SelectItem>
                 {credentials.map((c) => (
                   <SelectItem key={c.id} value={c.id}>{c.name} ({c.access_level})</SelectItem>
                 ))}
               </SelectContent>
             </Select>
           </FormField>
-          <FormField label="Read-Write Credential">
+          <FormField label={t('catalog.field.rwCredential')}>
             <Select value={targetForm.rw_credential_id || '__none'} onValueChange={(v) => setTargetForm((p) => ({ ...p, rw_credential_id: v === '__none' ? '' : v }))}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="__none">None</SelectItem>
+                <SelectItem value="__none">{t('common.none')}</SelectItem>
                 {credentials.map((c) => (
                   <SelectItem key={c.id} value={c.id}>{c.name} ({c.access_level})</SelectItem>
                 ))}
@@ -1027,13 +1095,13 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
             </Select>
           </FormField>
         </div>
-        <FormField label="Status">
+        <FormField label={t('catalog.field.status')}>
           <Select value={targetForm.status ?? 'active'} onValueChange={(v) => setTargetForm((p) => ({ ...p, status: v as TargetRecord['status'] }))}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="active">active</SelectItem>
-              <SelectItem value="maintenance">maintenance</SelectItem>
-              <SelectItem value="disabled">disabled</SelectItem>
+              <SelectItem value="active">{t('catalog.status.active')}</SelectItem>
+              <SelectItem value="maintenance">{t('catalog.status.maintenance')}</SelectItem>
+              <SelectItem value="disabled">{t('catalog.status.disabled')}</SelectItem>
             </SelectContent>
           </Select>
         </FormField>
@@ -1042,15 +1110,17 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       <FormDialog
         open={dialog === 'networks'}
         onOpenChange={(o) => !o && setDialog(null)}
-        title={netForm.id ? 'Edit Network Profile' : 'New Network Profile'}
+        title={netForm.id ? t('catalog.dialog.editNetwork') : t('catalog.dialog.newNetwork')}
+        submitLabel={t('common.save')}
+        cancelLabel={t('common.cancel')}
         error={formError}
         pending={saving}
         onSubmit={handleSave}
       >
-        <FormField label="Name">
+        <FormField label={t('catalog.field.name')}>
           <Input value={netForm.name ?? ''} onChange={(e) => setNetForm((p) => ({ ...p, name: e.target.value }))} />
         </FormField>
-        <FormField label="Mode">
+        <FormField label={t('catalog.field.mode')}>
           <Select value={netForm.mode ?? 'direct'} onValueChange={(v) => setNetForm((p) => ({ ...p, mode: v as NetworkProfileRecord['mode'] }))}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
@@ -1064,43 +1134,45 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
         {netForm.mode === 'ssh_tunnel' && (
           <>
             <div className="grid grid-cols-[1fr_100px] gap-3">
-              <FormField label="Bastion Host"><Input value={netForm.bastion_host ?? ''} onChange={(e) => setNetForm((p) => ({ ...p, bastion_host: e.target.value }))} /></FormField>
-              <FormField label="Port"><Input type="number" value={netForm.bastion_port ?? 22} onChange={(e) => setNetForm((p) => ({ ...p, bastion_port: Number(e.target.value) }))} /></FormField>
+              <FormField label={t('catalog.field.bastionHost')}><Input value={netForm.bastion_host ?? ''} onChange={(e) => setNetForm((p) => ({ ...p, bastion_host: e.target.value }))} /></FormField>
+              <FormField label={t('catalog.field.port')}><Input type="number" value={netForm.bastion_port ?? 22} onChange={(e) => setNetForm((p) => ({ ...p, bastion_port: Number(e.target.value) }))} /></FormField>
             </div>
-            <FormField label="Bastion User"><Input value={netForm.bastion_user ?? ''} onChange={(e) => setNetForm((p) => ({ ...p, bastion_user: e.target.value }))} /></FormField>
-            <FormField label="Bastion Credential (uses SSH_AUTH_SOCK if None)">
+            <FormField label={t('catalog.field.bastionUser')}><Input value={netForm.bastion_user ?? ''} onChange={(e) => setNetForm((p) => ({ ...p, bastion_user: e.target.value }))} /></FormField>
+            <FormField label={t('catalog.field.bastionCred')}>
               <Select value={netForm.bastion_credential_id || '__none'} onValueChange={(v) => setNetForm((p) => ({ ...p, bastion_credential_id: v === '__none' ? '' : v }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__none">None (SSH Agent)</SelectItem>
+                  <SelectItem value="__none">{t('catalog.field.noneSshAgent')}</SelectItem>
                   {credentials.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
                 </SelectContent>
               </Select>
             </FormField>
             <div className="flex items-center justify-between">
-              <span className="text-sm">Strict SSH known_hosts check</span>
+              <span className="text-sm">{t('catalog.field.strictHostKey')}</span>
               <Switch checked={Boolean(netForm.ssh_strict_host_key)} onCheckedChange={(c) => setNetForm((p) => ({ ...p, ssh_strict_host_key: c }))} />
             </div>
           </>
         )}
         {(netForm.mode === 'socks5' || netForm.mode === 'http_proxy') && (
-          <FormField label="Proxy URL"><Input value={netForm.proxy_url ?? ''} onChange={(e) => setNetForm((p) => ({ ...p, proxy_url: e.target.value }))} placeholder="socks5://127.0.0.1:1080" /></FormField>
+          <FormField label={t('catalog.field.proxyUrl')}><Input value={netForm.proxy_url ?? ''} onChange={(e) => setNetForm((p) => ({ ...p, proxy_url: e.target.value }))} placeholder="socks5://127.0.0.1:1080" /></FormField>
         )}
       </FormDialog>
 
       <FormDialog
         open={dialog === 'credentials'}
         onOpenChange={(o) => !o && setDialog(null)}
-        title={credForm.id ? 'Edit Credential' : 'New Credential'}
+        title={credForm.id ? t('catalog.dialog.editCredential') : t('catalog.dialog.newCredential')}
+        submitLabel={t('common.save')}
+        cancelLabel={t('common.cancel')}
         error={formError}
         pending={saving}
         onSubmit={handleSave}
       >
-        <FormField label="Name">
+        <FormField label={t('catalog.field.name')}>
           <Input value={credForm.name ?? ''} onChange={(e) => setCredForm((p) => ({ ...p, name: e.target.value }))} />
         </FormField>
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Kind">
+          <FormField label={t('catalog.field.kind')}>
             <Select value={credForm.kind ?? 'keychain'} onValueChange={(v) => setCredForm((p) => ({ ...p, kind: v as CredentialProfileRecord['kind'] }))}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -1110,7 +1182,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
               </SelectContent>
             </Select>
           </FormField>
-          <FormField label="Access Level">
+          <FormField label={t('catalog.field.accessLevel')}>
             <Select value={credForm.access_level ?? 'read_only'} onValueChange={(v) => setCredForm((p) => ({ ...p, access_level: v as CredentialProfileRecord['access_level'] }))}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -1120,16 +1192,16 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
             </Select>
           </FormField>
         </div>
-        <FormField label="Username">
+        <FormField label={t('catalog.field.username')}>
           <Input value={credForm.username ?? ''} onChange={(e) => setCredForm((p) => ({ ...p, username: e.target.value }))} />
         </FormField>
         {credForm.kind === 'keychain' && (
           <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">Secret / Password / Private Key (write-only)</span>
+              <span className="text-xs font-medium text-muted-foreground">{t('catalog.field.secretHeader')}</span>
               <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
                 <Switch checked={multilineSecret} onCheckedChange={setMultilineSecret} />
-                <span>Private Key (multiline)</span>
+                <span>{t('catalog.field.multilineKey')}</span>
               </label>
             </div>
             {multilineSecret ? (
@@ -1138,25 +1210,34 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
                 className="font-mono text-xs"
                 value={credForm.secret_value ?? ''}
                 onChange={(e) => setCredForm((p) => ({ ...p, secret_value: e.target.value }))}
-                placeholder={credForm.id ? 'Leave blank to keep existing' : 'Paste SSH private key (PEM / OpenSSH)'}
+                placeholder={
+                  credForm.id && credForm.has_secret
+                    ? t('catalog.field.secretKeep')
+                    : t('catalog.field.secretKeyPlaceholder')
+                }
               />
             ) : (
               <Input
                 type="password"
+                autoFocus={Boolean(credForm.id && !credForm.has_secret)}
                 value={credForm.secret_value ?? ''}
                 onChange={(e) => setCredForm((p) => ({ ...p, secret_value: e.target.value }))}
-                placeholder={credForm.id ? 'Leave blank to keep existing' : 'Stored securely in Keychain'}
+                placeholder={
+                  credForm.id && credForm.has_secret
+                    ? t('catalog.field.secretKeep')
+                    : t('catalog.field.secretPwdPlaceholder')
+                }
               />
             )}
           </div>
         )}
         {credForm.kind === 'env_ref' && (
-          <FormField label="Environment Variable Name">
+          <FormField label={t('catalog.field.envVarName')}>
             <Input value={credForm.env_var_name ?? ''} onChange={(e) => setCredForm((p) => ({ ...p, env_var_name: e.target.value }))} placeholder="PROD_DB_PASSWORD" />
           </FormField>
         )}
         {credForm.kind === 'exec_provider' && (
-          <FormField label="Command (executed directly without shell)">
+          <FormField label={t('catalog.field.execCmd')}>
             <Input value={credForm.exec_command ?? ''} onChange={(e) => setCredForm((p) => ({ ...p, exec_command: e.target.value }))} placeholder="op read op://prod/db/password" />
           </FormField>
         )}
@@ -1165,37 +1246,39 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       <FormDialog
         open={dialog === 'environments'}
         onOpenChange={(o) => !o && setDialog(null)}
-        title="Environment Configuration"
+        title={t('catalog.dialog.envConfig')}
+        submitLabel={t('common.save')}
+        cancelLabel={t('common.cancel')}
         error={formError}
         pending={saving}
         onSubmit={handleSave}
       >
-        <FormField label="Code">
+        <FormField label={t('catalog.field.code')}>
           <Input value={envForm.code} onChange={(e) => setEnvForm((p) => ({ ...p, code: e.target.value }))} placeholder="uat" />
         </FormField>
-        <FormField label="Safety Tier">
+        <FormField label={t('catalog.field.safetyTier')}>
           <Select value={envForm.safety_tier} onValueChange={(v) => setEnvForm((p) => ({ ...p, safety_tier: v as EnvironmentRecord['safety_tier'] }))}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="yolo">yolo (Dev free execution)</SelectItem>
-              <SelectItem value="guarded">guarded (Staging confirmation on writes/high-cost)</SelectItem>
-              <SelectItem value="strict">strict (Production protection + preflight)</SelectItem>
+              <SelectItem value="yolo">{t('catalog.tier.yolo')}</SelectItem>
+              <SelectItem value="guarded">{t('catalog.tier.guarded')}</SelectItem>
+              <SelectItem value="strict">{t('catalog.tier.strict')}</SelectItem>
             </SelectContent>
           </Select>
         </FormField>
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Label (EN)">
+          <FormField label={t('catalog.field.labelEn')}>
             <Input value={envForm.labels.en ?? ''} onChange={(e) => setEnvForm((p) => ({ ...p, labels: { ...p.labels, en: e.target.value } }))} />
           </FormField>
-          <FormField label="Label (ZH)">
+          <FormField label={t('catalog.field.labelZh')}>
             <Input value={envForm.labels.zh ?? ''} onChange={(e) => setEnvForm((p) => ({ ...p, labels: { ...p.labels, zh: e.target.value } }))} />
           </FormField>
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Color (#RRGGBB)">
+          <FormField label={t('catalog.field.color')}>
             <Input value={envForm.color} onChange={(e) => setEnvForm((p) => ({ ...p, color: e.target.value }))} />
           </FormField>
-          <FormField label="Sort Order">
+          <FormField label={t('catalog.field.sortOrder')}>
             <Input type="number" value={envForm.sort_order} onChange={(e) => setEnvForm((p) => ({ ...p, sort_order: Number(e.target.value) }))} />
           </FormField>
         </div>
@@ -1204,14 +1287,15 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       <FormDialog
         open={dialog === 'topology'}
         onOpenChange={(o) => !o && setDialog(null)}
-        title="Sanitized Topology Export / Import"
-        submitLabel="Import YAML/JSON"
+        title={t('catalog.dialog.topologyTitle')}
+        submitLabel={t('catalog.dialog.topologySubmit')}
+        cancelLabel={t('common.cancel')}
         error={formError}
         pending={saving}
         onSubmit={handleSave}
         maxWidthClassName="sm:max-w-[680px]"
       >
-        <FormField label="Topology YAML/JSON (secret-free)">
+        <FormField label={t('catalog.field.topologyText')}>
           <Textarea rows={14} className="font-mono text-xs" value={topologyText} onChange={(e) => setTopologyText(e.target.value)} />
         </FormField>
         <div className="flex justify-start">
@@ -1230,7 +1314,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
             }}
           >
             <Upload className="size-3.5" />
-            Download YAML
+            {t('catalog.downloadYaml')}
           </Button>
         </div>
       </FormDialog>
@@ -1238,14 +1322,14 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
       <Sheet open={Boolean(discoverSheet)} onOpenChange={(o) => !o && setDiscoverSheet(null)}>
         <SheetContent>
           <SheetHeader>
-            <SheetTitle>Discovered Databases · {discoverSheet?.instance.name}</SheetTitle>
+            <SheetTitle>{t('catalog.discoverTitle', { name: discoverSheet?.instance.name ?? '' })}</SheetTitle>
           </SheetHeader>
           <SheetBody>
             {discoverSheet && (
               <div className="space-y-3">
                 <div className="flex items-end gap-2">
                   <div className="flex-1">
-                    <FormField label="Credential">
+                    <FormField label={t('catalog.field.credential')}>
                       <Select
                         value={discoverSheet.credentialId || '__none'}
                         onValueChange={(v) => {
@@ -1255,7 +1339,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
                       >
                         <SelectTrigger><SelectValue /></SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="__none">None</SelectItem>
+                          <SelectItem value="__none">{t('common.none')}</SelectItem>
                           {credentials.map((c) => (
                             <SelectItem key={c.id} value={c.id}>{c.name} ({c.access_level})</SelectItem>
                           ))}
@@ -1270,7 +1354,7 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
                     onClick={() => void runDiscover(discoverSheet.instance, discoverSheet.credentialId)}
                   >
                     <RefreshCw className="size-3.5" />
-                    Scan
+                    {t('catalog.scan')}
                   </LoadingButton>
                 </div>
 
@@ -1302,12 +1386,12 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
                           setDialog('targets')
                         }}
                       >
-                        Attach
+                        {t('catalog.attach')}
                       </Button>
                     </div>
                   ))}
                   {!discoverSheet.loading && !discoverSheet.error && discoverSheet.databases.length === 0 && (
-                    <div className="py-6 text-center text-xs text-muted-foreground">No databases discovered.</div>
+                    <div className="py-6 text-center text-xs text-muted-foreground">{t('catalog.noDiscovered')}</div>
                   )}
                 </div>
               </div>

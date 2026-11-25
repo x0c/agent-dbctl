@@ -34,7 +34,7 @@ func (d *PostgresDriver) Metadata() types.DriverMetadata {
 		Family:       types.FamilySQL,
 		Tier:         "builtin",
 		Version:      "1.1.0",
-		Capabilities: []string{"ping", "list_databases", "preflight", "execute"},
+		Capabilities: []string{"ping", "list_databases", "schema", "preflight", "execute"},
 		Verified:     true,
 		Labels:       map[string]string{"en": "PostgreSQL", "zh": "PostgreSQL"},
 	}
@@ -233,8 +233,8 @@ func (c *postgresConn) Preflight(ctx context.Context, raw string, _ driver.Prefl
 		Executed:  false,
 		Format:    "pg_json",
 	}
-	if !cls.IsReadOnly || cls.StatementCount != 1 {
-		report.Warnings = append(report.Warnings, "EXPLAIN skipped for non-read or multi-statement SQL")
+	if !driver.CanPreflightSQL(cls) {
+		report.Warnings = append(report.Warnings, "EXPLAIN skipped for DDL/admin/multi-statement SQL")
 		return report, nil
 	}
 
@@ -346,7 +346,7 @@ func parsePGTextPlan(lines []string, report *types.PreflightReport) {
 func (c *postgresConn) Execute(ctx context.Context, raw string, opts driver.ExecOpts) (*types.ExecResult, error) {
 	start := time.Now()
 	cls := classify.Classify("postgres", raw)
-	useQuery := (cls.IsReadOnly && cls.StatementCount == 1) || (cls.StatementCount == 1 && hasReturningClause(raw))
+	useQuery := cls.StatementCount == 1 && (cls.IsReadOnly || classify.HasReturningClause(raw))
 	if useQuery {
 		rows, err := c.conn.Query(ctx, raw)
 		if err != nil {
@@ -424,8 +424,168 @@ func (c *postgresConn) Execute(ctx context.Context, raw string, opts driver.Exec
 	}, nil
 }
 
-func hasReturningClause(raw string) bool {
-	return strings.Contains(strings.ToUpper(raw), " RETURNING ")
+func (c *postgresConn) ListTables(ctx context.Context, opts driver.SchemaListOpts) (*types.SchemaListResult, error) {
+	rows, err := c.conn.Query(ctx, `
+		SELECT table_schema, table_name, table_type
+		FROM information_schema.tables
+		WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+		ORDER BY (table_schema = current_schema()) DESC, table_schema, table_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var all []types.SchemaObjectSummary
+	for rows.Next() {
+		var sch, name, ttype string
+		if err := rows.Scan(&sch, &name, &ttype); err != nil {
+			return nil, err
+		}
+		objType := "table"
+		if strings.Contains(strings.ToUpper(ttype), "VIEW") {
+			objType = "view"
+		}
+		all = append(all, types.SchemaObjectSummary{
+			Schema: sch,
+			Name:   name,
+			Type:   objType,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	items, total, truncated := driver.FilterAndCapSchemaObjects(all, opts.Search, opts.Limit)
+	dialect := "postgres"
+	if caps := c.Capabilities(); caps != nil && caps.Dialect != "" {
+		dialect = caps.Dialect
+	}
+	return &types.SchemaListResult{
+		Engine:        "postgres",
+		Dialect:       dialect,
+		Database:      c.cfg.DatabaseName,
+		Items:         items,
+		TotalCount:    total,
+		ReturnedCount: len(items),
+		Truncated:     truncated,
+	}, nil
+}
+
+func (c *postgresConn) DescribeTable(ctx context.Context, name string) (*types.TableSchema, error) {
+	sch, tbl := driver.SplitQualifiedObject(name)
+	if tbl == "" {
+		return nil, fmt.Errorf("table name is required")
+	}
+	if sch == "" {
+		_ = c.conn.QueryRow(ctx, "SELECT current_schema()").Scan(&sch)
+		if sch == "" {
+			sch = "public"
+		}
+	}
+
+	pkSet := map[string]bool{}
+	pkRows, err := c.conn.Query(ctx, `
+		SELECT kcu.column_name
+		FROM information_schema.table_constraints tc
+		JOIN information_schema.key_column_usage kcu
+		  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+		WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 AND tc.table_name = $2`, sch, tbl)
+	if err == nil {
+		for pkRows.Next() {
+			var col string
+			if pkRows.Scan(&col) == nil {
+				pkSet[col] = true
+			}
+		}
+		pkRows.Close()
+	}
+
+	colRows, err := c.conn.Query(ctx, `
+		SELECT column_name, data_type, is_nullable, COALESCE(column_default, '')
+		FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = $2
+		ORDER BY ordinal_position`, sch, tbl)
+	if err != nil {
+		return nil, err
+	}
+	defer colRows.Close()
+
+	var cols []types.SchemaColumn
+	for colRows.Next() {
+		var cname, dtype, nullable, defVal string
+		if err := colRows.Scan(&cname, &dtype, &nullable, &defVal); err != nil {
+			return nil, err
+		}
+		cols = append(cols, types.SchemaColumn{
+			Name:       cname,
+			Type:       dtype,
+			Nullable:   strings.EqualFold(nullable, "YES"),
+			PrimaryKey: pkSet[cname],
+			Default:    defVal,
+		})
+	}
+	if err := colRows.Err(); err != nil {
+		return nil, err
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("table or view %s.%s not found", sch, tbl)
+	}
+
+	var fks []types.SchemaForeignKey
+	fkRows, err := c.conn.Query(ctx, `
+		SELECT kcu.column_name, ccu.table_name, ccu.column_name
+		FROM information_schema.table_constraints tc
+		JOIN information_schema.key_column_usage kcu
+		  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+		JOIN information_schema.constraint_column_usage ccu
+		  ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+		WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1 AND tc.table_name = $2`, sch, tbl)
+	if err == nil {
+		for fkRows.Next() {
+			var fk types.SchemaForeignKey
+			if fkRows.Scan(&fk.Column, &fk.ReferencedTable, &fk.ReferencedColumn) == nil {
+				fks = append(fks, fk)
+			}
+		}
+		fkRows.Close()
+	}
+
+	var idxs []types.SchemaIndex
+	idxRows, err := c.conn.Query(ctx, `
+		SELECT indexname, indexdef
+		FROM pg_indexes
+		WHERE schemaname = $1 AND tablename = $2
+		ORDER BY indexname`, sch, tbl)
+	if err == nil {
+		for idxRows.Next() {
+			var idxName, idxDef string
+			if idxRows.Scan(&idxName, &idxDef) == nil {
+				idxs = append(idxs, types.SchemaIndex{
+					Name:    idxName,
+					Columns: driver.ParsePGIndexColumns(idxDef),
+					Unique:  strings.Contains(strings.ToUpper(idxDef), "CREATE UNIQUE INDEX"),
+					Primary: strings.HasSuffix(strings.ToLower(idxName), "_pkey"),
+				})
+			}
+		}
+		idxRows.Close()
+	}
+
+	dialect := "postgres"
+	if caps := c.Capabilities(); caps != nil && caps.Dialect != "" {
+		dialect = caps.Dialect
+	}
+	return &types.TableSchema{
+		Engine:      "postgres",
+		Dialect:     dialect,
+		Database:    c.cfg.DatabaseName,
+		Schema:      sch,
+		Name:        tbl,
+		ObjectType:  "table",
+		Columns:     cols,
+		Indexes:     idxs,
+		ForeignKeys: fks,
+	}, nil
 }
 
 func normalizePGValue(v any, typeName string) any {

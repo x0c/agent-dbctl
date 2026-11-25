@@ -33,6 +33,8 @@ type Paths struct {
 	DBPath     string
 	SocketPath string
 	DaemonMeta string
+	DaemonLock string
+	StartLock  string
 	SecretFile string
 	Session    string
 }
@@ -101,6 +103,8 @@ func ResolvePaths(sessionOverride string) (Paths, error) {
 		DBPath:     filepath.Join(absRoot, "agent-dbctl.db"),
 		SocketPath: sockPath,
 		DaemonMeta: filepath.Join(runDir, session+".daemon.json"),
+		DaemonLock: filepath.Join(runDir, session+".lock"),
+		StartLock:  filepath.Join(runDir, session+".start.lock"),
 		SecretFile: filepath.Join(absRoot, "secrets.json"),
 		Session:    session,
 	}, nil

@@ -353,9 +353,11 @@ func ResolveEffectivePatternRulesWithSystems(
 func ruleAppliesToTarget(r types.RiskPatternRule, engine string, family types.EngineFamily) bool {
 	if len(r.Engines) > 0 {
 		matched := false
+		engLower := strings.ToLower(strings.TrimSpace(engine))
+		engCanon := classify.CanonicalEngine(engLower)
 		for _, e := range r.Engines {
 			el := strings.ToLower(strings.TrimSpace(e))
-			if el == "*" || el == "all" || el == strings.ToLower(engine) {
+			if el == "*" || el == "all" || el == engLower || (engCanon != "" && classify.CanonicalEngine(el) == engCanon) {
 				matched = true
 				break
 			}

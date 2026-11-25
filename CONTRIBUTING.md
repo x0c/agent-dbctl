@@ -20,7 +20,19 @@ govulncheck ./...
 
 Do not include credentials, private network addresses, or personal home-directory paths anywhere in source files, tests, or screenshots.
 
-> **macOS install note**: `make install-local` currently copies directly over `~/.local/bin/agent-dbctl`; on Apple Silicon macOS, stop a running daemon first or stage cleanly (`cp ... ~/.local/bin/agent-dbctl.tmp && chmod 755 ... && mv -f ... ~/.local/bin/agent-dbctl`) to avoid in-place Mach-O signature invalidation (`SIGKILL` / exit 137). Follow-up: switch `Makefile`'s `install-local` recipe to atomic replacement.
+### Live Multi-Database Integration Tests
+
+To run `TestLiveMultiDatabaseEngines` against real database instances (PostgreSQL, MySQL, MongoDB, Redis, ClickHouse, SQL Server, Oracle, Elasticsearch) over your private test host, supply credentials strictly through environment variables:
+
+```sh
+AGENT_DBCTL_LIVE_TEST=1 \
+AGENT_DBCTL_TEST_HOST=<test-host> \
+AGENT_DBCTL_TEST_RW_PASS='<rw-password>' \
+AGENT_DBCTL_TEST_RO_PASS='<ro-password>' \
+go test -v ./internal/daemon -run TestLiveMultiDatabaseEngines
+```
+
+> **macOS install note**: `make install-local` stages a temporary file and atomically replaces `~/.local/bin/agent-dbctl` (`mv -f`) to avoid in-place Mach-O signature invalidation (`SIGKILL` / exit 137) on Apple Silicon macOS.
 
 ## Local Release Packaging
 

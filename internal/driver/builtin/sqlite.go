@@ -30,6 +30,10 @@ func RegisterAll(reg *driver.Registry) {
 	reg.Register(&SQLiteDriver{})
 	reg.Register(&MongoDriver{})
 	reg.Register(&RedisDriver{})
+	reg.Register(&ClickHouseDriver{})
+	reg.Register(&MSSQLDriver{})
+	reg.Register(&OracleDriver{})
+	reg.Register(&ElasticsearchDriver{})
 }
 
 // SQLiteDriver executes verbatim SQL against SQLite files via pure-Go modernc.org/sqlite.
@@ -43,7 +47,7 @@ func (d *SQLiteDriver) Metadata() types.DriverMetadata {
 		Family:       types.FamilySQL,
 		Tier:         "builtin",
 		Version:      "1.1.0",
-		Capabilities: []string{"ping", "list_databases", "preflight", "execute"},
+		Capabilities: []string{"ping", "list_databases", "schema", "preflight", "execute"},
 		Verified:     true,
 		Labels:       map[string]string{"en": "SQLite", "zh": "SQLite"},
 	}
@@ -239,8 +243,8 @@ func (c *sqliteConn) Preflight(ctx context.Context, raw string, _ driver.Preflig
 		Executed:  false,
 		Format:    "sqlite_query_plan",
 	}
-	if !cls.IsReadOnly || cls.StatementCount != 1 {
-		report.Warnings = append(report.Warnings, "EXPLAIN QUERY PLAN skipped for non-read or multi-statement SQL")
+	if !driver.CanPreflightSQL(cls) {
+		report.Warnings = append(report.Warnings, "EXPLAIN QUERY PLAN skipped for DDL/admin/multi-statement SQL")
 		return report, nil
 	}
 	rows, err := c.db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+raw)
@@ -280,8 +284,8 @@ func isSQLiteCatalogScan(upperDetail string) bool {
 func (c *sqliteConn) Execute(ctx context.Context, raw string, opts driver.ExecOpts) (*types.ExecResult, error) {
 	start := time.Now()
 	cls := classify.Classify("sqlite", raw)
-	// Use QueryContext when single read statement; ExecContext otherwise (or multi-statement fallback).
-	if cls.IsReadOnly && cls.StatementCount == 1 {
+	// Use QueryContext for single-statement reads and DML ... RETURNING; ExecContext otherwise.
+	if cls.StatementCount == 1 && (cls.IsReadOnly || classify.HasReturningClause(raw)) {
 		rows, err := c.db.QueryContext(ctx, raw)
 		if err != nil {
 			return nil, err
@@ -308,6 +312,153 @@ func (c *sqliteConn) Execute(ctx context.Context, raw string, opts driver.ExecOp
 		Family:       types.FamilySQL,
 		AffectedRows: affPtr,
 		LatencyMs:    time.Since(start).Milliseconds(),
+	}, nil
+}
+
+func (c *sqliteConn) ListTables(ctx context.Context, opts driver.SchemaListOpts) (*types.SchemaListResult, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT name, type
+		FROM sqlite_master
+		WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
+		ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var all []types.SchemaObjectSummary
+	for rows.Next() {
+		var name, objType string
+		if err := rows.Scan(&name, &objType); err != nil {
+			return nil, err
+		}
+		all = append(all, types.SchemaObjectSummary{
+			Name: name,
+			Type: strings.ToLower(objType),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	items, total, truncated := driver.FilterAndCapSchemaObjects(all, opts.Search, opts.Limit)
+	return &types.SchemaListResult{
+		Engine:        "sqlite",
+		Dialect:       "sqlite",
+		Database:      c.cfg.DatabaseName,
+		Items:         items,
+		TotalCount:    total,
+		ReturnedCount: len(items),
+		Truncated:     truncated,
+	}, nil
+}
+
+func (c *sqliteConn) DescribeTable(ctx context.Context, name string) (*types.TableSchema, error) {
+	_, tbl := driver.SplitQualifiedObject(name)
+	if tbl == "" {
+		return nil, fmt.Errorf("table name is required")
+	}
+	var resolvedName, objType string
+	if err := c.db.QueryRowContext(ctx, `
+		SELECT name, type
+		FROM sqlite_master
+		WHERE type IN ('table', 'view') AND LOWER(name) = LOWER(?)
+		LIMIT 1`, tbl).Scan(&resolvedName, &objType); err != nil {
+		return nil, fmt.Errorf("table or view %q not found", tbl)
+	}
+	quoted := driver.QuoteSQLiteIdent(resolvedName)
+
+	colRows, err := c.db.QueryContext(ctx, "PRAGMA table_info("+quoted+")")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = colRows.Close() }()
+
+	var cols []types.SchemaColumn
+	for colRows.Next() {
+		var cid, notnull, pk int
+		var cname, ctype string
+		var dflt sql.NullString
+		if err := colRows.Scan(&cid, &cname, &ctype, &notnull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		cols = append(cols, types.SchemaColumn{
+			Name:       cname,
+			Type:       ctype,
+			Nullable:   notnull == 0 && pk == 0,
+			PrimaryKey: pk > 0,
+			Default:    dflt.String,
+		})
+	}
+	if err := colRows.Err(); err != nil {
+		return nil, err
+	}
+
+	var idxs []types.SchemaIndex
+	idxListRows, err := c.db.QueryContext(ctx, "PRAGMA index_list("+quoted+")")
+	if err == nil {
+		type rawIdx struct {
+			name   string
+			unique bool
+			origin string
+		}
+		var rawIdxs []rawIdx
+		for idxListRows.Next() {
+			var seq, unique, partial int
+			var idxName, origin string
+			if idxListRows.Scan(&seq, &idxName, &unique, &origin, &partial) == nil {
+				rawIdxs = append(rawIdxs, rawIdx{name: idxName, unique: unique == 1, origin: origin})
+			}
+		}
+		_ = idxListRows.Close()
+
+		for _, ri := range rawIdxs {
+			var idxCols []string
+			infoRows, infoErr := c.db.QueryContext(ctx, "PRAGMA index_info("+driver.QuoteSQLiteIdent(ri.name)+")")
+			if infoErr == nil {
+				for infoRows.Next() {
+					var seqno, cid int
+					var colName sql.NullString
+					if infoRows.Scan(&seqno, &cid, &colName) == nil && colName.Valid {
+						idxCols = append(idxCols, colName.String)
+					}
+				}
+				_ = infoRows.Close()
+			}
+			idxs = append(idxs, types.SchemaIndex{
+				Name:    ri.name,
+				Columns: idxCols,
+				Unique:  ri.unique,
+				Primary: ri.origin == "pk",
+			})
+		}
+	}
+
+	var fks []types.SchemaForeignKey
+	fkRows, err := c.db.QueryContext(ctx, "PRAGMA foreign_key_list("+quoted+")")
+	if err == nil {
+		for fkRows.Next() {
+			var id, seq int
+			var refTable, fromCol, toCol, onUpd, onDel, match string
+			if fkRows.Scan(&id, &seq, &refTable, &fromCol, &toCol, &onUpd, &onDel, &match) == nil {
+				fks = append(fks, types.SchemaForeignKey{
+					Column:           fromCol,
+					ReferencedTable:  refTable,
+					ReferencedColumn: toCol,
+				})
+			}
+		}
+		_ = fkRows.Close()
+	}
+
+	return &types.TableSchema{
+		Engine:      "sqlite",
+		Dialect:     "sqlite",
+		Database:    c.cfg.DatabaseName,
+		Name:        resolvedName,
+		ObjectType:  strings.ToLower(objType),
+		Columns:     cols,
+		Indexes:     idxs,
+		ForeignKeys: fks,
 	}, nil
 }
 

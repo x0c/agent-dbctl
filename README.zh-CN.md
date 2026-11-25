@@ -2,7 +2,7 @@
 
 # agent-dbctl
 
-为 Claude Code、Codex、Cursor 和 OpenCode 提供安全的 PostgreSQL、MySQL、SQLite、MongoDB 与 Redis 执行门禁。单个零 JVM 二进制集成 EXPLAIN 预检、分环境策略、本地 Web 人工审批以及防篡改哈希链审计日志。
+为 Claude Code、Codex、Cursor 和 OpenCode 提供安全的 PostgreSQL、MySQL、SQLite、ClickHouse、SQL Server、Oracle、MongoDB、Elasticsearch 与 Redis 执行门禁。单个零 JVM 二进制集成 EXPLAIN 预检、分环境策略、本地 Web 人工审批以及防篡改哈希链审计日志。
 
 > **100% 本地运行 · 零遥测 · 零 JVM · 系统钥匙串托管凭据 · SHA-256 哈希链审计**
 
@@ -49,9 +49,17 @@ make install-local
 
 ## 快速上手
 
-1. **打开本地 Web 控制台**（仅监听 `127.0.0.1`），录入业务系统、数据库实例、凭据（密码保存在系统钥匙串 / 环境变量 / 外部命令中）和目标库：
+1. **通过 CLI 或本地 Web 控制台**（仅监听 `127.0.0.1`）接入数据库：
 
    ```sh
+   # 通过 CLI 一键注册库与系统（密码留空），自动打开 Web 界面让人工直接录入 Keychain 密码：
+   agent-dbctl db add --engine postgres --host 127.0.0.1 --port 5432 --database app \
+     --system order-core --env dev --user app_ro --open-secret --json
+
+   # 或导入脱敏 YAML/JSON 拓扑文件（可用 `topology schema` 查看完整格式）：
+   agent-dbctl topology apply --file topology.yaml --dry-run --json
+
+   # 或直接打开本地 Web 控制台可视化配置：
    agent-dbctl ui open
    ```
 
@@ -82,8 +90,8 @@ make install-local
 | 能力 | 行为说明 |
 |---|---|
 | **四层企业资产目录** | 按 `系统 (System)`（支持 `workspace_paths` 自动匹配当前目录）-> `环境` -> `网络/凭据模板` -> `实例/目标库`（支持读写凭据分离）管理多库资产，支持脱敏后导出/导入 YAML/JSON 拓扑。 |
-| **分环境策略护栏** | **`dev`（YOLO 放行）**免批直跑；**`staging`（守卫）**与 **`prod`（严格）**执行前做只读 `EXPLAIN` 预检，对写操作、DDL、全表扫描或 Redis/Mongo 高开销读自动拉起本地浏览器审批。通过 `Policies -> High-Risk Patterns` 自定义高危规则，在 `dev` 库上命中特定模式同样可强制二次确认或拒绝。 |
-| **原生方言原样透传** | 内置纯 Go 支持 PostgreSQL、MySQL/MariaDB/TiDB、SQLite、MongoDB（JSON `RunCommand`）和 Redis，原样执行各引擎语法，不做易出错的跨库 SQL 改写。 |
+| **分环境策略护栏** | **`dev`（YOLO 放行）**免批直跑；**`staging`（守卫）**与 **`prod`（严格）**执行前做只读 `EXPLAIN` 预检，对写操作、DDL、全表扫描或 Redis/Mongo 高开销读自动拉起支持中英文切换的本地 Web 审批（默认强制校验 `--reason` 申请理由）。通过 `Policies -> High-Risk Patterns` 自定义高危规则，在 `dev` 库上命中特定模式同样可强制二次确认或拒绝。 |
+| **原生方言原样透传** | 内置纯 Go 支持 PostgreSQL、MySQL/MariaDB/TiDB、SQLite、ClickHouse、SQL Server、Oracle、MongoDB（JSON `RunCommand`）、Elasticsearch/OpenSearch 与 Redis，原样执行各引擎语法，不做易出错的跨库 SQL 改写。 |
 | **Agent 友好 CLI 契约** | 终端表格与 `--json` 结构化信封 `{ok, data, error, meta}` 双受众输出，`describe` 自描述、整行边界截断、`--out` 原子落盘、写超时严禁自动重放。 |
 | **可插拔审批与外部驱动** | 通过 `ApprovalProvider` 解耦审批通道（内置 `local-web`，可扩展飞书/Slack/内部工单系统）；支持 `hashicorp/go-plugin` 跨语言 gRPC 驱动子进程并校验 SHA-256 与 API 版本。 |
 | **不可变哈希链审计** | SQLite WAL 只追加 `audit_logs` 按 SHA-256 逐条成链（`agent-dbctl audit verify`），查询结果集不写入审计库，兼顾可追溯性与数据隔离。 |

@@ -18,6 +18,7 @@ import {
   type DisplayCatalog,
   type GlobalSecurityConfig,
 } from '../api'
+import { useI18n } from '../lib/i18n'
 import { MetaBadge } from './MetaBadge'
 
 export function ApprovalsTab({
@@ -35,6 +36,7 @@ export function ApprovalsTab({
   onToggleFreeze: (next: boolean) => Promise<void>
   onCountChange: (pendingCount: number) => void
 }) {
+  const { t } = useI18n()
   const [items, setItems] = useState<ApprovalRecord[]>([])
   const [filterStatus, setFilterStatus] = useState<'pending' | 'all'>('pending')
   const [selectedId, setSelectedId] = useState<string | null>(deepLinkId)
@@ -62,7 +64,7 @@ export function ApprovalsTab({
         setSelectedId(list[0].id)
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load approvals')
+      setError(e instanceof Error ? e.message : t('approvals.loadFailed'))
     } finally {
       setLoading(false)
     }
@@ -94,7 +96,7 @@ export function ApprovalsTab({
   const handleDecision = async (app: ApprovalRecord, approve: boolean) => {
     const note = (noteById[app.id] ?? '').trim()
     if (!approve && !note) {
-      toast.error('Please enter a rejection note for the agent.')
+      toast.error(t('approvals.noteRequiredToast'))
       return
     }
     setSubmittingId(app.id)
@@ -102,14 +104,14 @@ export function ApprovalsTab({
       const token = app.id === deepLinkId && deepLinkToken ? deepLinkToken : undefined
       if (approve) {
         await api.approve(app.id, { reviewer: 'local-human', note, token })
-        toast.success(`Approved ${app.target_ref}`)
+        toast.success(t('approvals.approvedToast', { target: app.target_ref }))
       } else {
         await api.reject(app.id, { reviewer: 'local-human', note, token })
-        toast.success(`Rejected ${app.target_ref}`)
+        toast.success(t('approvals.rejectedToast', { target: app.target_ref }))
       }
       await load()
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Decision failed')
+      toast.error(e instanceof Error ? e.message : t('approvals.decisionFailed'))
     } finally {
       setSubmittingId(null)
     }
@@ -118,16 +120,16 @@ export function ApprovalsTab({
   const remainingText = (expiresAt: string) => {
     const diff = Math.floor((new Date(expiresAt).getTime() - nowMs) / 1000)
     if (Number.isNaN(diff)) return '—'
-    if (diff <= 0) return 'Expired'
+    if (diff <= 0) return t('approvals.expired')
     const m = Math.floor(diff / 60)
     const s = diff % 60
-    return m > 0 ? `${m}m ${s}s` : `${s}s`
+    return m > 0 ? t('approvals.durationMinSec', { m, s }) : t('approvals.durationSec', { s })
   }
 
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Approvals"
+        title={t('approvals.title')}
         actions={
           <div className="flex items-center gap-2">
             <div className="flex rounded-md border border-border bg-card p-0.5 text-xs">
@@ -138,7 +140,7 @@ export function ApprovalsTab({
                   filterStatus === 'pending' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'
                 }`}
               >
-                Pending
+                {t('approvals.pending')}
               </button>
               <button
                 type="button"
@@ -147,12 +149,12 @@ export function ApprovalsTab({
                   filterStatus === 'all' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'
                 }`}
               >
-                All
+                {t('approvals.all')}
               </button>
             </div>
             <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
               <RefreshCw className={loading ? 'animate-spin' : undefined} />
-              Refresh
+              {t('common.refresh')}
             </Button>
           </div>
         }
@@ -161,11 +163,9 @@ export function ApprovalsTab({
       {globalSecurity?.prod_read_only_freeze && (
         <Notice tone="warning">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <span>
-              Production read-only freeze is active. All mutating or unknown production operations are automatically denied.
-            </span>
+            <span>{t('approvals.freezeBanner')}</span>
             <Button size="sm" variant="outline" onClick={() => void onToggleFreeze(false)}>
-              Disable Freeze
+              {t('approvals.disableFreeze')}
             </Button>
           </div>
         </Notice>
@@ -174,10 +174,10 @@ export function ApprovalsTab({
       {error && <Notice tone="error">{error}</Notice>}
 
       <div className="grid gap-5 lg:grid-cols-[340px_1fr]">
-        <Panel title={`Queue (${items.length})`} flush>
+        <Panel title={t('approvals.queueTitle', { count: items.length })} flush>
           {items.length === 0 ? (
             <div className="px-4 py-8 text-center text-sm text-muted-foreground">
-              No {filterStatus === 'pending' ? 'pending' : ''} approval requests
+              {filterStatus === 'pending' ? t('approvals.emptyPending') : t('approvals.emptyAll')}
             </div>
           ) : (
             <div className="divide-y divide-border">
@@ -211,10 +211,10 @@ export function ApprovalsTab({
           )}
         </Panel>
 
-        <Panel title={selected ? `Request ${selected.id}` : 'Approval Detail'}>
+        <Panel title={selected ? t('approvals.requestTitle', { id: selected.id }) : t('approvals.detailTitle')}>
           {!selected ? (
             <div className="py-12 text-center text-sm text-muted-foreground">
-              Select an approval request to inspect query details and execution plan.
+              {t('approvals.selectHint')}
             </div>
           ) : (
             <div className="space-y-4">
@@ -228,42 +228,42 @@ export function ApprovalsTab({
                 <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
                   <Clock className="size-3.5" />
                   {selected.status === 'pending'
-                    ? `Expires in ${remainingText(selected.expires_at_utc)}`
+                    ? t('approvals.expiresIn', { time: remainingText(selected.expires_at_utc) })
                     : fmtDateTime(selected.resolved_at_utc || selected.created_at_utc)}
                 </div>
               </div>
 
               <div className="grid gap-3 rounded-md border border-border bg-muted/30 p-3 text-xs sm:grid-cols-3">
                 <div>
-                  <div className="text-muted-foreground">System</div>
+                  <div className="text-muted-foreground">{t('approvals.system')}</div>
                   <div className="mt-0.5 font-mono font-medium">{selected.system_slug || '—'}</div>
                 </div>
                 <div>
-                  <div className="text-muted-foreground">Actor & Provider</div>
+                  <div className="text-muted-foreground">{t('approvals.actorProvider')}</div>
                   <div className="mt-0.5 font-mono font-medium">
                     {selected.actor} · {selected.provider}
                   </div>
                 </div>
                 <div>
-                  <div className="text-muted-foreground">Workspace</div>
+                  <div className="text-muted-foreground">{t('approvals.workspace')}</div>
                   <div className="mt-0.5 truncate font-mono" title={selected.workspace_cwd}>
                     {selected.workspace_cwd ? selected.workspace_cwd.replace(/^\/Users\/[^/]+/, '~') : '—'}
                   </div>
                 </div>
               </div>
 
-              {selected.reason && (
-                <div className="rounded-md border border-border bg-card px-3 py-2 text-sm">
-                  <span className="mr-2 font-medium text-muted-foreground">Reason:</span>
-                  <span>{selected.reason}</span>
-                </div>
-              )}
+              <div className="rounded-md border border-border bg-card px-3 py-2 text-sm">
+                <span className="mr-2 font-medium text-muted-foreground">{t('approvals.reason')}:</span>
+                <span className={selected.reason ? 'text-foreground' : 'text-muted-foreground'}>
+                  {selected.reason || t('approvals.noReason')}
+                </span>
+              </div>
 
               {(selected.matched_rules ?? []).length > 0 && (
                 <div className="space-y-2 rounded-md border border-amber-300 bg-amber-50/70 p-3 text-xs">
                   <div className="flex items-center gap-1.5 font-semibold text-amber-950">
                     <ShieldAlert className="size-4 text-amber-700" />
-                    <span>High-Risk Pattern Confirmation</span>
+                    <span>{t('approvals.patternTitle')}</span>
                   </div>
                   <div className="space-y-1.5">
                     {selected.matched_rules!.map((mr) => (
@@ -294,7 +294,7 @@ export function ApprovalsTab({
 
               <div>
                 <div className="mb-1.5 flex items-center justify-between">
-                  <span className="text-xs font-medium text-muted-foreground">Verbatim Query / Command</span>
+                  <span className="text-xs font-medium text-muted-foreground">{t('approvals.verbatimQuery')}</span>
                   <div className="flex flex-wrap gap-1">
                     {(selected.trigger_reasons ?? []).map((r) => (
                       <Badge key={r} variant="outline" className="font-mono text-[11px]">
@@ -314,10 +314,11 @@ export function ApprovalsTab({
                   <div className="mb-1.5 flex items-center justify-between text-xs font-medium">
                     <span className="flex items-center gap-1.5">
                       <AlertTriangle className="size-3.5 text-amber-600" />
-                      Preflight EXPLAIN ({selected.preflight.format || 'plan'})
+                      {t('approvals.preflightTitle', { format: selected.preflight.format || 'plan' })}
                     </span>
                     <span className="font-mono text-muted-foreground">
-                      full_scan={String(selected.preflight.full_scan)} · est_rows={selected.preflight.estimated_rows}
+                      {t('approvals.fullScan', { val: String(selected.preflight.full_scan) })} ·{' '}
+                      {t('approvals.estRows', { val: selected.preflight.estimated_rows })}
                     </span>
                   </div>
                   {selected.preflight.plan_summary && (
@@ -330,9 +331,9 @@ export function ApprovalsTab({
 
               {selected.status === 'pending' ? (
                 <div className="space-y-3 border-t border-border pt-3">
-                  <FormField label="Reviewer Note (sent back to agent on reject)">
+                  <FormField label={t('approvals.noteLabel')}>
                     <Input
-                      placeholder="Optional on approve; required on reject (e.g. Add LIMIT 100)"
+                      placeholder={t('approvals.notePlaceholder')}
                       value={noteById[selected.id] ?? ''}
                       onChange={(e) =>
                         setNoteById((prev) => ({ ...prev, [selected.id]: e.target.value }))
@@ -346,25 +347,27 @@ export function ApprovalsTab({
                       onClick={() => void handleDecision(selected, false)}
                     >
                       <X className="size-4" />
-                      Reject
+                      {t('approvals.reject')}
                     </LoadingButton>
                     <LoadingButton
                       pending={submittingId === selected.id}
                       onClick={() => void handleDecision(selected, true)}
                     >
                       <Check className="size-4" />
-                      Approve & Execute
+                      {t('approvals.approveExecute')}
                     </LoadingButton>
                   </div>
                 </div>
               ) : (
                 <div className="rounded-md border border-border bg-muted/30 p-3 text-xs">
                   <div className="font-medium">
-                    Decision: <span className="font-mono uppercase">{selected.status}</span> by{' '}
-                    <span className="font-mono">{selected.reviewer || 'system'}</span>
+                    {t('approvals.decisionLabel')}: <span className="font-mono uppercase">{selected.status}</span>{' '}
+                    {t('approvals.decisionBy')} <span className="font-mono">{selected.reviewer || 'system'}</span>
                   </div>
                   {selected.reviewer_note && (
-                    <div className="mt-1 text-muted-foreground">Note: {selected.reviewer_note}</div>
+                    <div className="mt-1 text-muted-foreground">
+                      {t('approvals.reviewerNote', { note: selected.reviewer_note })}
+                    </div>
                   )}
                 </div>
               )}

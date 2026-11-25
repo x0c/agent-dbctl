@@ -10,50 +10,64 @@ import (
 )
 
 var sqlAdminFunctions = map[string]bool{
-	"pg_read_file":          true,
-	"pg_read_binary_file":   true,
-	"pg_ls_dir":             true,
-	"pg_ls_logdir":          true,
-	"pg_ls_waldir":          true,
-	"pg_ls_tmpdir":          true,
-	"pg_stat_file":          true,
-	"lo_import":             true,
-	"lo_export":             true,
-	"lo_from_bytea":         true,
-	"lo_put":                true,
-	"lo_unlink":             true,
-	"dblink":                true,
-	"dblink_connect":        true,
-	"dblink_connect_u":      true,
-	"dblink_exec":           true,
-	"dblink_send_query":     true,
-	"load_file":             true,
-	"load_extension":        true,
-	"pg_terminate_backend":  true,
-	"pg_cancel_backend":     true,
-	"pg_reload_conf":        true,
-	"pg_rotate_logfile":     true,
-	"set_config":            true,
-	"pg_switch_wal":         true,
+	"pg_read_file":            true,
+	"pg_read_binary_file":     true,
+	"pg_ls_dir":               true,
+	"pg_ls_logdir":            true,
+	"pg_ls_waldir":            true,
+	"pg_ls_tmpdir":            true,
+	"pg_stat_file":            true,
+	"lo_import":               true,
+	"lo_export":               true,
+	"lo_from_bytea":           true,
+	"lo_put":                  true,
+	"lo_unlink":               true,
+	"dblink":                  true,
+	"dblink_connect":          true,
+	"dblink_connect_u":        true,
+	"dblink_exec":             true,
+	"dblink_send_query":       true,
+	"load_file":               true,
+	"load_extension":          true,
+	"pg_terminate_backend":    true,
+	"pg_cancel_backend":       true,
+	"pg_reload_conf":          true,
+	"pg_rotate_logfile":       true,
+	"set_config":              true,
+	"pg_switch_wal":           true,
 	"pg_create_restore_point": true,
-	"pg_backup_start":       true,
-	"pg_backup_stop":        true,
+	"pg_backup_start":         true,
+	"pg_backup_stop":          true,
+	"xp_cmdshell":             true,
+	"sp_oacreate":             true,
+	"sp_oamethod":             true,
+	"openrowset":              true,
+	"opendatasource":          true,
+	"utl_file":                true,
+	"utl_file.fopen":          true,
+	"utl_http":                true,
+	"utl_http.request":        true,
+	"utl_tcp":                 true,
+	"utl_tcp.open_connection": true,
+	"dbms_sql":                true,
+	"dbms_sql.execute":        true,
+	"dbms_pipe":               true,
 }
 
 var sqlWriteFunctions = map[string]bool{
-	"nextval":                    true,
-	"setval":                     true,
-	"pg_advisory_lock":           true,
-	"pg_advisory_lock_shared":    true,
-	"pg_try_advisory_lock":       true,
+	"nextval":                     true,
+	"setval":                      true,
+	"pg_advisory_lock":            true,
+	"pg_advisory_lock_shared":     true,
+	"pg_try_advisory_lock":        true,
 	"pg_try_advisory_lock_shared": true,
-	"pg_advisory_xact_lock":      true,
+	"pg_advisory_xact_lock":       true,
 	"pg_advisory_xact_lock_shared": true,
-	"pg_advisory_unlock":         true,
-	"pg_advisory_unlock_all":     true,
-	"get_lock":                   true,
-	"release_lock":               true,
-	"release_all_locks":          true,
+	"pg_advisory_unlock":          true,
+	"pg_advisory_unlock_all":      true,
+	"get_lock":                    true,
+	"release_lock":                true,
+	"release_all_locks":           true,
 }
 
 var sqlHighCostFunctions = map[string]bool{
@@ -66,6 +80,7 @@ var sqlHighCostFunctions = map[string]bool{
 	"zeroblob":        true,
 	"generate_series": true,
 	"xmlparse":        true,
+	"dbms_lock.sleep": true,
 }
 
 var sqliteSafeParenPragmas = map[string]bool{
@@ -108,7 +123,44 @@ var sqlExplainModifiers = map[string]bool{
 	"BUFFERS": true, "WAL": true, "TIMING": true, "SUMMARY": true, "MEMORY": true,
 	"SERIALIZE": true, "GENERIC_PLAN": true, "FORMAT": true, "JSON": true, "TEXT": true,
 	"XML": true, "YAML": true, "EXTENDED": true, "PARTITIONS": true, "TREE": true,
-	"QUERY": true, "PLAN": true, "ON": true, "OFF": true, "TRUE": true, "FALSE": true,
+	"QUERY": true, "PLAN": true, "ESTIMATE": true, "SYNTAX": true, "AST": true,
+	"PIPELINE": true, "ON": true, "OFF": true, "TRUE": true, "FALSE": true,
+}
+
+// CanonicalEngine normalizes engine names and compatible dialect aliases to their primary built-in engine key.
+func CanonicalEngine(engine string) string {
+	e := strings.ToLower(strings.TrimSpace(engine))
+	switch e {
+	case "postgres", "postgresql", "pg", "cockroachdb", "cockroach", "redshift", "yugabytedb", "yugabyte", "greenplum", "alloydb":
+		return "postgres"
+	case "mysql", "mariadb", "tidb", "oceanbase", "oceanbase_mysql", "starrocks", "doris":
+		return "mysql"
+	case "sqlite", "sqlite3", "sqlite-ext":
+		return "sqlite"
+	case "mongodb", "mongo", "documentdb", "ferretdb", "cosmosdb_mongo":
+		return "mongodb"
+	case "redis", "valkey", "dragonfly", "keydb":
+		return "redis"
+	case "clickhouse", "ch":
+		return "clickhouse"
+	case "mssql", "sqlserver", "sql-server", "azuresql":
+		return "mssql"
+	case "oracle", "oracledb":
+		return "oracle"
+	case "elasticsearch", "es", "opensearch":
+		return "elasticsearch"
+	default:
+		if strings.Contains(e, "mongo") {
+			return "mongodb"
+		}
+		if strings.Contains(e, "redis") || strings.Contains(e, "valkey") {
+			return "redis"
+		}
+		if strings.Contains(e, "elastic") || strings.Contains(e, "opensearch") {
+			return "elasticsearch"
+		}
+		return e
+	}
 }
 
 // Classify evaluates raw statements/commands for an engine and returns fail-closed risk classification.
@@ -119,6 +171,8 @@ func Classify(engine, raw string) types.Classification {
 		return classifyMongo(engine, raw)
 	case "redis":
 		return classifyRedis(engine, raw)
+	case "elasticsearch":
+		return classifyElasticsearch(engine, raw)
 	default:
 		return classifySQL(engine, raw)
 	}
@@ -127,7 +181,7 @@ func Classify(engine, raw string) types.Classification {
 // EngineFamily returns the EngineFamily matching an engine name.
 func EngineFamily(engine string) types.EngineFamily {
 	switch normalizeEngine(engine) {
-	case "mongodb":
+	case "mongodb", "elasticsearch":
 		return types.FamilyDocument
 	case "redis":
 		return types.FamilyKV
@@ -137,15 +191,7 @@ func EngineFamily(engine string) types.EngineFamily {
 }
 
 func normalizeEngine(engine string) string {
-	e := strings.ToLower(strings.TrimSpace(engine))
-	switch {
-	case strings.Contains(e, "mongo"):
-		return "mongodb"
-	case strings.Contains(e, "redis"), strings.Contains(e, "valkey"):
-		return "redis"
-	default:
-		return e
-	}
+	return CanonicalEngine(engine)
 }
 
 func classifySQL(engine, raw string) types.Classification {
@@ -388,7 +434,8 @@ func classifySQLTokens(rawTokens []string, snippet string) types.StatementSummar
 			Snippet:       snippet,
 		}
 
-	case "GRANT", "REVOKE", "COPY", "LOAD", "CALL", "EXEC", "EXECUTE", "VACUUM", "ANALYZE", "REINDEX", "CLUSTER", "KILL", "FLUSH", "LOCK", "UNLOCK", "SET", "USE", "ATTACH", "DETACH":
+	case "GRANT", "REVOKE", "COPY", "LOAD", "CALL", "EXEC", "EXECUTE", "VACUUM", "ANALYZE", "REINDEX", "CLUSTER", "KILL", "FLUSH", "LOCK", "UNLOCK", "SET", "USE", "ATTACH", "DETACH",
+		"OPTIMIZE", "SYSTEM", "EXCHANGE", "BACKUP", "RESTORE", "DBCC", "SHUTDOWN", "RECONFIGURE", "BULK", "WAITFOR":
 		if first == "COPY" && containsToken(kwUpper, "PROGRAM") {
 			flags = append(flags, "copy_program_rce")
 		}
@@ -536,13 +583,14 @@ func analyzeSelectQuery(stmtType string, rawTokens, upper, kwUpper, flags []stri
 		flags = append(flags, "missing_where", "missing_limit", "table_full_scan")
 	} else {
 		// Recursive CTEs can amplify into millions of rows even under scalar aggregates.
-		scalarAgg := !isRecursive && isScalarAggregateOnly(kwUpper)
+		scalarAgg := !isRecursive && (isScalarAggregateOnly(kwUpper) || isOracleDualQuery(kwUpper))
+		hasBoundedLimit := hasBoundedTopLevelLimit(upper, 1000)
 		if hasFrom && !hasWhere && !hasLimit && !scalarAgg {
 			flags = append(flags, "missing_where", "missing_limit")
 		} else if hasFrom && !hasLimit && !scalarAgg {
 			flags = append(flags, "missing_limit")
 		}
-		if hasFrom && hasSelectStar(upper) && !hasWhere {
+		if hasFrom && hasSelectStar(upper) && !hasWhere && !hasBoundedLimit && !scalarAgg {
 			flags = append(flags, "select_star_no_where")
 		}
 	}
@@ -607,6 +655,24 @@ func parseExplainInner(rawTokens []string) (bool, []string) {
 		}
 		if sqlExplainModifiers[u] {
 			i++
+			continue
+		}
+		// ClickHouse EXPLAIN key=val options (e.g. EXPLAIN PLAN indexes = 1 SELECT ...)
+		if i+2 < n && rawTokens[i+1] == "=" {
+			i += 3
+			continue
+		}
+		// Oracle EXPLAIN PLAN [SET STATEMENT_ID = ...] [INTO tbl] FOR <stmt>
+		if u == "FOR" {
+			i++
+			break
+		}
+		if u == "SET" && i+3 < n && rawTokens[i+2] == "=" {
+			i += 4
+			continue
+		}
+		if u == "INTO" && i+1 < n {
+			i += 2
 			continue
 		}
 		break
@@ -691,6 +757,82 @@ func hasDeepOffset(upper []string) bool {
 		}
 		if upper[i] == "LIMIT" && i+3 < len(upper) && upper[i+2] == "," {
 			if n, err := strconv.ParseInt(upper[i+1], 10, 64); err == nil && n >= 10000 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasBoundedTopLevelLimit returns true when the outermost query enforces a positive numeric LIMIT/FETCH/TOP <= maxCap.
+func hasBoundedTopLevelLimit(upper []string, maxCap int64) bool {
+	depth := 0
+	for i := 0; i < len(upper); i++ {
+		tok := upper[i]
+		switch tok {
+		case "(":
+			depth++
+			continue
+		case ")":
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 {
+			continue
+		}
+		switch tok {
+		case "LIMIT":
+			if i+3 < len(upper) && upper[i+2] == "," {
+				if n, err := strconv.ParseInt(upper[i+3], 10, 64); err == nil && n > 0 && n <= maxCap {
+					return true
+				}
+			} else if i+1 < len(upper) {
+				if n, err := strconv.ParseInt(upper[i+1], 10, 64); err == nil && n > 0 && n <= maxCap {
+					return true
+				}
+			}
+		case "FETCH":
+			if i+2 < len(upper) && (upper[i+1] == "FIRST" || upper[i+1] == "NEXT") {
+				if n, err := strconv.ParseInt(upper[i+2], 10, 64); err == nil && n > 0 && n <= maxCap {
+					return true
+				}
+			}
+		case "TOP":
+			if i+1 < len(upper) {
+				if n, err := strconv.ParseInt(upper[i+1], 10, 64); err == nil && n > 0 && n <= maxCap {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// HasReturningClause lexically detects a top-level RETURNING clause in a single SQL statement,
+// ignoring string literals and comments.
+func HasReturningClause(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	stmts, unclosed := splitSQLStatements(trimmed)
+	if unclosed || len(stmts) != 1 {
+		return false
+	}
+	tokens := tokenizeSQLWithPunctuation(stmts[0])
+	depth := 0
+	for _, tok := range tokens {
+		switch tok {
+		case "(":
+			depth++
+		case ")":
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && strings.EqualFold(tok, "RETURNING") {
 				return true
 			}
 		}
@@ -836,6 +978,21 @@ func stripIdentifierQuotes(s string) string {
 		}
 	}
 	return s
+}
+
+func isOracleDualQuery(kwUpper []string) bool {
+	for i := 0; i < len(kwUpper)-1; i++ {
+		if kwUpper[i] == "FROM" && kwUpper[i+1] == "DUAL" {
+			if i+2 == len(kwUpper) {
+				return true
+			}
+			next := kwUpper[i+2]
+			if next == "WHERE" || next == "ORDER" || next == "GROUP" || next == "LIMIT" || next == "FETCH" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isScalarAggregateOnly(upper []string) bool {

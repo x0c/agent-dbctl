@@ -33,18 +33,23 @@ import {
   type SystemRecord,
   type TargetDetail,
 } from '../api'
+import { useI18n, type TranslationKey } from '../lib/i18n'
 
-const ENGINES = ['*', 'postgres', 'mysql', 'sqlite', 'mongodb', 'redis'] as const
+const ENGINES = ['*', 'postgres', 'mysql', 'sqlite', 'mongodb', 'redis', 'clickhouse', 'mssql', 'oracle', 'elasticsearch'] as const
 
-const MATCHER_LABELS: Record<PatternMatcherType, string> = {
-  function_call: 'SQL Function Call',
-  table_ref: 'Table / Collection Ref',
-  pragma_name: 'SQLite PRAGMA',
-  command_arg: 'Redis Command / Arg',
-  json_path: 'MongoDB Operator / JSON Path',
-  regex: 'Regex (RE2)',
-  risk_flag: 'Classifier Risk Flag',
-  preflight_metric: 'EXPLAIN Preflight Metric',
+const MATCHER_TYPES: PatternMatcherType[] = [
+  'function_call',
+  'table_ref',
+  'pragma_name',
+  'command_arg',
+  'json_path',
+  'regex',
+  'risk_flag',
+  'preflight_metric',
+]
+
+function matcherLabelKey(type: PatternMatcherType): TranslationKey {
+  return `patterns.matcher.${type}` as TranslationKey
 }
 
 function defaultCondition(type: PatternMatcherType = 'table_ref'): PatternCondition {
@@ -147,6 +152,7 @@ export function RiskPatternsPanel({
   systems: SystemRecord[]
   targets: TargetDetail[]
 }) {
+  const { t } = useI18n()
   const [rules, setRules] = useState<RiskPatternRule[]>([])
   const [packs, setPacks] = useState<BuiltinRulePack[]>([])
   const [loading, setLoading] = useState(true)
@@ -183,7 +189,7 @@ export function RiskPatternsPanel({
       setRules(res.items ?? [])
       setPacks(res.builtin_packs ?? [])
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load high-risk patterns')
+      setError(e instanceof Error ? e.message : t('patterns.loadFailed'))
     } finally {
       setLoading(false)
     }
@@ -246,10 +252,10 @@ export function RiskPatternsPanel({
         condition: cond,
       })
       setDialogOpen(false)
-      toast.success('High-risk pattern rule saved')
+      toast.success(t('patterns.ruleSaved'))
       await load()
     } catch (err) {
-      setRuleErr(err instanceof Error ? err.message : 'Failed to save rule')
+      setRuleErr(err instanceof Error ? err.message : t('patterns.ruleSaveFailed'))
     } finally {
       setSavingRule(false)
     }
@@ -260,13 +266,13 @@ export function RiskPatternsPanel({
       await api.saveRiskPattern({ ...rule, enabled: next })
       setRules((prev) => prev.map((x) => (x.id === rule.id ? { ...x, enabled: next } : x)))
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to update rule')
+      toast.error(err instanceof Error ? err.message : t('patterns.ruleUpdateFailed'))
     }
   }
 
   const installPack = async (packId: string) => {
     if (packScopeType !== 'global' && !packScopeId) {
-      toast.error(`Select a ${packScopeType} scope target first.`)
+      toast.error(t('patterns.selectScopeFirst', { scope: packScopeType }))
       return
     }
     setInstallingPack(packId)
@@ -275,10 +281,10 @@ export function RiskPatternsPanel({
         scope_type: packScopeType,
         scope_id: packScopeType === 'global' ? 'global' : packScopeId,
       })
-      toast.success(`Enabled ${res.items?.length ?? 0} rule(s) from ${packId}`)
+      toast.success(t('patterns.packEnabledToast', { count: res.items?.length ?? 0, pack: packId }))
       await load()
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to enable pack')
+      toast.error(err instanceof Error ? err.message : t('patterns.packEnableFailed'))
     } finally {
       setInstallingPack(null)
     }
@@ -308,7 +314,7 @@ export function RiskPatternsPanel({
       })
       setTestResult(res)
     } catch (err) {
-      setTestErr(err instanceof Error ? err.message : 'Dry-run test failed')
+      setTestErr(err instanceof Error ? err.message : t('patterns.dryRunFailed'))
     } finally {
       setTesting(false)
     }
@@ -334,7 +340,7 @@ export function RiskPatternsPanel({
       return `sys:${sys?.slug || scopeID}`
     }
     if (scopeType === 'target') {
-      const tgt = targets.find((t) => t.target.id === scopeID)
+      const tgt = targets.find((tg) => tg.target.id === scopeID)
       return tgt ? tgt.target.ref : `target:${scopeID}`
     }
     return `${scopeType}:${scopeID}`
@@ -343,7 +349,7 @@ export function RiskPatternsPanel({
   const columns: ColumnDef<RiskPatternRule, unknown>[] = [
     {
       accessorKey: 'name',
-      header: 'Rule',
+      header: t('patterns.col.rule'),
       cell: ({ row }) => (
         <div className="max-w-[140px] truncate font-mono text-xs font-semibold" title={row.original.name}>
           {row.original.name}
@@ -352,7 +358,7 @@ export function RiskPatternsPanel({
     },
     {
       id: 'scope',
-      header: 'Scope',
+      header: t('patterns.col.scope'),
       cell: ({ row }) => {
         const label = resolveScopeLabel(row.original.scope_type, row.original.scope_id)
         return (
@@ -364,7 +370,7 @@ export function RiskPatternsPanel({
     },
     {
       id: 'engines',
-      header: 'Engine',
+      header: t('patterns.col.engine'),
       cell: ({ row }) => (
         <span className="block max-w-[68px] truncate font-mono text-xs text-muted-foreground">
           {row.original.engines?.length ? row.original.engines.join(', ') : '*'}
@@ -373,7 +379,7 @@ export function RiskPatternsPanel({
     },
     {
       id: 'condition',
-      header: 'Condition',
+      header: t('patterns.col.condition'),
       cell: ({ row }) => {
         const text = summarizeCondition(row.original.condition)
         return (
@@ -385,12 +391,12 @@ export function RiskPatternsPanel({
     },
     {
       id: 'action',
-      header: 'Action',
+      header: t('patterns.col.action'),
       cell: ({ row }) => actionBadge(row.original.action),
     },
     {
       id: 'enabled',
-      header: 'On',
+      header: t('patterns.col.on'),
       cell: ({ row }) => (
         <Switch checked={row.original.enabled} onCheckedChange={(c) => void toggleRuleEnabled(row.original, c)} />
       ),
@@ -401,16 +407,17 @@ export function RiskPatternsPanel({
       cell: ({ row }) => (
         <div className="flex justify-end gap-1">
           <Button size="sm" variant="outline" onClick={() => openEditor(row.original)}>
-            Edit
+            {t('common.edit')}
           </Button>
           <ConfirmAction
             trigger={
-              <Button size="icon" variant="ghost" aria-label={`Delete ${row.original.name}`}>
+              <Button size="icon" variant="ghost" aria-label={t('patterns.deleteRuleAria', { name: row.original.name })}>
                 <Trash2 className="size-3.5" />
               </Button>
             }
-            title={`Delete pattern rule ${row.original.name}?`}
-            confirmLabel="Delete"
+            title={t('patterns.deleteRuleTitle', { name: row.original.name })}
+            confirmLabel={t('common.delete')}
+            cancelLabel={t('common.cancel')}
             destructive
             onConfirm={async () => {
               await api.deleteRiskPattern(row.original.id)
@@ -427,7 +434,7 @@ export function RiskPatternsPanel({
       {error && <Notice tone="error">{error}</Notice>}
 
       <Panel
-        title="Official Risk Pattern Packs"
+        title={t('patterns.packsTitle')}
         action={
           <div className="flex items-center gap-2">
             <div className="w-28">
@@ -457,7 +464,7 @@ export function RiskPatternsPanel({
               <div className="w-40">
                 <Select value={packScopeId} onValueChange={setPackScopeId}>
                   <SelectTrigger size="sm">
-                    <SelectValue placeholder="Scope" />
+                    <SelectValue placeholder={t('patterns.col.scope')} />
                   </SelectTrigger>
                   <SelectContent>
                     {packScopeType === 'env' &&
@@ -473,9 +480,9 @@ export function RiskPatternsPanel({
                         </SelectItem>
                       ))}
                     {packScopeType === 'target' &&
-                      targets.map((t) => (
-                        <SelectItem key={t.target.id} value={t.target.id}>
-                          {t.target.ref}
+                      targets.map((tg) => (
+                        <SelectItem key={tg.target.id} value={tg.target.id}>
+                          {tg.target.ref}
                         </SelectItem>
                       ))}
                   </SelectContent>
@@ -509,7 +516,9 @@ export function RiskPatternsPanel({
                 </div>
                 <div className="flex items-center justify-between border-t border-border pt-2">
                   <span className="font-mono text-[11px] text-muted-foreground">
-                    {installedCount > 0 ? `${installedCount}/${pack.rules.length} active` : `${pack.rules.length} rules`}
+                    {installedCount > 0
+                      ? t('patterns.rulesActive', { installed: installedCount, total: pack.rules.length })
+                      : t('patterns.rulesCount', { total: pack.rules.length })}
                   </span>
                   <LoadingButton
                     size="sm"
@@ -518,7 +527,7 @@ export function RiskPatternsPanel({
                     onClick={() => void installPack(pack.id)}
                   >
                     <PackagePlus className="size-3.5" />
-                    {installedCount > 0 ? 'Sync Pack' : 'Enable Pack'}
+                    {installedCount > 0 ? t('patterns.syncPack') : t('patterns.enablePack')}
                   </LoadingButton>
                 </div>
               </div>
@@ -528,11 +537,11 @@ export function RiskPatternsPanel({
       </Panel>
 
       <Panel
-        title="Custom & Active High-Risk Rules (Global → Env → System → Target)"
+        title={t('patterns.rulesTitle')}
         action={
           <Button size="sm" onClick={() => openEditor()}>
             <Plus />
-            New Risk Pattern
+            {t('patterns.newRule')}
           </Button>
         }
         flush
@@ -541,31 +550,32 @@ export function RiskPatternsPanel({
           columns={columns}
           data={rules}
           loading={loading}
-          emptyLabel="No high-risk pattern rules configured. Enable a pack above or create a custom rule."
+          searchPlaceholder={t('common.search')}
+          emptyLabel={t('patterns.emptyRules')}
         />
       </Panel>
 
       <Panel
-        title="Dry-Run Sandbox"
+        title={t('patterns.sandboxTitle')}
         action={
           <LoadingButton size="sm" pending={testing} onClick={() => void runTest()}>
             <FlaskConical className="size-3.5" />
-            Run Dry-Run Test
+            {t('patterns.runDryRun')}
           </LoadingButton>
         }
       >
         <div className="space-y-3">
           <div className="grid gap-3 sm:grid-cols-3">
-            <FormField label="Target">
+            <FormField label={t('patterns.sandboxTarget')}>
               <Select value={testTarget} onValueChange={setTestTarget}>
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__custom__">Engine + Tier Preset</SelectItem>
-                  {targets.map((t) => (
-                    <SelectItem key={t.target.id} value={t.target.id}>
-                      {t.target.ref}
+                  <SelectItem value="__custom__">{t('patterns.sandboxPreset')}</SelectItem>
+                  {targets.map((tg) => (
+                    <SelectItem key={tg.target.id} value={tg.target.id}>
+                      {tg.target.ref}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -573,7 +583,7 @@ export function RiskPatternsPanel({
             </FormField>
             {testTarget === '__custom__' && (
               <>
-                <FormField label="Engine">
+                <FormField label={t('patterns.sandboxEngine')}>
                   <Select value={testEngine} onValueChange={setTestEngine}>
                     <SelectTrigger>
                       <SelectValue />
@@ -587,7 +597,7 @@ export function RiskPatternsPanel({
                     </SelectContent>
                   </Select>
                 </FormField>
-                <FormField label="Safety Tier">
+                <FormField label={t('patterns.sandboxTier')}>
                   <Select value={testTier} onValueChange={(v) => setTestTier(v as typeof testTier)}>
                     <SelectTrigger>
                       <SelectValue />
@@ -603,7 +613,7 @@ export function RiskPatternsPanel({
             )}
           </div>
 
-          <FormField label="Sample Query / Command" htmlFor="sandbox-query">
+          <FormField label={t('patterns.sandboxQuery')} htmlFor="sandbox-query">
             <Textarea
               id="sandbox-query"
               rows={3}
@@ -616,10 +626,10 @@ export function RiskPatternsPanel({
           <div className="flex flex-wrap items-center gap-4 text-xs">
             <label className="flex items-center gap-2">
               <Switch checked={simFullScan} onCheckedChange={setSimFullScan} />
-              <span>Simulate Full Scan</span>
+              <span>{t('patterns.simFullScan')}</span>
             </label>
             <div className="flex items-center gap-2">
-              <span className="text-muted-foreground">Simulated Est. Rows</span>
+              <span className="text-muted-foreground">{t('patterns.simEstRows')}</span>
               <Input
                 type="number"
                 className="h-8 w-32 font-mono text-xs"
@@ -682,9 +692,9 @@ export function RiskPatternsPanel({
               )}
 
               <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground">
-                {(testResult.extracted.tables ?? []).map((t) => (
-                  <Badge key={`t-${t}`} variant="outline" className="font-mono">
-                    tbl:{t}
+                {(testResult.extracted.tables ?? []).map((tbl) => (
+                  <Badge key={`t-${tbl}`} variant="outline" className="font-mono">
+                    tbl:{tbl}
                   </Badge>
                 ))}
                 {(testResult.extracted.functions ?? []).map((fn) => (
@@ -711,21 +721,23 @@ export function RiskPatternsPanel({
       <FormDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
-        title={ruleForm.id ? 'Edit Risk Pattern Rule' : 'New Risk Pattern Rule'}
+        title={ruleForm.id ? t('patterns.dialog.editTitle') : t('patterns.dialog.newTitle')}
+        submitLabel={t('common.save')}
+        cancelLabel={t('common.cancel')}
         maxWidthClassName="max-w-2xl"
         error={ruleErr}
         pending={savingRule}
         onSubmit={saveRule}
       >
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Rule Name">
+          <FormField label={t('patterns.field.ruleName')}>
             <Input
               value={ruleForm.name}
               onChange={(e) => setRuleForm((p) => ({ ...p, name: e.target.value }))}
               placeholder="e.g. confirm-orders-scan"
             />
           </FormField>
-          <FormField label="Action">
+          <FormField label={t('patterns.field.action')}>
             <Select
               value={ruleForm.action}
               onValueChange={(v) => setRuleForm((p) => ({ ...p, action: v as PatternAction }))}
@@ -743,7 +755,7 @@ export function RiskPatternsPanel({
         </div>
 
         <div className="grid grid-cols-3 gap-3">
-          <FormField label="Scope Type">
+          <FormField label={t('patterns.field.scopeType')}>
             <Select
               value={ruleForm.scope_type}
               onValueChange={(v) => {
@@ -766,7 +778,7 @@ export function RiskPatternsPanel({
               </SelectContent>
             </Select>
           </FormField>
-          <FormField label="Scope Target">
+          <FormField label={t('patterns.field.scopeTarget')}>
             {ruleForm.scope_type === 'global' ? (
               <Input value="global" disabled />
             ) : (
@@ -775,11 +787,11 @@ export function RiskPatternsPanel({
                 onValueChange={(v) => setRuleForm((p) => ({ ...p, scope_id: v === '__pick__' ? '' : v }))}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder="Select scope" />
+                  <SelectValue placeholder={t('policies.field.selectScope')} />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="__pick__" disabled>
-                    Select...
+                    {t('policies.field.selectScope')}
                   </SelectItem>
                   {ruleForm.scope_type === 'env' &&
                     envs.map((e) => (
@@ -794,16 +806,16 @@ export function RiskPatternsPanel({
                       </SelectItem>
                     ))}
                   {ruleForm.scope_type === 'target' &&
-                    targets.map((t) => (
-                      <SelectItem key={t.target.id} value={t.target.id}>
-                        {t.target.ref}
+                    targets.map((tg) => (
+                      <SelectItem key={tg.target.id} value={tg.target.id}>
+                        {tg.target.ref}
                       </SelectItem>
                     ))}
                 </SelectContent>
               </Select>
             )}
           </FormField>
-          <FormField label="Priority">
+          <FormField label={t('patterns.field.priority')}>
             <Input
               type="number"
               value={ruleForm.priority}
@@ -812,7 +824,7 @@ export function RiskPatternsPanel({
           </FormField>
         </div>
 
-        <FormField label="Engines">
+        <FormField label={t('patterns.field.engines')}>
           <div className="flex flex-wrap gap-1.5">
             {ENGINES.map((eng) => {
               const active = (ruleForm.engines ?? ['*']).includes(eng)
@@ -827,7 +839,7 @@ export function RiskPatternsPanel({
                       : 'border-border bg-card text-muted-foreground hover:bg-muted'
                   }`}
                 >
-                  {eng === '*' ? 'all (*)' : eng}
+                  {eng === '*' ? t('patterns.field.allEngines') : eng}
                 </button>
               )
             })}
@@ -835,34 +847,34 @@ export function RiskPatternsPanel({
         </FormField>
 
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Confirmation Title">
+          <FormField label={t('patterns.field.confirmTitle')}>
             <Input
               value={ruleForm.confirm_title ?? ''}
               onChange={(e) => setRuleForm((p) => ({ ...p, confirm_title: e.target.value }))}
-              placeholder="Shown on Web approval prompt"
+              placeholder={t('patterns.field.confirmTitlePh')}
             />
           </FormField>
-          <FormField label="Approval Provider Override">
+          <FormField label={t('patterns.field.providerOverride')}>
             <Input
               value={ruleForm.approval_provider ?? ''}
               onChange={(e) => setRuleForm((p) => ({ ...p, approval_provider: e.target.value }))}
-              placeholder="Inherit target policy"
+              placeholder={t('patterns.field.providerOverridePh')}
             />
           </FormField>
         </div>
 
-        <FormField label="Confirmation Message">
+        <FormField label={t('patterns.field.confirmMessage')}>
           <Input
             value={ruleForm.confirm_message ?? ''}
             onChange={(e) => setRuleForm((p) => ({ ...p, confirm_message: e.target.value }))}
-            placeholder="Risk explanation shown to reviewer"
+            placeholder={t('patterns.field.confirmMessagePh')}
           />
         </FormField>
 
         <div className="space-y-2 rounded-md border border-border p-3">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <span className="text-xs font-semibold">Condition Builder</span>
+              <span className="text-xs font-semibold">{t('patterns.conditionBuilder')}</span>
               {condMode === 'visual' && (
                 <div className="w-36">
                   <Select
@@ -879,9 +891,9 @@ export function RiskPatternsPanel({
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="single">Single Matcher</SelectItem>
-                      <SelectItem value="all">Match ALL (AND)</SelectItem>
-                      <SelectItem value="any">Match ANY (OR)</SelectItem>
+                      <SelectItem value="single">{t('patterns.comb.single')}</SelectItem>
+                      <SelectItem value="all">{t('patterns.comb.all')}</SelectItem>
+                      <SelectItem value="any">{t('patterns.comb.any')}</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -894,7 +906,7 @@ export function RiskPatternsPanel({
                 variant={condMode === 'visual' ? 'default' : 'outline'}
                 onClick={() => setCondMode('visual')}
               >
-                Visual
+                {t('patterns.mode.visual')}
               </Button>
               <Button
                 type="button"
@@ -910,7 +922,7 @@ export function RiskPatternsPanel({
                   setCondMode('json')
                 }}
               >
-                JSON
+                {t('patterns.mode.json')}
               </Button>
             </div>
           </div>
@@ -939,9 +951,9 @@ export function RiskPatternsPanel({
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        {(Object.keys(MATCHER_LABELS) as PatternMatcherType[]).map((k) => (
+                        {MATCHER_TYPES.map((k) => (
                           <SelectItem key={k} value={k}>
-                            {MATCHER_LABELS[k]}
+                            {t(matcherLabelKey(k))}
                           </SelectItem>
                         ))}
                       </SelectContent>
@@ -959,7 +971,7 @@ export function RiskPatternsPanel({
                               .filter(Boolean)
                             setLeafList((prev) => prev.map((x, i) => (i === idx ? { ...x, type: mType, values: vals } : x)))
                           }}
-                          placeholder="Comma-separated values (supports * glob)"
+                          placeholder={t('patterns.ph.csvValues')}
                         />
                       )}
                       {mType === 'regex' && (
@@ -970,7 +982,7 @@ export function RiskPatternsPanel({
                             onChange={(e) =>
                               setLeafList((prev) => prev.map((x, i) => (i === idx ? { ...x, pattern: e.target.value } : x)))
                             }
-                            placeholder="RE2 pattern"
+                            placeholder={t('patterns.ph.re2')}
                           />
                           <Select
                             value={leaf.target || 'normalized_no_literals'}
@@ -982,9 +994,9 @@ export function RiskPatternsPanel({
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
-                              <SelectItem value="normalized_no_literals">No-Literals</SelectItem>
-                              <SelectItem value="normalized">No-Comments</SelectItem>
-                              <SelectItem value="raw">Raw Query</SelectItem>
+                              <SelectItem value="normalized_no_literals">{t('patterns.regex.noLiterals')}</SelectItem>
+                              <SelectItem value="normalized">{t('patterns.regex.noComments')}</SelectItem>
+                              <SelectItem value="raw">{t('patterns.regex.raw')}</SelectItem>
                             </SelectContent>
                           </Select>
                         </div>
@@ -997,7 +1009,7 @@ export function RiskPatternsPanel({
                             onChange={(e) =>
                               setLeafList((prev) => prev.map((x, i) => (i === idx ? { ...x, command: e.target.value } : x)))
                             }
-                            placeholder="Command (e.g. CLIENT)"
+                            placeholder={t('patterns.ph.cmd')}
                           />
                           <Input
                             className="h-8 font-mono text-xs"
@@ -1005,7 +1017,7 @@ export function RiskPatternsPanel({
                             onChange={(e) =>
                               setLeafList((prev) => prev.map((x, i) => (i === idx ? { ...x, subcommand: e.target.value } : x)))
                             }
-                            placeholder="Subcommand (optional)"
+                            placeholder={t('patterns.ph.subcmd')}
                           />
                           <Input
                             className="h-8 font-mono text-xs"
@@ -1013,7 +1025,7 @@ export function RiskPatternsPanel({
                             onChange={(e) =>
                               setLeafList((prev) => prev.map((x, i) => (i === idx ? { ...x, arg_keyword: e.target.value } : x)))
                             }
-                            placeholder="Arg keyword (e.g. COUNT)"
+                            placeholder={t('patterns.ph.argKw')}
                           />
                           <Input
                             className="h-8 font-mono text-xs"
@@ -1026,7 +1038,7 @@ export function RiskPatternsPanel({
                                 ),
                               )
                             }
-                            placeholder="Arg > N"
+                            placeholder={t('patterns.ph.argGt')}
                           />
                         </div>
                       )}
@@ -1038,7 +1050,7 @@ export function RiskPatternsPanel({
                             onChange={(e) =>
                               setLeafList((prev) => prev.map((x, i) => (i === idx ? { ...x, json_path: e.target.value } : x)))
                             }
-                            placeholder="Key or $op (e.g. $where, verbosity)"
+                            placeholder={t('patterns.ph.jsonPath')}
                           />
                           <Input
                             className="h-8 font-mono text-xs"
@@ -1046,7 +1058,7 @@ export function RiskPatternsPanel({
                             onChange={(e) =>
                               setLeafList((prev) => prev.map((x, i) => (i === idx ? { ...x, equals: e.target.value } : x)))
                             }
-                            placeholder="Equals (optional)"
+                            placeholder={t('patterns.ph.equalsOpt')}
                           />
                         </div>
                       )}
@@ -1077,7 +1089,7 @@ export function RiskPatternsPanel({
                                   prev.map((x, i) => (i === idx ? { ...x, threshold: Number(e.target.value) || 0 } : x)),
                                 )
                               }
-                              placeholder="Threshold rows"
+                              placeholder={t('patterns.ph.thresholdRows')}
                             />
                           )}
                           {leaf.metric === 'plan_contains' && (
@@ -1087,7 +1099,7 @@ export function RiskPatternsPanel({
                               onChange={(e) =>
                                 setLeafList((prev) => prev.map((x, i) => (i === idx ? { ...x, pattern: e.target.value } : x)))
                               }
-                              placeholder="Plan regex"
+                              placeholder={t('patterns.ph.planRegex')}
                             />
                           )}
                         </div>
@@ -1099,7 +1111,7 @@ export function RiskPatternsPanel({
                         type="button"
                         size="icon"
                         variant="ghost"
-                        aria-label="Remove condition"
+                        aria-label={t('patterns.removeConditionAria')}
                         onClick={() => setLeafList((prev) => prev.filter((_, i) => i !== idx))}
                       >
                         <Trash2 className="size-3.5" />
@@ -1116,7 +1128,7 @@ export function RiskPatternsPanel({
                   onClick={() => setLeafList((prev) => [...prev, defaultCondition('table_ref')])}
                 >
                   <Plus className="size-3.5" />
-                  Add Condition
+                  {t('patterns.addCondition')}
                 </Button>
               )}
             </div>

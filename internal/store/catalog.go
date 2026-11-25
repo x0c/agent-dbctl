@@ -844,19 +844,21 @@ func (s *Store) DeleteTarget(ctx context.Context, actor, id string) error {
 // GetGlobalSecurityConfig returns the global security guardrails.
 func (s *Store) GetGlobalSecurityConfig(ctx context.Context) (types.GlobalSecurityConfig, error) {
 	var cfg types.GlobalSecurityConfig
-	var freeze, blockMulti, redact int
+	var freeze, blockMulti, redact, reqReason int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT exec_timeout_sec, approval_timeout_sec, max_rows, max_bytes, explain_max_rows,
-			prod_read_only_freeze, block_multi_statement_in_prod, default_approval_provider, redact_audit_literals, updated_at_utc
+			prod_read_only_freeze, block_multi_statement_in_prod, default_approval_provider, redact_audit_literals,
+			require_reason_for_approval, updated_at_utc
 		FROM global_security_config WHERE id = 1`).
 		Scan(&cfg.ExecTimeoutSec, &cfg.ApprovalTimeoutSec, &cfg.MaxRows, &cfg.MaxBytes, &cfg.ExplainMaxRows,
-			&freeze, &blockMulti, &cfg.DefaultApprovalProvider, &redact, &cfg.UpdatedAtUTC)
+			&freeze, &blockMulti, &cfg.DefaultApprovalProvider, &redact, &reqReason, &cfg.UpdatedAtUTC)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.ProdReadOnlyFreeze = freeze == 1
 	cfg.BlockMultiStatementInProd = blockMulti == 1
 	cfg.RedactAuditLiterals = redact == 1
+	cfg.RequireReasonForApproval = reqReason == 1
 	return cfg, nil
 }
 
@@ -882,11 +884,12 @@ func (s *Store) UpdateGlobalSecurityConfig(ctx context.Context, actor string, cf
 				block_multi_statement_in_prod = ?,
 				default_approval_provider = ?,
 				redact_audit_literals = ?,
+				require_reason_for_approval = ?,
 				updated_at_utc = ?
 			WHERE id = 1`,
 			cfg.ExecTimeoutSec, cfg.ApprovalTimeoutSec, cfg.MaxRows, cfg.MaxBytes, cfg.ExplainMaxRows,
 			boolToInt(cfg.ProdReadOnlyFreeze), boolToInt(cfg.BlockMultiStatementInProd),
-			cfg.DefaultApprovalProvider, boolToInt(cfg.RedactAuditLiterals), now)
+			cfg.DefaultApprovalProvider, boolToInt(cfg.RedactAuditLiterals), boolToInt(cfg.RequireReasonForApproval), now)
 		if err != nil {
 			return err
 		}
@@ -1092,308 +1095,8 @@ func (s *Store) ExportTopology(ctx context.Context) (types.TopologyBundle, error
 // ImportTopology imports a TopologyBundle in a single atomic transaction, resolving natural keys
 // (Code/Slug/Name/Ref) to preserve local IDs and Keychain bindings without overwriting local secrets.
 func (s *Store) ImportTopology(ctx context.Context, actor string, b types.TopologyBundle) error {
-	if b.SchemaVersion < 0 || b.SchemaVersion > 1 {
-		return fmt.Errorf("unsupported topology schema_version %d (supported: 1)", b.SchemaVersion)
-	}
-	if b.GlobalSecurity != nil {
-		if err := policy.ValidateGlobalConfig(*b.GlobalSecurity); err != nil {
-			return fmt.Errorf("invalid global_security in topology: %w", err)
-		}
-	}
-	now := nowUTC()
-	return s.withTx(ctx, func(tx *sql.Tx) error {
-		if b.GlobalSecurity != nil {
-			cfg := *b.GlobalSecurity
-			if cfg.DefaultApprovalProvider == "" {
-				cfg.DefaultApprovalProvider = "local-web"
-			}
-			cfg.UpdatedAtUTC = now
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE global_security_config SET
-					exec_timeout_sec = ?,
-					approval_timeout_sec = ?,
-					max_rows = ?,
-					max_bytes = ?,
-					explain_max_rows = ?,
-					prod_read_only_freeze = ?,
-					block_multi_statement_in_prod = ?,
-					default_approval_provider = ?,
-					redact_audit_literals = ?,
-					updated_at_utc = ?
-				WHERE id = 1`,
-				cfg.ExecTimeoutSec, cfg.ApprovalTimeoutSec, cfg.MaxRows, cfg.MaxBytes, cfg.ExplainMaxRows,
-				boolToInt(cfg.ProdReadOnlyFreeze), boolToInt(cfg.BlockMultiStatementInProd),
-				cfg.DefaultApprovalProvider, boolToInt(cfg.RedactAuditLiterals), now); err != nil {
-				return err
-			}
-			if err := s.appendAuditTx(ctx, tx, actor, "global_security.update", "global", "", cfg, now); err != nil {
-				return err
-			}
-		}
-
-		envCodeMap := map[string]string{}
-		envs := make([]types.Environment, len(b.Environments))
-		for i, env := range b.Environments {
-			var existingCode string
-			if err := tx.QueryRowContext(ctx, `SELECT code FROM environments WHERE LOWER(code) = LOWER(?)`, env.Code).Scan(&existingCode); err == nil {
-				envCodeMap[strings.ToLower(env.Code)] = existingCode
-				env.Code = existingCode
-			} else {
-				envCodeMap[strings.ToLower(env.Code)] = env.Code
-			}
-			envs[i] = env
-		}
-
-		sysIDMap := map[string]string{}
-		systems := make([]types.System, len(b.Systems))
-		for i, sys := range b.Systems {
-			origID := sys.ID
-			var existingID, existingWSJSON string
-			err := tx.QueryRowContext(ctx, `SELECT id, workspace_paths_json FROM systems WHERE id = ? OR LOWER(slug) = LOWER(?) LIMIT 1`, sys.ID, sys.Slug).
-				Scan(&existingID, &existingWSJSON)
-			if err == nil {
-				sys.ID = existingID
-				if len(sys.WorkspacePaths) == 0 {
-					var localWS []string
-					_ = json.Unmarshal([]byte(existingWSJSON), &localWS)
-					if len(localWS) > 0 {
-						sys.WorkspacePaths = localWS
-					}
-				}
-			} else if sys.ID == "" {
-				sys.ID = newID("sys")
-			}
-			if origID != "" {
-				sysIDMap[origID] = sys.ID
-			}
-			if sys.Slug != "" {
-				sysIDMap["slug:"+strings.ToLower(sys.Slug)] = sys.ID
-			}
-			systems[i] = sys
-		}
-
-		cpIDMap := map[string]string{}
-		creds := make([]types.CredentialProfile, len(b.CredentialProfiles))
-		for i, cp := range b.CredentialProfiles {
-			origID := cp.ID
-			var existingID string
-			if err := tx.QueryRowContext(ctx, `SELECT id FROM credential_profiles WHERE id = ? OR LOWER(name) = LOWER(?) LIMIT 1`, cp.ID, cp.Name).
-				Scan(&existingID); err == nil {
-				cp.ID = existingID
-			} else if cp.ID == "" {
-				cp.ID = newID("cred")
-			}
-			if origID != "" {
-				cpIDMap[origID] = cp.ID
-			}
-			creds[i] = cp
-		}
-
-		npIDMap := map[string]string{}
-		nets := make([]types.NetworkProfile, len(b.NetworkProfiles))
-		for i, np := range b.NetworkProfiles {
-			origID := np.ID
-			var existingID string
-			if err := tx.QueryRowContext(ctx, `SELECT id FROM network_profiles WHERE id = ? OR LOWER(name) = LOWER(?) LIMIT 1`, np.ID, np.Name).
-				Scan(&existingID); err == nil {
-				np.ID = existingID
-			} else if np.ID == "" {
-				np.ID = newID("net")
-			}
-			if origID != "" {
-				npIDMap[origID] = np.ID
-			}
-			nets[i] = np
-		}
-
-		instIDMap := map[string]string{}
-		insts := make([]types.Instance, len(b.Instances))
-		for i, inst := range b.Instances {
-			origID := inst.ID
-			var existingID string
-			if err := tx.QueryRowContext(ctx, `SELECT id FROM instances WHERE id = ? OR LOWER(name) = LOWER(?) LIMIT 1`, inst.ID, inst.Name).
-				Scan(&existingID); err == nil {
-				inst.ID = existingID
-			} else if inst.ID == "" {
-				inst.ID = newID("inst")
-			}
-			if origID != "" {
-				instIDMap[origID] = inst.ID
-			}
-			insts[i] = inst
-		}
-
-		tgtIDMap := map[string]string{}
-		targets := make([]types.Target, len(b.Targets))
-		for i, tgt := range b.Targets {
-			origID := tgt.ID
-			var existingID string
-			if err := tx.QueryRowContext(ctx, `SELECT id FROM targets WHERE id = ? OR LOWER(ref) = LOWER(?) LIMIT 1`, tgt.ID, tgt.Ref).
-				Scan(&existingID); err == nil {
-				tgt.ID = existingID
-			} else if tgt.ID == "" {
-				tgt.ID = newID("tgt")
-			}
-			if origID != "" {
-				tgtIDMap[origID] = tgt.ID
-			}
-			if tgt.Ref != "" {
-				tgtIDMap["ref:"+strings.ToLower(tgt.Ref)] = tgt.ID
-			}
-			targets[i] = tgt
-		}
-
-		polIDMap := map[string]string{}
-		policies := make([]types.PolicyRuleSet, len(b.Policies))
-		for i, pol := range b.Policies {
-			origID := pol.ID
-			var existingID string
-			if err := tx.QueryRowContext(ctx, `SELECT id FROM policies WHERE id = ? OR LOWER(name) = LOWER(?) LIMIT 1`, pol.ID, pol.Name).
-				Scan(&existingID); err == nil {
-				pol.ID = existingID
-			} else if pol.ID == "" {
-				pol.ID = newID("pol")
-			}
-			if origID != "" {
-				polIDMap[origID] = pol.ID
-			}
-			pol.ScopeID = remapScopeID(pol.ScopeType, pol.ScopeID, envCodeMap, sysIDMap, tgtIDMap)
-			policies[i] = pol
-		}
-
-		for _, pol := range policies {
-			if _, err := s.upsertPolicyTx(ctx, tx, actor, pol, now); err != nil {
-				return err
-			}
-		}
-		for _, env := range envs {
-			if mapped, ok := polIDMap[env.DefaultPolicyID]; ok {
-				env.DefaultPolicyID = mapped
-			}
-			if _, err := s.upsertEnvironmentTx(ctx, tx, actor, env, now); err != nil {
-				return err
-			}
-		}
-		for _, sys := range systems {
-			if mapped, ok := polIDMap[sys.DefaultPolicyID]; ok {
-				sys.DefaultPolicyID = mapped
-			}
-			if _, err := s.upsertSystemTx(ctx, tx, actor, sys, now); err != nil {
-				return err
-			}
-		}
-		for _, cp := range creds {
-			if _, err := s.upsertCredentialProfileTx(ctx, tx, actor, cp, now); err != nil {
-				return err
-			}
-		}
-		for _, np := range nets {
-			if mapped, ok := cpIDMap[np.BastionCredentialID]; ok {
-				np.BastionCredentialID = mapped
-			}
-			if _, err := s.upsertNetworkProfileTx(ctx, tx, actor, np, now); err != nil {
-				return err
-			}
-		}
-
-		// Upsert non-replica / root instances before replicas so PrimaryInstanceID checks pass regardless of bundle order.
-		for pass := 0; pass < 2; pass++ {
-			for _, inst := range insts {
-				isDependent := inst.PrimaryInstanceID != ""
-				if (pass == 0 && isDependent) || (pass == 1 && !isDependent) {
-					continue
-				}
-				if mapped, ok := npIDMap[inst.NetworkProfileID]; ok {
-					inst.NetworkProfileID = mapped
-				}
-				if mapped, ok := instIDMap[inst.PrimaryInstanceID]; ok {
-					inst.PrimaryInstanceID = mapped
-				}
-				if _, err := s.upsertInstanceTx(ctx, tx, actor, inst, now); err != nil {
-					return err
-				}
-			}
-		}
-
-		for _, tgt := range targets {
-			if mapped, ok := sysIDMap[tgt.OwnerSystemID]; ok {
-				tgt.OwnerSystemID = mapped
-			}
-			for j, lid := range tgt.LinkedSystemIDs {
-				if mapped, ok := sysIDMap[lid]; ok {
-					tgt.LinkedSystemIDs[j] = mapped
-				}
-			}
-			if mapped, ok := envCodeMap[strings.ToLower(tgt.EnvironmentCode)]; ok {
-				tgt.EnvironmentCode = mapped
-			}
-			if mapped, ok := instIDMap[tgt.InstanceID]; ok {
-				tgt.InstanceID = mapped
-			}
-			if mapped, ok := cpIDMap[tgt.ROCredentialID]; ok {
-				tgt.ROCredentialID = mapped
-			}
-			if mapped, ok := cpIDMap[tgt.RWCredentialID]; ok {
-				tgt.RWCredentialID = mapped
-			}
-			if mapped, ok := polIDMap[tgt.PolicyOverrideID]; ok {
-				tgt.PolicyOverrideID = mapped
-			}
-			if _, err := s.upsertTargetTx(ctx, tx, actor, tgt, now); err != nil {
-				return err
-			}
-		}
-
-		for _, pat := range b.RiskPatternRules {
-			if pat.ScopeType != "global" {
-				pat.ScopeID = remapScopeID(pat.ScopeType, pat.ScopeID, envCodeMap, sysIDMap, tgtIDMap)
-			}
-			var existingID string
-			if err := tx.QueryRowContext(ctx, `SELECT id FROM risk_pattern_rules WHERE id = ? OR (scope_type = ? AND scope_id = ? AND name = ?) LIMIT 1`,
-				pat.ID, pat.ScopeType, pat.ScopeID, pat.Name).Scan(&existingID); err == nil {
-				pat.ID = existingID
-			}
-			if _, err := s.upsertRiskPatternRuleTx(ctx, tx, actor, pat, now); err != nil {
-				return err
-			}
-		}
-		return s.appendAuditTx(ctx, tx, actor, "topology.import", "catalog", "", map[string]any{
-			"schema_version":      b.SchemaVersion,
-			"environments":        len(envs),
-			"systems":             len(systems),
-			"credential_profiles": len(creds),
-			"network_profiles":    len(nets),
-			"instances":           len(insts),
-			"targets":             len(targets),
-			"policies":            len(policies),
-			"risk_pattern_rules":  len(b.RiskPatternRules),
-		}, now)
-	})
-}
-
-func remapScopeID(scopeType, scopeID string, envCodeMap, sysIDMap, tgtIDMap map[string]string) string {
-	trimmed := strings.TrimSpace(scopeID)
-	switch scopeType {
-	case "env":
-		if mapped, ok := envCodeMap[strings.ToLower(trimmed)]; ok {
-			return mapped
-		}
-	case "system":
-		if mapped, ok := sysIDMap[trimmed]; ok {
-			return mapped
-		}
-		if mapped, ok := sysIDMap["slug:"+strings.ToLower(trimmed)]; ok {
-			return mapped
-		}
-	case "target":
-		if mapped, ok := tgtIDMap[trimmed]; ok {
-			return mapped
-		}
-		if mapped, ok := tgtIDMap["ref:"+strings.ToLower(trimmed)]; ok {
-			return mapped
-		}
-	}
-	return trimmed
+	_, err := s.ImportTopologyWithResult(ctx, actor, b)
+	return err
 }
 
 func canonicalizeScopeIDTx(ctx context.Context, tx *sql.Tx, scopeType, scopeID string) string {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,7 +36,7 @@ func (d *MongoDriver) Metadata() types.DriverMetadata {
 		Family:       types.FamilyDocument,
 		Tier:         "builtin",
 		Version:      "1.1.0",
-		Capabilities: []string{"ping", "list_databases", "preflight", "execute"},
+		Capabilities: []string{"ping", "list_databases", "schema", "preflight", "execute"},
 		Verified:     true,
 		Labels:       map[string]string{"en": "MongoDB", "zh": "MongoDB"},
 	}
@@ -733,6 +734,112 @@ func normalizeBSON(v any) any {
 	default:
 		return x
 	}
+}
+
+func (c *mongoConn) ListTables(ctx context.Context, opts driver.SchemaListOpts) (*types.SchemaListResult, error) {
+	names, err := c.client.Database(c.dbName).ListCollectionNames(ctx, bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(names)
+	all := make([]types.SchemaObjectSummary, 0, len(names))
+	for _, n := range names {
+		all = append(all, types.SchemaObjectSummary{
+			Schema: c.dbName,
+			Name:   n,
+			Type:   "collection",
+		})
+	}
+	items, total, truncated := driver.FilterAndCapSchemaObjects(all, opts.Search, opts.Limit)
+	dialect := "mongodb"
+	if caps := c.Capabilities(); caps != nil && caps.Dialect != "" {
+		dialect = caps.Dialect
+	}
+	return &types.SchemaListResult{
+		Engine:        "mongodb",
+		Dialect:       dialect,
+		Database:      c.dbName,
+		Items:         items,
+		TotalCount:    total,
+		ReturnedCount: len(items),
+		Truncated:     truncated,
+		Notes:         []string{`MongoDB exec uses JSON RunCommand syntax (e.g. {"find": "collection", "filter": {}, "limit": 20}).`},
+	}, nil
+}
+
+func (c *mongoConn) DescribeTable(ctx context.Context, name string) (*types.TableSchema, error) {
+	_, coll := driver.SplitQualifiedObject(name)
+	if coll == "" {
+		return nil, fmt.Errorf("collection name is required")
+	}
+	names, err := c.client.Database(c.dbName).ListCollectionNames(ctx, bson.D{{Key: "name", Value: coll}})
+	if err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("collection %s.%s not found", c.dbName, coll)
+	}
+
+	var idxs []types.SchemaIndex
+	var idxOut bson.M
+	if err := c.client.Database(c.dbName).RunCommand(ctx, bson.D{{Key: "listIndexes", Value: coll}}).Decode(&idxOut); err == nil {
+		if cur, ok := idxOut["cursor"].(bson.M); ok {
+			if fb, ok := cur["firstBatch"].(bson.A); ok {
+				for _, rawIdx := range fb {
+					norm, ok := normalizeBSON(rawIdx).(map[string]any)
+					if !ok {
+						continue
+					}
+					idxName := fmt.Sprint(norm["name"])
+					uniq, _ := norm["unique"].(bool)
+					var cols []string
+					if keyMap, ok := norm["key"].(map[string]any); ok {
+						for k := range keyMap {
+							cols = append(cols, k)
+						}
+						sort.Strings(cols)
+					}
+					idxs = append(idxs, types.SchemaIndex{
+						Name:    idxName,
+						Columns: cols,
+						Unique:  uniq || idxName == "_id_",
+						Primary: idxName == "_id_",
+					})
+				}
+			}
+		}
+	}
+
+	var sampleDocs []any
+	var findOut bson.M
+	if err := c.client.Database(c.dbName).RunCommand(ctx, bson.D{
+		{Key: "find", Value: coll},
+		{Key: "limit", Value: 5},
+	}).Decode(&findOut); err == nil {
+		if cur, ok := findOut["cursor"].(bson.M); ok {
+			if fb, ok := cur["firstBatch"].(bson.A); ok {
+				for _, d := range fb {
+					sampleDocs = append(sampleDocs, normalizeBSON(d))
+				}
+			}
+		}
+	}
+
+	dialect := "mongodb"
+	if caps := c.Capabilities(); caps != nil && caps.Dialect != "" {
+		dialect = caps.Dialect
+	}
+	return &types.TableSchema{
+		Engine:       "mongodb",
+		Dialect:      dialect,
+		Database:     c.dbName,
+		Schema:       c.dbName,
+		Name:         coll,
+		ObjectType:   "collection",
+		Indexes:      idxs,
+		SampleFields: driver.CollectSampleFields(sampleDocs),
+		Notes:        []string{fmt.Sprintf(`Query with JSON RunCommand: {"find": %q, "filter": {}, "limit": 20}`, coll)},
+	}, nil
 }
 
 func (c *mongoConn) CancelAndDiscard() error {

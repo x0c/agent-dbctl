@@ -34,6 +34,8 @@ import {
   type SystemRecord,
   type TargetDetail,
 } from '../api'
+import { resolveDisplayItem } from '../lib/catalog'
+import { useI18n } from '../lib/i18n'
 import { RiskPatternsPanel } from './RiskPatternsPanel'
 
 export function PoliciesTab({
@@ -43,6 +45,7 @@ export function PoliciesTab({
   catalog: DisplayCatalog
   onSavedGlobal: (cfg: GlobalSecurityConfig) => void
 }) {
+  const { locale, t } = useI18n()
   const [globalCfg, setGlobalCfg] = useState<GlobalSecurityConfig | null>(null)
   const [policies, setPolicies] = useState<PolicyRuleSet[]>([])
   const [envs, setEnvs] = useState<EnvironmentRecord[]>([])
@@ -81,7 +84,7 @@ export function PoliciesTab({
       setSystems(sRes.items ?? [])
       setTargets(tRes.items ?? [])
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load policies')
+      setError(e instanceof Error ? e.message : t('policies.loadFailed'))
     } finally {
       setLoading(false)
     }
@@ -98,9 +101,9 @@ export function PoliciesTab({
       const updated = await api.saveGlobalSecurity(globalCfg)
       setGlobalCfg(updated)
       onSavedGlobal(updated)
-      toast.success('Global security guardrails updated')
+      toast.success(t('policies.globalSaved'))
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Update failed')
+      toast.error(e instanceof Error ? e.message : t('policies.updateFailed'))
     } finally {
       setSavingGlobal(false)
     }
@@ -113,10 +116,10 @@ export function PoliciesTab({
     try {
       await api.savePolicy(polForm)
       setDialogOpen(false)
-      toast.success('Policy saved')
+      toast.success(t('policies.policySaved'))
       await load()
     } catch (e) {
-      setPolErr(e instanceof Error ? e.message : 'Save failed')
+      setPolErr(e instanceof Error ? e.message : t('common.saveFailed'))
     } finally {
       setSavingPol(false)
     }
@@ -125,12 +128,12 @@ export function PoliciesTab({
   const columns: ColumnDef<PolicyRuleSet, unknown>[] = [
     {
       accessorKey: 'name',
-      header: 'Policy Name',
+      header: t('policies.col.name'),
       cell: ({ row }) => <span className="font-mono text-xs font-semibold">{row.original.name}</span>,
     },
     {
       id: 'scope',
-      header: 'Scope',
+      header: t('policies.col.scope'),
       cell: ({ row }) => (
         <Badge variant="outline" className="font-mono text-[11px]">
           {row.original.scope_type}:{row.original.scope_id}
@@ -139,10 +142,13 @@ export function PoliciesTab({
     },
     {
       id: 'limits',
-      header: 'Tightened Limits',
+      header: t('policies.col.limits'),
       cell: ({ row }) => (
         <span className="font-mono text-xs text-muted-foreground">
-          timeout={row.original.exec_timeout_sec ?? 'inherit'}s · max_rows={row.original.max_rows ?? 'inherit'}
+          {t('policies.limitsSummary', {
+            timeout: row.original.exec_timeout_sec ?? t('policies.inherit'),
+            rows: row.original.max_rows ?? t('policies.inherit'),
+          })}
         </span>
       ),
     },
@@ -160,12 +166,13 @@ export function PoliciesTab({
               setDialogOpen(true)
             }}
           >
-            Edit
+            {t('common.edit')}
           </Button>
           <ConfirmAction
-            trigger={<Button size="sm" variant="ghost">Delete</Button>}
-            title={`Delete policy ${row.original.name}?`}
-            confirmLabel="Delete"
+            trigger={<Button size="sm" variant="ghost">{t('common.delete')}</Button>}
+            title={t('policies.deleteTitle', { name: row.original.name })}
+            confirmLabel={t('common.delete')}
+            cancelLabel={t('common.cancel')}
             destructive
             onConfirm={async () => {
               await api.deletePolicy(row.original.id)
@@ -180,12 +187,12 @@ export function PoliciesTab({
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Policies & Guardrails"
+        title={t('policies.title')}
         actions={
           <div className="flex items-center gap-2">
             <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
               <RefreshCw className={loading ? 'animate-spin' : undefined} />
-              Refresh
+              {t('common.refresh')}
             </Button>
             <Button
               size="sm"
@@ -202,7 +209,7 @@ export function PoliciesTab({
               }}
             >
               <Plus />
-              New Policy Override
+              {t('policies.newOverride')}
             </Button>
           </div>
         }
@@ -212,100 +219,116 @@ export function PoliciesTab({
 
       <Tabs value={subTab} onValueChange={(v) => setSubTab(v as typeof subTab)}>
         <TabsList>
-          <TabsTrigger value="guardrails">Guardrails &amp; Overrides</TabsTrigger>
-          <TabsTrigger value="patterns">High-Risk Patterns</TabsTrigger>
+          <TabsTrigger value="guardrails">{t('policies.tab.guardrails')}</TabsTrigger>
+          <TabsTrigger value="patterns">{t('policies.tab.patterns')}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="guardrails" className="space-y-5 pt-2">
           {globalCfg && (
             <Panel
-              title="Global Security Guardrails (Hard Ceilings)"
+              title={t('policies.globalTitle')}
               action={
                 <LoadingButton size="sm" pending={savingGlobal} onClick={() => void saveGlobal()}>
                   <Save className="size-3.5" />
-                  Save Guardrails
+                  {t('policies.saveGuardrails')}
                 </LoadingButton>
               }
             >
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                <FormField label="Execution Timeout (sec)">
+                <FormField label={t('policies.execTimeout')}>
                   <Input
                     type="number"
                     value={globalCfg.exec_timeout_sec}
                     onChange={(e) => setGlobalCfg((p) => p && { ...p, exec_timeout_sec: Number(e.target.value) })}
                   />
                 </FormField>
-                <FormField label="Approval Timeout (sec)">
+                <FormField label={t('policies.approvalTimeout')}>
                   <Input
                     type="number"
                     value={globalCfg.approval_timeout_sec}
                     onChange={(e) => setGlobalCfg((p) => p && { ...p, approval_timeout_sec: Number(e.target.value) })}
                   />
                 </FormField>
-                <FormField label="Max Returned Rows">
+                <FormField label={t('policies.maxRows')}>
                   <Input
                     type="number"
                     value={globalCfg.max_rows}
                     onChange={(e) => setGlobalCfg((p) => p && { ...p, max_rows: Number(e.target.value) })}
                   />
                 </FormField>
-                <FormField label="Max Returned Bytes">
+                <FormField label={t('policies.maxBytes')}>
                   <Input
                     type="number"
                     value={globalCfg.max_bytes}
                     onChange={(e) => setGlobalCfg((p) => p && { ...p, max_bytes: Number(e.target.value) })}
                   />
                 </FormField>
-                <FormField label="EXPLAIN Estimated Row Threshold">
+                <FormField label={t('policies.explainMaxRows')}>
                   <Input
                     type="number"
                     value={globalCfg.explain_max_rows}
                     onChange={(e) => setGlobalCfg((p) => p && { ...p, explain_max_rows: Number(e.target.value) })}
                   />
                 </FormField>
-                <FormField label="Default Approval Provider">
+                <FormField label={t('policies.defaultProvider')}>
                   <Select
                     value={globalCfg.default_approval_provider}
                     onValueChange={(v) => setGlobalCfg((p) => p && { ...p, default_approval_provider: v })}
                   >
-                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
                     <SelectContent>
                       {catalog.approval_providers.map((ap) => (
-                        <SelectItem key={ap.code} value={ap.code}>{ap.code}</SelectItem>
+                        <SelectItem key={ap.code} value={ap.code}>
+                          {resolveDisplayItem(catalog.approval_providers, ap.code, locale).label}
+                        </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
                 </FormField>
               </div>
 
-              <div className="mt-4 grid gap-3 border-t border-border pt-4 sm:grid-cols-3">
+              <div className="mt-4 grid gap-3 border-t border-border pt-4 sm:grid-cols-2">
                 <label className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm">
-                  <span>Prod Read-Only Freeze</span>
+                  <span>{t('policies.prodFreeze')}</span>
                   <Switch
                     checked={globalCfg.prod_read_only_freeze}
                     onCheckedChange={(c) => setGlobalCfg((p) => p && { ...p, prod_read_only_freeze: c })}
                   />
                 </label>
                 <label className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm">
-                  <span>Block Multi-Statement in Prod</span>
+                  <span>{t('policies.blockMultiProd')}</span>
                   <Switch
                     checked={globalCfg.block_multi_statement_in_prod}
                     onCheckedChange={(c) => setGlobalCfg((p) => p && { ...p, block_multi_statement_in_prod: c })}
                   />
                 </label>
                 <label className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm">
-                  <span>Redact Literals in Audit</span>
+                  <span>{t('policies.redactAudit')}</span>
                   <Switch
                     checked={globalCfg.redact_audit_literals}
                     onCheckedChange={(c) => setGlobalCfg((p) => p && { ...p, redact_audit_literals: c })}
+                  />
+                </label>
+                <label className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm">
+                  <span>{t('policies.requireReason')}</span>
+                  <Switch
+                    checked={globalCfg.require_reason_for_approval}
+                    onCheckedChange={(c) => setGlobalCfg((p) => p && { ...p, require_reason_for_approval: c })}
                   />
                 </label>
               </div>
             </Panel>
           )}
 
-          <Panel title="Scoped Policy Overrides (Env → System → Target)" flush>
-            <DataTable columns={columns} data={policies} emptyLabel="No scoped policy overrides configured (using environment defaults)." />
+          <Panel title={t('policies.overridesTitle')} flush>
+            <DataTable
+              columns={columns}
+              data={policies}
+              searchPlaceholder={t('common.search')}
+              emptyLabel={t('policies.overridesEmpty')}
+            />
           </Panel>
         </TabsContent>
 
@@ -317,18 +340,27 @@ export function PoliciesTab({
       <FormDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
-        title={polForm.id ? 'Edit Policy Override' : 'New Policy Override'}
+        title={polForm.id ? t('policies.dialog.editTitle') : t('policies.dialog.newTitle')}
+        submitLabel={t('common.save')}
+        cancelLabel={t('common.cancel')}
         error={polErr}
         pending={savingPol}
         onSubmit={savePolicy}
       >
-        <FormField label="Name">
+        <FormField label={t('policies.field.name')}>
           <Input value={polForm.name ?? ''} onChange={(e) => setPolForm((p) => ({ ...p, name: e.target.value }))} />
         </FormField>
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Scope Type">
-            <Select value={polForm.scope_type ?? 'env'} onValueChange={(v) => setPolForm((p) => ({ ...p, scope_type: v as PolicyRuleSet['scope_type'], scope_id: '' }))}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
+          <FormField label={t('policies.field.scopeType')}>
+            <Select
+              value={polForm.scope_type ?? 'env'}
+              onValueChange={(v) =>
+                setPolForm((p) => ({ ...p, scope_type: v as PolicyRuleSet['scope_type'], scope_id: '' }))
+              }
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
               <SelectContent>
                 <SelectItem value="env">env</SelectItem>
                 <SelectItem value="system">system</SelectItem>
@@ -336,61 +368,86 @@ export function PoliciesTab({
               </SelectContent>
             </Select>
           </FormField>
-          <FormField label="Scope Target">
+          <FormField label={t('policies.field.scopeTarget')}>
             <Select value={polForm.scope_id ?? ''} onValueChange={(v) => setPolForm((p) => ({ ...p, scope_id: v }))}>
-              <SelectTrigger><SelectValue placeholder="Select scope" /></SelectTrigger>
+              <SelectTrigger>
+                <SelectValue placeholder={t('policies.field.selectScope')} />
+              </SelectTrigger>
               <SelectContent>
-                {polForm.scope_type === 'env' && envs.map((e) => <SelectItem key={e.code} value={e.code}>{e.code}</SelectItem>)}
-                {polForm.scope_type === 'system' && systems.map((s) => <SelectItem key={s.id} value={s.id}>{s.slug}</SelectItem>)}
-                {polForm.scope_type === 'target' && targets.map((t) => <SelectItem key={t.target.id} value={t.target.id}>{t.target.ref}</SelectItem>)}
+                {polForm.scope_type === 'env' &&
+                  envs.map((e) => (
+                    <SelectItem key={e.code} value={e.code}>
+                      {e.code}
+                    </SelectItem>
+                  ))}
+                {polForm.scope_type === 'system' &&
+                  systems.map((s) => (
+                    <SelectItem key={s.id} value={s.id}>
+                      {s.slug}
+                    </SelectItem>
+                  ))}
+                {polForm.scope_type === 'target' &&
+                  targets.map((tg) => (
+                    <SelectItem key={tg.target.id} value={tg.target.id}>
+                      {tg.target.ref}
+                    </SelectItem>
+                  ))}
               </SelectContent>
             </Select>
           </FormField>
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Exec Timeout Override (sec)">
+          <FormField label={t('policies.field.execTimeoutOverride')}>
             <Input
               type="number"
               value={polForm.exec_timeout_sec ?? ''}
-              onChange={(e) => setPolForm((p) => ({ ...p, exec_timeout_sec: e.target.value ? Number(e.target.value) : null }))}
-              placeholder="Inherit global"
+              onChange={(e) =>
+                setPolForm((p) => ({ ...p, exec_timeout_sec: e.target.value ? Number(e.target.value) : null }))
+              }
+              placeholder={t('policies.field.inheritGlobal')}
             />
           </FormField>
-          <FormField label="Max Rows Override">
+          <FormField label={t('policies.field.maxRowsOverride')}>
             <Input
               type="number"
               value={polForm.max_rows ?? ''}
-              onChange={(e) => setPolForm((p) => ({ ...p, max_rows: e.target.value ? Number(e.target.value) : null }))}
-              placeholder="Inherit global"
+              onChange={(e) =>
+                setPolForm((p) => ({ ...p, max_rows: e.target.value ? Number(e.target.value) : null }))
+              }
+              placeholder={t('policies.field.inheritGlobal')}
             />
           </FormField>
         </div>
         <div className="grid grid-cols-2 gap-3 text-sm">
           <label className="flex items-center justify-between rounded-md border border-border px-3 py-2">
-            <span>Approve High-Cost Read</span>
+            <span>{t('policies.field.approveHighCost')}</span>
             <Switch
               checked={polForm.require_approval_on_high_cost_read ?? true}
               onCheckedChange={(c) => setPolForm((p) => ({ ...p, require_approval_on_high_cost_read: c }))}
             />
           </label>
           <label className="flex items-center justify-between rounded-md border border-border px-3 py-2">
-            <span>Approve Writes</span>
+            <span>{t('policies.field.approveWrites')}</span>
             <Switch
               checked={polForm.require_approval_on_write ?? true}
               onCheckedChange={(c) => setPolForm((p) => ({ ...p, require_approval_on_write: c }))}
             />
           </label>
         </div>
-        <FormField label="Approval Provider Override">
+        <FormField label={t('policies.field.providerOverride')}>
           <Select
             value={polForm.approval_provider || '__inherit'}
             onValueChange={(v) => setPolForm((p) => ({ ...p, approval_provider: v === '__inherit' ? '' : v }))}
           >
-            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
             <SelectContent>
-              <SelectItem value="__inherit">Inherit parent / global</SelectItem>
+              <SelectItem value="__inherit">{t('policies.field.inheritParent')}</SelectItem>
               {catalog.approval_providers.map((ap) => (
-                <SelectItem key={ap.code} value={ap.code}>{ap.code}</SelectItem>
+                <SelectItem key={ap.code} value={ap.code}>
+                  {resolveDisplayItem(catalog.approval_providers, ap.code, locale).label}
+                </SelectItem>
               ))}
             </SelectContent>
           </Select>

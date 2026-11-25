@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.3.0
+
+### English
+
+- **9 built-in zero-JVM drivers & unified schema introspection**: Added built-in pure-Go drivers for ClickHouse, Microsoft SQL Server (MSSQL), Oracle Database, and Elasticsearch / OpenSearch (plus compatible dialect aliases across PostgreSQL, MySQL, MongoDB, and Redis families) and implemented `db schema <ref> [table]` read-only introspection across all 9 engines.
+- **Mandatory approval reason (`--reason`), DML preflight & 9 official risk packs**: Enabled `require_reason_for_approval` by default so operations triggering human approval without `--reason` fail fast with exit `2` (`reason_required`) and recovery guidance without creating blank tickets; extended non-mutating `EXPLAIN` preflight to single-statement DML and expanded built-in risk pattern packs to 9 (`pg-side-effect`, `sqlite-pragma-blob`, `redis-single-thread`, `mongo-js-explain`, `mysql-dos-guard`, `clickhouse-heavy-scan`, `mssql-proc-dos`, `oracle-sys-guard`, `es-unbounded-scan`).
+- **Full CLI catalog/policy automation & zero-secret Web handoff**: Added idempotent `--dry-run`-capable `db add|set|delete`, `system|env|network|cred|instance` management, `topology schema|export|apply`, and `security|policy|pattern` administration over the private `0600` daemon RPC channel, plus zero-secret Keychain setup (`--open-secret` / `ui open --credential`).
+- **Hardened Web Console security & bilingual English / Chinese UI**: Added `WebSecurityMiddleware` (loopback `Host` validation, strict same-origin checks, and per-daemon `HttpOnly; SameSite=Strict` session cookie + `X-Agent-DBCTL-CSRF` verification) and full English / Simplified Chinese (`EN` / `中文`) Web Console localization with auto-detection, instant topbar switching, and server-driven `DisplayCatalog` labels.
+- **Audit framing, daemon upgrade & CLI ergonomics**: Hardened `audit_logs` SHA-256 hash-chain framing, added `--format objects` row output, synchronous `op cancel`, automatic single-instance daemon version upgrade with fast SSE shutdown, and richer `TargetLookupError` recovery hints.
+
+### 简体中文
+
+- **9 大零 JVM 内置驱动与跨引擎结构探查**：新增 ClickHouse、Microsoft SQL Server（MSSQL）、Oracle Database 与 Elasticsearch / OpenSearch 纯 Go 内置驱动（并完善各引擎方言别名映射），全部 9 类引擎统一支持只读 `db schema <ref> [table]` 库表/集合/索引与键前缀结构探查。
+- **强制申请理由（`--reason`）、DML 预检与 9 套官方风险规则包**：默认开启全局护栏 `require_reason_for_approval`，触发人工审批却未传 `--reason` 时立即返回退出码 `2`（`reason_required`）与可执行恢复命令而不生成空白审批单；扩展只读 `EXPLAIN` 预检至单条 DML 语句，并将官方内置高危规则包扩充至 9 套。
+- **全量 CLI 资产/策略自动化与零密钥 Web 录入交接**：通过私有 `0600` 守护进程 RPC 通道提供幂等且支持 `--dry-run` 的 `db add|set|delete`、`system|env|network|cred|instance` 管理、`topology schema|export|apply` 以及 `security|policy|pattern` 配置命令，并支持 `--open-secret` / `ui open --credential` 免暴露密码的 Keychain Web 录入交接。
+- **Web 控制台安全加固与完整中英文双语界面**：新增 `WebSecurityMiddleware`（回环 `Host` 校验、严格同源检查以及每会话 `HttpOnly; SameSite=Strict` Cookie + `X-Agent-DBCTL-CSRF` 校验）；为 Web 控制台补齐完整简体中文 / 英文界面适配，默认跟随系统语言并提供顶栏一键切换，联动服务端下发的多语言 `DisplayCatalog` 标签。
+- **审计哈希链加固、守护进程升级与 CLI 体验优化**：加固 `audit_logs` SHA-256 哈希链防歧义编码，新增 `--format objects` 对象数组输出、`op cancel` 同步等待收敛、单实例锁下的守护进程自动版本重启与 SSE 快速关闭，以及更清晰的模糊目标候选恢复提示。
+
 ## v0.2.0
 
 ### English

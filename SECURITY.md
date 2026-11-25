@@ -9,8 +9,9 @@
 
 ## Trust Boundary
 
-- `agent-dbctl` separates configuration and approval writes (human-facing local Web UI) from agent CLI execution (configuration read-only). Local HTTP mutating endpoints enforce browser same-origin checks (`Origin`/`Sec-Fetch-Site`/`Referer`), while direct non-browser loopback requests and the static `X-Agent-DBCTL-UI: 1` SPA approval header are currently accepted pending replacement with a daemon-issued cryptographic UI session/CSRF token (`docs/ARCHITECTURE.md` §6); until then, the local OS user account is trusted against rogue local processes.
-- Production safety depends on assigning databases to `guarded` (`staging`) or `strict` (`prod`) environments and configuring separate read-only (`ro_credential_id`) vs read-write (`rw_credential_id`) credentials.
+- **CLI vs Human Approval Separation**: Coding agents and engineers can manage the four-layer catalog, topology bundles, instance discovery, security guardrails, and custom risk pattern rules via the `agent-dbctl` CLI over the private `0600` daemon RPC channel (`Unix` domain socket on macOS/Linux, `0600` loopback token on Windows). Execution approval decisions (`approve` / `reject`) are intentionally excluded from CLI/RPC and require human confirmation in the local Web Console or an external `ApprovalProvider`.
+- **Hardened Local Web Console**: All `/api/v1/*` requests validate loopback `Host` headers (`127.0.0.1`, `localhost`, `[::1]`) against DNS rebinding. Mutating Web requests enforce strict browser same-origin headers (`Origin`/`Sec-Fetch-Site`/`Referer`, rejecting headerless requests) plus a per-daemon cryptographic `HttpOnly; SameSite=Strict` session cookie (`agent_dbctl_session`) and `X-Agent-DBCTL-CSRF` token (or a one-time `approval_token` for deep-link approval actions).
+- **Zero-Secret Web Handoff**: Agents can register `keychain` credentials with a blank password via CLI and open `ui open --credential <name-or-id>` (or `--open-secret`) so humans enter passwords directly in the local Web UI without ever exposing secrets to the agent or CLI history. Production safety depends on assigning databases to `guarded` (`staging`) or `strict` (`prod`) environments and configuring separate read-only (`ro_credential_id`) vs read-write (`rw_credential_id`) credentials.
 
 ## Reporting a Vulnerability
 

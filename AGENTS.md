@@ -14,14 +14,14 @@ Read the relevant document(s) before making design, protocol, CLI contract, or U
 - [docs/PLUGIN_PROTOCOL.md](docs/PLUGIN_PROTOCOL.md): Tier-3 external gRPC driver plugin protocol (`v1` `Struct` & `v2` typed Protobuf + `Cancel` RPC), `manifest.json` schema, SHA-256 verification, capability-gated dispatch, loopback tunnel bridge, and `ApprovalProvider` (`local-web`, `webhook`, custom) contract.
 - [skills/agent-dbctl/SKILL.md](skills/agent-dbctl/SKILL.md): Canonical companion coding-agent skill synced to local agent skill directories.
 - [SECURITY.md](SECURITY.md): Threat model, local execution guarantees, and private vulnerability reporting.
-- [CONTRIBUTING.md](CONTRIBUTING.md): Development checks, local binary installation caveats, and CI-independent local release packaging.
+- [CONTRIBUTING.md](CONTRIBUTING.md): Development checks, live multi-database test workflow, local binary installation caveats, and CI-independent local release packaging.
 - [CHANGELOG.md](CHANGELOG.md): Bilingual release notes.
 
 ## Invariants
 
 - **Zero JVM**: No Java/JDBC runtime or sidecar components. Built-in drivers are pure Go (`CGO_ENABLED=0`); external drivers run via language-agnostic gRPC subprocesses (`hashicorp/go-plugin`).
-- **Control vs Execution Separation**: Configuration writes, environment tagging, policy changes, and production approvals happen strictly in the human-facing local Web UI (local Web UI / loopback HTTP endpoints with same-origin checks and approval tokens; session-token hardening tracked in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)). The CLI is read-only for catalog/policy configuration and never prints secrets or connection strings.
-- **Verbatim Forwarding**: `agent-dbctl` never translates or rewrites SQL/Mongo/Redis dialects across engines (except read-only `EXPLAIN` preflight wrapping).
+- **Control vs Execution Separation**: Both the CLI (over the private `0600` daemon RPC socket/token channel) and the local Web Console manage the four-layer catalog, topology, discovery, global security guardrails, scoped policies, and custom risk pattern rules with same-transaction hash-chain audit logging. Execution approval resolution (`approve`/`reject`) remains human-confirmed via the hardened local Web Console (loopback `Host`, same-origin checks, per-session `HttpOnly` cookie + `X-Agent-DBCTL-CSRF` token, or one-time `approval_token`) or external `ApprovalProvider`. The CLI never prints secrets or connection strings and supports blank Keychain password setup + Web handoff (`--open-secret` / `ui open --credential`) alongside env, stdin, file, `env_ref`, and `exec_provider`.
+- **Verbatim Forwarding**: `agent-dbctl` never translates or rewrites SQL/Mongo/Elasticsearch/Redis dialects across engines (except read-only `EXPLAIN`/`SHOWPLAN`/`_validate` preflight wrapping).
 - **Same-Transaction Audit**: Every catalog/policy/approval mutation and every execution lifecycle event writes `actor`, `action`, `target_id`, and `timestamp` to the append-only hash-chain `audit_logs` table in the same SQLite transaction.
 - **Silent Companion Skill Ownership**: Auto-sync never pollutes stdout/stderr, never overwrites symlinks or user-modified `SKILL.md` files unless `--force` is passed, and respects `AGENT_DBCTL_NO_SKILL_SYNC`.
 - **Clean Public Exports**: Verify `python3 scripts/check-public.py` and keep committed trees free of private hosts, personal paths, or internal registry references.

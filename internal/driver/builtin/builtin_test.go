@@ -702,3 +702,79 @@ func TestBuildSQLiteDSNWindowsAndRelativePaths(t *testing.T) {
 		})
 	}
 }
+
+func TestSQLiteSchemaReturningAndDMLPreflight(t *testing.T) {
+	ctx := context.Background()
+	drv := &SQLiteDriver{}
+	dbPath := filepath.Join(t.TempDir(), "schema-test.sqlite")
+
+	rwConn, err := drv.Open(ctx, driver.ConnectionConfig{
+		Engine:       "sqlite",
+		DatabaseName: dbPath,
+	})
+	if err != nil {
+		t.Fatalf("open rw sqlite: %v", err)
+	}
+	defer func() { _ = rwConn.Close() }()
+
+	if _, err := rwConn.Execute(ctx, `
+		CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE);
+		CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id), status TEXT DEFAULT 'pending');
+		CREATE INDEX idx_orders_user ON orders(user_id);
+	`, driver.ExecOpts{}); err != nil {
+		t.Fatalf("seed tables: %v", err)
+	}
+
+	// 1. INSERT ... RETURNING must return rows rather than dropping them.
+	insRes, err := rwConn.Execute(ctx, "INSERT INTO users(id, email) VALUES (1, 'alice@example.com') RETURNING id, email", driver.ExecOpts{MaxRows: 10})
+	if err != nil {
+		t.Fatalf("insert returning: %v", err)
+	}
+	if len(insRes.Columns) != 2 || len(insRes.Rows) != 1 || insRes.Rows[0][1] != "alice@example.com" {
+		t.Fatalf("expected RETURNING columns & row, got %+v", insRes)
+	}
+	recs := driver.BuildRecordsFromSQL(insRes.Columns, insRes.Rows)
+	if len(recs) != 1 || recs[0]["email"] != "alice@example.com" {
+		t.Fatalf("unexpected BuildRecordsFromSQL output: %+v", recs)
+	}
+
+	// 2. Read-only SchemaInspector + DML Preflight.
+	roConn, err := drv.Open(ctx, driver.ConnectionConfig{
+		Engine:       "sqlite",
+		DatabaseName: dbPath,
+		ReadOnly:     true,
+	})
+	if err != nil {
+		t.Fatalf("open ro sqlite: %v", err)
+	}
+	defer func() { _ = roConn.Close() }()
+
+	si, ok := roConn.(driver.SchemaInspector)
+	if !ok {
+		t.Fatal("sqliteConn must implement driver.SchemaInspector")
+	}
+	listRes, err := si.ListTables(ctx, driver.SchemaListOpts{})
+	if err != nil || len(listRes.Items) != 2 {
+		t.Fatalf("expected 2 tables, got %+v err=%v", listRes, err)
+	}
+	tbl, err := si.DescribeTable(ctx, "orders")
+	if err != nil {
+		t.Fatalf("describe orders: %v", err)
+	}
+	if len(tbl.Columns) != 3 || !tbl.Columns[0].PrimaryKey || len(tbl.Indexes) == 0 || len(tbl.ForeignKeys) != 1 {
+		t.Fatalf("unexpected DescribeTable output: %+v", tbl)
+	}
+	if _, err := si.DescribeTable(ctx, "does_not_exist"); err == nil {
+		t.Fatal("expected error for nonexistent table")
+	}
+
+	// DML Preflight on read-only SQLite connection must run EXPLAIN QUERY PLAN without mutating.
+	pfIndexed, err := roConn.Preflight(ctx, "UPDATE orders SET status = 'paid' WHERE user_id = 1", driver.PreflightOpts{})
+	if err != nil || !pfIndexed.Supported || pfIndexed.Executed || pfIndexed.FullScan {
+		t.Fatalf("expected indexed DML preflight full_scan=false, got %+v err=%v", pfIndexed, err)
+	}
+	pfFull, err := roConn.Preflight(ctx, "DELETE FROM orders WHERE status = 'pending'", driver.PreflightOpts{})
+	if err != nil || !pfFull.Supported || pfFull.Executed || !pfFull.FullScan {
+		t.Fatalf("expected unindexed DML preflight full_scan=true, got %+v err=%v", pfFull, err)
+	}
+}

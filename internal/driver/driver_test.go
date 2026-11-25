@@ -113,3 +113,54 @@ func TestExecuteWithCancelGuardDiscardsOnCancel(t *testing.T) {
 		t.Fatal("expected CancelAndDiscard when ctx is already cancelled")
 	}
 }
+
+type stubDriver struct {
+	engine string
+	tier   string
+}
+
+func (s *stubDriver) Metadata() types.DriverMetadata {
+	return types.DriverMetadata{ID: s.tier + "-" + s.engine, Engine: s.engine, Tier: s.tier, Verified: true}
+}
+func (s *stubDriver) Open(context.Context, driver.ConnectionConfig) (driver.Conn, error) {
+	return &fakeConn{}, nil
+}
+func (s *stubDriver) Classify(context.Context, string) (types.Classification, error) {
+	return types.Classification{Engine: s.engine}, nil
+}
+
+func TestRegistryAliasResolutionAndPluginOverride(t *testing.T) {
+	reg := driver.NewRegistry()
+	reg.Register(&stubDriver{engine: "postgres", tier: "builtin"})
+	reg.Register(&stubDriver{engine: "mysql", tier: "builtin"})
+	reg.Register(&stubDriver{engine: "redis", tier: "builtin"})
+	reg.Register(&stubDriver{engine: "mssql", tier: "builtin"})
+	reg.Register(&stubDriver{engine: "elasticsearch", tier: "builtin"})
+
+	aliases := map[string]string{
+		"postgresql":  "postgres",
+		"cockroachdb": "postgres",
+		"mariadb":     "mysql",
+		"tidb":        "mysql",
+		"valkey":      "redis",
+		"sqlserver":   "mssql",
+		"opensearch":  "elasticsearch",
+	}
+	for alias, want := range aliases {
+		d, ok := reg.Get(alias)
+		if !ok || d.Metadata().Engine != want {
+			t.Fatalf("Registry.Get(%q) = (%v, %v), want engine %q", alias, d, ok, want)
+		}
+	}
+
+	if _, ok := reg.Get("duckdb"); ok {
+		t.Fatal("unknown engine duckdb should not match any built-in driver")
+	}
+
+	// An explicit Tier-3 plugin for cockroachdb must override the postgres alias fallback.
+	reg.Register(&stubDriver{engine: "cockroachdb", tier: "plugin"})
+	d, ok := reg.Get("cockroachdb")
+	if !ok || d.Metadata().ID != "plugin-cockroachdb" {
+		t.Fatalf("expected plugin override for cockroachdb, got (%+v, %v)", d, ok)
+	}
+}

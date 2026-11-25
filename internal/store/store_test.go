@@ -537,3 +537,104 @@ func TestCrossMachineTopologyNaturalKeyMergeAndIntegrity(t *testing.T) {
 		t.Fatalf("expected target-scoped pattern rule cleaned up on target delete, got %+v", pats)
 	}
 }
+
+func TestNaturalKeyTopologyPlanAndPartialApply(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "topo-plan.db")
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	// Pre-seed a system and credential outside the partial topology bundle.
+	seededSys, err := st.UpsertSystem(ctx, "setup", types.System{Slug: "orders", Name: "Orders"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seededCred, err := st.UpsertCredentialProfile(ctx, "setup", types.CredentialProfile{
+		Name: "orders-ro", Kind: types.CredKeychain, AccessLevel: types.AccessReadOnly, Username: "reader",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	beforeAudits, _ := st.ListAuditEntries(ctx, "", "", "", 1000)
+	beforeVerify, _ := st.VerifyAuditChain(ctx)
+
+	// Partial bundle with zero IDs, using slug:, name:, and ref: natural references.
+	partial := types.TopologyBundle{
+		SchemaVersion: 1,
+		Instances: []types.Instance{
+			{Name: "orders-pg", Engine: "postgres", Host: "127.0.0.1", Port: 5432, Role: types.RolePrimary},
+		},
+		Targets: []types.Target{
+			{
+				Ref:             "orders/prod/main",
+				Alias:           "orders-prod",
+				OwnerSystemID:   "slug:orders",
+				EnvironmentCode: "prod",
+				InstanceID:      "name:orders-pg",
+				DatabaseName:    "orders",
+				ROCredentialID:  "name:orders-ro",
+				Status:          types.TargetActive,
+			},
+		},
+		Policies: []types.PolicyRuleSet{
+			{Name: "orders-pol", ScopeType: "system", ScopeID: "slug:orders"},
+		},
+		RiskPatternRules: []types.RiskPatternRule{
+			{
+				Name:      "block-secrets-tbl",
+				ScopeType: "target",
+				ScopeID:   "ref:orders/prod/main",
+				Enabled:   true,
+				Action:    types.PatternActionDeny,
+				Condition: types.PatternCondition{Type: types.MatcherTableRef, Values: []string{"secrets"}},
+			},
+		},
+	}
+
+	// Read-only plan must predict exact counts with zero DB/audit mutations.
+	plan, err := st.PlanTopologyImport(ctx, partial)
+	if err != nil {
+		t.Fatalf("PlanTopologyImport failed: %v", err)
+	}
+	if !plan.DryRun || plan.Status != "planned" ||
+		plan.Summary.Instances.Created != 1 ||
+		plan.Summary.Targets.Created != 1 ||
+		plan.Summary.Policies.Created != 1 ||
+		plan.Summary.RiskPatternRules.Created != 1 {
+		t.Fatalf("unexpected plan result: %+v", plan)
+	}
+	if insts, _ := st.ListInstances(ctx); len(insts) != 0 {
+		t.Fatalf("expected PlanTopologyImport to make no writes, got %+v", insts)
+	}
+	afterPlanAudits, _ := st.ListAuditEntries(ctx, "", "", "", 1000)
+	afterPlanVerify, _ := st.VerifyAuditChain(ctx)
+	if len(afterPlanAudits) != len(beforeAudits) || afterPlanVerify.LastHash != beforeVerify.LastHash {
+		t.Fatalf("expected PlanTopologyImport to write zero audit entries")
+	}
+
+	// Real apply creates and maps all natural keys to real IDs.
+	res, err := st.ImportTopologyWithResult(ctx, "agent-cli", partial)
+	if err != nil {
+		t.Fatalf("ImportTopologyWithResult failed: %v", err)
+	}
+	if res.DryRun || res.Status != "applied" || res.Summary.Targets.Created != 1 {
+		t.Fatalf("unexpected apply result: %+v", res)
+	}
+	tgts, _ := st.ListTargets(ctx)
+	if len(tgts) != 1 || tgts[0].OwnerSystemID != seededSys.ID || tgts[0].ROCredentialID != seededCred.ID {
+		t.Fatalf("expected natural keys mapped to seeded IDs, got %+v", tgts)
+	}
+
+	// Re-applying identical partial bundle is idempotent (status=unchanged).
+	res2, err := st.ImportTopologyWithResult(ctx, "agent-cli", partial)
+	if err != nil {
+		t.Fatalf("second ImportTopologyWithResult failed: %v", err)
+	}
+	if res2.Status != "unchanged" || res2.Summary.Targets.Unchanged != 1 || res2.Summary.Policies.Unchanged != 1 {
+		t.Fatalf("expected unchanged on idempotent re-apply, got %+v", res2)
+	}
+}

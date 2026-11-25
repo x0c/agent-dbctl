@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/x0c/agent-dbctl/internal/classify"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
 
@@ -16,6 +17,7 @@ type DialectHints struct {
 	BuildInfoModules []string
 	MaxWireVersion   int
 	VersionComment   string
+	Distribution     string
 }
 
 var semverMajorMinorRe = regexp.MustCompile(`v?(\d+)\.(\d+)`)
@@ -23,7 +25,8 @@ var wireVersionRe = regexp.MustCompile(`(?i)^wire_v(\d+)$`)
 
 // DetectServerCapabilities resolves engine dialect, major/minor version, and feature flags from a live probe.
 func DetectServerCapabilities(engine, serverVersion string, hints DialectHints) types.ServerCapabilities {
-	eng := strings.ToLower(strings.TrimSpace(engine))
+	rawEng := strings.ToLower(strings.TrimSpace(engine))
+	eng := classify.CanonicalEngine(rawEng)
 	ver := strings.TrimSpace(serverVersion)
 	caps := types.ServerCapabilities{
 		Engine:        eng,
@@ -34,17 +37,24 @@ func DetectServerCapabilities(engine, serverVersion string, hints DialectHints) 
 	}
 
 	switch eng {
-	case "postgres", "postgresql":
-		caps.Engine = "postgres"
+	case "postgres":
 		return detectPostgresCapabilities(caps, ver)
 	case "mysql":
 		return detectMySQLCapabilities(caps, ver, hints.VersionComment)
-	case "sqlite", "sqlite-ext":
+	case "sqlite":
 		return detectSQLiteCapabilities(caps, ver)
 	case "mongodb":
 		return detectMongoCapabilities(caps, ver, hints)
 	case "redis":
 		return detectRedisCapabilities(caps, ver, hints)
+	case "clickhouse":
+		return detectClickHouseCapabilities(caps, ver)
+	case "mssql":
+		return detectMSSQLCapabilities(caps, ver)
+	case "oracle":
+		return detectOracleCapabilities(caps, ver)
+	case "elasticsearch":
+		return detectElasticsearchCapabilities(caps, ver, hints)
 	default:
 		caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
 		return caps
@@ -250,6 +260,66 @@ func detectRedisCapabilities(caps types.ServerCapabilities, ver string, hints Di
 
 	caps.MajorVersion, caps.MinorVersion = parseMajorMinor(caps.ServerVersion)
 	caps.SupportsRESP3 = caps.Dialect == "valkey" || caps.Dialect == "dragonfly" || caps.MajorVersion == 0 || caps.MajorVersion >= 6
+	return caps
+}
+
+func detectClickHouseCapabilities(caps types.ServerCapabilities, ver string) types.ServerCapabilities {
+	caps.Dialect = "clickhouse"
+	caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+	caps.SupportsExplain = caps.MajorVersion == 0 || caps.MajorVersion >= 20
+	if caps.SupportsExplain {
+		caps.ExplainFormat = "clickhouse_plan"
+	} else {
+		caps.ExplainFormat = "none"
+	}
+	caps.SupportsExplainJSON = caps.MajorVersion >= 22
+	caps.SupportsReadOnlySession = true
+	caps.SupportsCancelQuery = true
+	return caps
+}
+
+func detectMSSQLCapabilities(caps types.ServerCapabilities, ver string) types.ServerCapabilities {
+	lower := strings.ToLower(ver)
+	caps.Dialect = "mssql"
+	caps.ExplainFormat = "mssql_showplan"
+	caps.SupportsExplain = true
+	caps.SupportsExplainJSON = false
+	caps.SupportsReadOnlySession = false // MSSQL lacks native session-level transaction READ ONLY; enforced via ApplicationIntent + driver gate.
+	caps.SupportsCancelQuery = true
+	if strings.Contains(lower, "azure") {
+		caps.Dialect = "azure_sql"
+	}
+	caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+	return caps
+}
+
+func detectOracleCapabilities(caps types.ServerCapabilities, ver string) types.ServerCapabilities {
+	caps.Dialect = "oracle"
+	caps.ExplainFormat = "oracle_xplan"
+	caps.SupportsExplain = true
+	caps.SupportsExplainJSON = false
+	caps.SupportsReadOnlySession = true
+	caps.SupportsCancelQuery = true
+	caps.SupportsReturning = true
+	caps.MajorVersion, caps.MinorVersion = parseDialectMajorMinor(ver, "release")
+	if caps.MajorVersion == 0 {
+		caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
+	}
+	return caps
+}
+
+func detectElasticsearchCapabilities(caps types.ServerCapabilities, ver string, hints DialectHints) types.ServerCapabilities {
+	dist := strings.ToLower(strings.TrimSpace(hints.Distribution + " " + ver))
+	caps.Dialect = "elasticsearch"
+	if strings.Contains(dist, "opensearch") {
+		caps.Dialect = "opensearch"
+	}
+	caps.ExplainFormat = "es_validate_query"
+	caps.SupportsExplain = true
+	caps.SupportsExplainJSON = true
+	caps.SupportsReadOnlySession = true
+	caps.SupportsCancelQuery = true
+	caps.MajorVersion, caps.MinorVersion = parseMajorMinor(ver)
 	return caps
 }
 

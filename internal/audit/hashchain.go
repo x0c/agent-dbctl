@@ -124,14 +124,16 @@ var dataSubtreeMongoKeys = map[string]bool{
 func RedactQuery(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
-		var parsed any
-		if err := json.Unmarshal([]byte(trimmed), &parsed); err == nil {
-			redacted := redactJSONValue(parsed, false, false)
-			var buf bytes.Buffer
-			enc := json.NewEncoder(&buf)
-			enc.SetEscapeHTML(false)
-			if err := enc.Encode(redacted); err == nil {
-				return strings.TrimRight(buf.String(), "\r\n")
+		if redacted, ok := tryRedactJSON(trimmed); ok {
+			return redacted
+		}
+	}
+	// Elasticsearch/OpenSearch HTTP-style command: "POST /index/_search\n{...}"
+	if head, body, hasNL := strings.Cut(trimmed, "\n"); hasNL {
+		bodyTrim := strings.TrimSpace(body)
+		if strings.HasPrefix(bodyTrim, "{") || strings.HasPrefix(bodyTrim, "[") {
+			if redactedBody, ok := tryRedactJSON(bodyTrim); ok {
+				return strings.TrimSpace(head) + "\n" + redactedBody
 			}
 		}
 	}
@@ -148,6 +150,21 @@ func RedactQuery(raw string) string {
 	masked = sqlPasswordEqRe.ReplaceAllString(masked, `$1***`)
 	masked = sqlSetPasswordRe.ReplaceAllString(masked, `$1***`)
 	return masked
+}
+
+func tryRedactJSON(raw string) (string, bool) {
+	var parsed any
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return "", false
+	}
+	redacted := redactJSONValue(parsed, false, false)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(redacted); err != nil {
+		return "", false
+	}
+	return strings.TrimRight(buf.String(), "\r\n"), true
 }
 
 func isSensitiveKey(key string) bool {

@@ -161,17 +161,86 @@ type TargetDetail struct {
 	WorkspaceMatch  bool               `json:"workspace_match"`
 }
 
+// TargetSummary is the compact agent-facing view returned by `db list` by default.
+type TargetSummary struct {
+	Ref             string       `json:"ref"`
+	Alias           string       `json:"alias,omitempty"`
+	System          string       `json:"system,omitempty"`
+	Env             string       `json:"env"`
+	SafetyTier      SafetyTier   `json:"safety_tier"`
+	Engine          string       `json:"engine"`
+	Database        string       `json:"database,omitempty"`
+	Status          TargetStatus `json:"status"`
+	Writable        bool         `json:"writable"`
+	MaxRows         int          `json:"max_rows"`
+	ExecTimeoutSec  int          `json:"exec_timeout_sec"`
+	WorkspaceMatch  bool         `json:"workspace_match,omitempty"`
+	QuerySyntaxHint string       `json:"query_syntax_hint,omitempty"`
+	Description     string       `json:"description,omitempty"`
+}
+
+// TargetShowSummary extends TargetSummary with non-secret connection & guardrail metadata for `db show`.
+type TargetShowSummary struct {
+	TargetSummary
+	Endpoint            string   `json:"endpoint,omitempty"`
+	NetworkMode         string   `json:"network_mode,omitempty"`
+	TLSMode             string   `json:"tls_mode,omitempty"`
+	HasROCredential     bool     `json:"has_ro_credential"`
+	HasRWCredential     bool     `json:"has_rw_credential"`
+	AllowMultiStatement bool     `json:"allow_multi_statement"`
+	ExplainMaxRows      int64    `json:"explain_max_rows"`
+	PatternRulesCount   int      `json:"pattern_rules_count"`
+	Examples            []string `json:"examples,omitempty"`
+}
+
 // TopologyBundle is a secret-free export/import representation of enterprise catalog topology.
 type TopologyBundle struct {
 	SchemaVersion      int                   `json:"schema_version" yaml:"schema_version"`
 	ExportedAtUTC      string                `json:"exported_at_utc" yaml:"exported_at_utc"`
 	GlobalSecurity     *GlobalSecurityConfig `json:"global_security,omitempty" yaml:"global_security,omitempty"`
 	Environments       []Environment         `json:"environments" yaml:"environments"`
-	Systems            []System            `json:"systems" yaml:"systems"`
-	NetworkProfiles    []NetworkProfile    `json:"network_profiles" yaml:"network_profiles"`
-	CredentialProfiles []CredentialProfile `json:"credential_profiles" yaml:"credential_profiles"`
-	Instances          []Instance          `json:"instances" yaml:"instances"`
-	Targets            []Target            `json:"targets" yaml:"targets"`
-	Policies           []PolicyRuleSet     `json:"policies" yaml:"policies"`
-	RiskPatternRules   []RiskPatternRule   `json:"risk_pattern_rules,omitempty" yaml:"risk_pattern_rules,omitempty"`
+	Systems            []System              `json:"systems" yaml:"systems"`
+	NetworkProfiles    []NetworkProfile      `json:"network_profiles" yaml:"network_profiles"`
+	CredentialProfiles []CredentialProfile   `json:"credential_profiles" yaml:"credential_profiles"`
+	Instances          []Instance            `json:"instances" yaml:"instances"`
+	Targets            []Target              `json:"targets" yaml:"targets"`
+	Policies           []PolicyRuleSet       `json:"policies" yaml:"policies"`
+	RiskPatternRules   []RiskPatternRule     `json:"risk_pattern_rules,omitempty" yaml:"risk_pattern_rules,omitempty"`
+}
+
+// MissingSecretInfo identifies a keychain credential lacking a stored secret alongside its Web setup URL.
+type MissingSecretInfo struct {
+	ID          string      `json:"id"`
+	Name        string      `json:"name"`
+	Username    string      `json:"username,omitempty"`
+	AccessLevel AccessLevel `json:"access_level"`
+	SetupURL    string      `json:"setup_url,omitempty"`
+}
+
+// ResourcePlanCounts summarizes planned or applied resource counts.
+type ResourcePlanCounts struct {
+	Created   int `json:"created"`
+	Updated   int `json:"updated"`
+	Unchanged int `json:"unchanged"`
+}
+
+// TopologyImportSummary reports per-entity counts for topology apply / dry-run.
+type TopologyImportSummary struct {
+	GlobalSecurityAction string             `json:"global_security_action,omitempty"`
+	Environments         ResourcePlanCounts `json:"environments"`
+	Systems              ResourcePlanCounts `json:"systems"`
+	NetworkProfiles      ResourcePlanCounts `json:"network_profiles"`
+	CredentialProfiles   ResourcePlanCounts `json:"credential_profiles"`
+	Instances            ResourcePlanCounts `json:"instances"`
+	Targets              ResourcePlanCounts `json:"targets"`
+	Policies             ResourcePlanCounts `json:"policies"`
+	RiskPatternRules     ResourcePlanCounts `json:"risk_pattern_rules"`
+}
+
+// TopologyImportResult summarizes a topology plan (--dry-run) or atomic import.
+type TopologyImportResult struct {
+	DryRun         bool                  `json:"dry_run"`
+	Status         string                `json:"status"` // planned | applied | unchanged
+	Summary        TopologyImportSummary `json:"summary"`
+	MissingSecrets []MissingSecretInfo   `json:"missing_secrets,omitempty"`
 }

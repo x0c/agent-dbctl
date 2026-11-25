@@ -17,9 +17,12 @@ const (
 	ErrCodeDBNotFound             = "db_not_found"
 	ErrCodeSystemNotFound         = "system_not_found"
 	ErrCodeOperationNotFound      = "operation_not_found"
+	ErrCodeNotFound               = "not_found"
+	ErrCodeConflict               = "conflict"
 	ErrCodeAmbiguousTarget        = "ambiguous_target"
 	ErrCodeInvalidUsage           = "invalid_usage"
 	ErrCodeInvalidInput           = "invalid_input"
+	ErrCodeReasonRequired         = "reason_required"
 	ErrCodeUnknownFlag            = "unknown_flag"
 	ErrCodeMultiTargetWrite       = "multi_target_write_forbidden"
 	ErrCodePolicyDenied           = "policy_denied"
@@ -74,13 +77,13 @@ func ExitCodeForError(code string) int {
 	switch code {
 	case "":
 		return ExitSuccess
-	case ErrCodeInvalidUsage, ErrCodeInvalidInput, ErrCodeUnknownFlag, ErrCodeMultiTargetWrite:
+	case ErrCodeInvalidUsage, ErrCodeInvalidInput, ErrCodeReasonRequired, ErrCodeUnknownFlag, ErrCodeMultiTargetWrite:
 		return ExitUsage
-	case ErrCodeDBNotFound, ErrCodeSystemNotFound, ErrCodeOperationNotFound:
+	case ErrCodeDBNotFound, ErrCodeSystemNotFound, ErrCodeOperationNotFound, ErrCodeNotFound:
 		return ExitNotFound
 	case ErrCodePolicyDenied, ErrCodeApprovalRejected, ErrCodeProdFrozen, ErrCodeHighCostReadBlocked, ErrCodeTargetMaintenance:
 		return ExitDenied
-	case ErrCodeAmbiguousTarget, ErrCodeDaemonVersionMismatch, ErrCodeOutputExists:
+	case ErrCodeAmbiguousTarget, ErrCodeDaemonVersionMismatch, ErrCodeOutputExists, ErrCodeConflict:
 		return ExitConflict
 	case ErrCodeQueryTimeout, ErrCodeApprovalTimeout:
 		return ExitTimeout

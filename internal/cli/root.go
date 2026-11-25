@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 	"github.com/x0c/agent-dbctl/internal/approval"
 	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/daemon"
+	"github.com/x0c/agent-dbctl/internal/driver"
+	"github.com/x0c/agent-dbctl/internal/driver/builtin"
 	drvplugin "github.com/x0c/agent-dbctl/internal/driver/plugin"
 	"github.com/x0c/agent-dbctl/internal/secrets"
 	"github.com/x0c/agent-dbctl/internal/skillinstall"
@@ -42,8 +45,15 @@ func Execute(version, commit string) int {
 	var exitCode int
 
 	root := &cobra.Command{
-		Use:           "agent-dbctl",
-		Short:         "Database execution gate, enterprise catalog, and audit CLI for coding agents",
+		Use:   "agent-dbctl",
+		Short: "Database execution gate, enterprise catalog, and audit CLI for coding agents",
+		Long: `agent-dbctl lets coding agents query and modify configured databases without managing drivers, network tunnels, or credentials.
+
+Typical agent workflow:
+  1. Discover targets:   agent-dbctl db list --json
+  2. Inspect schema:     agent-dbctl db schema <ref-or-alias> [table] --json
+  3. Execute CRUD:       agent-dbctl exec --db <ref-or-alias> --reason "..." --sql "..." --json
+  4. Wait if approved:   agent-dbctl op wait <operation_id> --timeout 60s --json`,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		PersistentPreRun: func(cmd *cobra.Command, _ []string) {
@@ -76,13 +86,14 @@ func Execute(version, commit string) int {
 	}
 
 	// ---- db ----
-	dbCmd := &cobra.Command{Use: "db", Short: "Discover and inspect configured databases (read-only)"}
+	dbCmd := &cobra.Command{Use: "db", Short: "Discover databases, inspect schemas, and probe connectivity (read-only)"}
 	var dbListOpts struct {
 		system string
 		env    string
 		engine string
 		tag    string
 		search string
+		detail bool
 	}
 	dbListCmd := &cobra.Command{
 		Use:   "list",
@@ -113,18 +124,38 @@ func Execute(version, commit string) int {
 				return nil
 			}
 			if ic.JSONMode {
-				exitCode = ic.WriteSuccess(map[string]any{
-					"items":              res.Items,
+				var outItems any = res.Items
+				if !dbListOpts.detail {
+					summaries := make([]types.TargetSummary, 0, len(res.Items))
+					for _, d := range res.Items {
+						summaries = append(summaries, daemon.SummarizeTarget(d))
+					}
+					outItems = summaries
+				}
+				payload := map[string]any{
+					"items":              outItems,
 					"count":              len(res.Items),
 					"similar_names":      res.SimilarNames,
 					"unsearched_sources": res.UnsearchedSources,
-				}, types.Meta{})
+				}
+				if len(res.Items) == 0 && len(res.SimilarNames) == 0 && len(res.UnsearchedSources) == 0 {
+					payload["hint"] = "No database targets configured yet. Onboard one via CLI 'db add', apply a 'topology' bundle, or open the Web Console."
+					payload["next_commands"] = []string{
+						ic.BinPath + " db add --dsn <dsn> --open-secret --json",
+						ic.BinPath + " topology schema --json",
+						ic.BinPath + " driver list --json",
+						ic.BinPath + " ui open --tab catalog",
+					}
+				}
+				exitCode = ic.WriteSuccess(payload, types.Meta{})
 				return nil
 			}
 			if len(res.Items) == 0 {
 				_, _ = fmt.Fprintln(ic.Stdout, "No matching databases found.")
 				if len(res.SimilarNames) > 0 {
 					_, _ = fmt.Fprintf(ic.Stdout, "Similar: %s\n", strings.Join(res.SimilarNames, ", "))
+				} else if len(res.UnsearchedSources) == 0 {
+					_, _ = fmt.Fprintf(ic.Stdout, "Hint: configure a database via `%s db add --dsn <dsn> --open-secret`, `%s topology apply -f topology.yaml`, or `%s ui open --tab catalog`.\n", ic.BinPath, ic.BinPath, ic.BinPath)
 				}
 				return nil
 			}
@@ -154,12 +185,14 @@ func Execute(version, commit string) int {
 	dbListCmd.Flags().StringVar(&dbListOpts.tag, "tag", "", "Filter by system tag")
 	dbListCmd.Flags().StringVar(&dbListOpts.search, "search", "", "Substring search across ref/alias/description")
 	dbListCmd.Flags().StringVar(&dbListOpts.search, "grep", "", "Alias for --search")
+	dbListCmd.Flags().BoolVar(&dbListOpts.detail, "detail", false, "Include full TargetDetail policy/network/credential metadata")
 	_ = dbListCmd.Flags().MarkHidden("grep")
 	annotateCommand(dbListCmd, RiskRead, "agent-dbctl db list --env prod --json")
 
+	var dbShowDetail bool
 	dbShowCmd := &cobra.Command{
 		Use:   "show <ref-or-alias>",
-		Short: "Show target metadata and effective policy provenance",
+		Short: "Show target metadata and effective guardrails",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
@@ -179,7 +212,11 @@ func Execute(version, commit string) int {
 				return nil
 			}
 			if ic.JSONMode {
-				exitCode = ic.WriteSuccess(detail, types.Meta{})
+				if dbShowDetail {
+					exitCode = ic.WriteSuccess(detail, types.Meta{})
+				} else {
+					exitCode = ic.WriteSuccess(daemon.SummarizeTargetShow(detail), types.Meta{})
+				}
 				return nil
 			}
 			eng, endpoint, netLabel := "—", "—", "direct"
@@ -217,7 +254,172 @@ func Execute(version, commit string) int {
 			return nil
 		},
 	}
+	dbShowCmd.Flags().BoolVar(&dbShowDetail, "detail", false, "Include full TargetDetail policy/network/credential provenance")
 	annotateCommand(dbShowCmd, RiskRead, "agent-dbctl db show prod-orders --json")
+
+	var dbSchemaOpts struct {
+		search  string
+		limit   int
+		outPath string
+		force   bool
+	}
+	dbSchemaCmd := &cobra.Command{
+		Use:   "schema <ref-or-alias> [table-or-collection]",
+		Short: "Inspect tables, collections, indexes, columns, or key prefixes (read-only)",
+		Long:  "Unified read-only schema introspection across SQL engines (postgres/mysql/sqlite/clickhouse/mssql/oracle), MongoDB, Redis/Valkey, and Elasticsearch/OpenSearch. Omit the second argument to list tables/collections/indices/key prefixes; pass an object name or pattern to inspect columns, indexes, mappings, or samples.",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ic := ioCtx()
+			client, err := ensureDaemon(ic, version, commit)
+			if err != nil {
+				exitCode = writeClientInitErr(ic, err)
+				return nil
+			}
+			cwd, _ := os.Getwd()
+			table := ""
+			if len(args) == 2 {
+				table = args[1]
+			}
+			reqBody := map[string]any{
+				"target":        args[0],
+				"table":         table,
+				"search":        dbSchemaOpts.search,
+				"limit":         dbSchemaOpts.limit,
+				"workspace_cwd": cwd,
+			}
+
+			if table == "" {
+				var listRes types.SchemaListResult
+				if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/schema", reqBody, &listRes); err != nil {
+					exitCode = writeRPCErr(ic, err)
+					return nil
+				}
+				if dbSchemaOpts.outPath != "" {
+					raw, _ := json.MarshalIndent(listRes, "", "  ")
+					absPath, err := WriteAtomicOutput(dbSchemaOpts.outPath, raw, dbSchemaOpts.force)
+					if err != nil {
+						errCode := types.ErrCodeInvalidInput
+						if errors.Is(err, errOutputExists) {
+							errCode = types.ErrCodeOutputExists
+						}
+						exitCode = ic.WriteError(errCode, false, err.Error(), "", nil, nil, types.Meta{})
+						return nil
+					}
+					if ic.JSONMode {
+						exitCode = ic.WriteSuccess(map[string]any{
+							"target_ref":     listRes.TargetRef,
+							"output_file":    absPath,
+							"returned_count": listRes.ReturnedCount,
+							"total_count":    listRes.TotalCount,
+							"truncated":      listRes.Truncated,
+						}, types.Meta{})
+						return nil
+					}
+					_, _ = fmt.Fprintf(ic.Stdout, "Wrote schema list (%d of %d) to %s\n", listRes.ReturnedCount, listRes.TotalCount, absPath)
+					return nil
+				}
+				if ic.JSONMode {
+					exitCode = ic.WriteSuccess(listRes, types.Meta{})
+					return nil
+				}
+				if len(listRes.Items) == 0 {
+					_, _ = fmt.Fprintln(ic.Stdout, "No matching tables/collections/keys found.")
+					return nil
+				}
+				rows := make([][]string, 0, len(listRes.Items))
+				for _, it := range listRes.Items {
+					extra := ""
+					if it.EstimatedRows != nil {
+						extra = fmt.Sprintf("~%d rows", *it.EstimatedRows)
+					} else if it.SampleCount > 0 {
+						extra = fmt.Sprintf("%d sampled", it.SampleCount)
+					}
+					rows = append(rows, []string{it.Schema, it.Name, it.Type, extra})
+				}
+				renderTable(ic.Stdout, []string{"SCHEMA", "NAME", "TYPE", "INFO"}, rows)
+				for _, note := range listRes.Notes {
+					_, _ = fmt.Fprintf(ic.Stderr, "Note: %s\n", note)
+				}
+				return nil
+			}
+
+			var tblRes types.TableSchema
+			if err := client.DoJSON(cmd.Context(), http.MethodPost, "/rpc/v1/db/schema", reqBody, &tblRes); err != nil {
+				exitCode = writeRPCErr(ic, err)
+				return nil
+			}
+			if dbSchemaOpts.outPath != "" {
+				raw, _ := json.MarshalIndent(tblRes, "", "  ")
+				absPath, err := WriteAtomicOutput(dbSchemaOpts.outPath, raw, dbSchemaOpts.force)
+				if err != nil {
+					errCode := types.ErrCodeInvalidInput
+					if errors.Is(err, errOutputExists) {
+						errCode = types.ErrCodeOutputExists
+					}
+					exitCode = ic.WriteError(errCode, false, err.Error(), "", nil, nil, types.Meta{})
+					return nil
+				}
+				if ic.JSONMode {
+					exitCode = ic.WriteSuccess(map[string]any{
+						"target_ref":  tblRes.TargetRef,
+						"name":        tblRes.Name,
+						"output_file": absPath,
+					}, types.Meta{})
+					return nil
+				}
+				_, _ = fmt.Fprintf(ic.Stdout, "Wrote schema for %s to %s\n", tblRes.Name, absPath)
+				return nil
+			}
+			if ic.JSONMode {
+				exitCode = ic.WriteSuccess(tblRes, types.Meta{})
+				return nil
+			}
+			_, _ = fmt.Fprintf(ic.Stdout, "%s (%s, %s)\n", tblRes.Name, tblRes.ObjectType, tblRes.Engine)
+			if len(tblRes.Columns) > 0 {
+				rows := make([][]string, 0, len(tblRes.Columns))
+				for _, c := range tblRes.Columns {
+					pk := ""
+					if c.PrimaryKey {
+						pk = "PK"
+					}
+					rows = append(rows, []string{c.Name, c.Type, fmt.Sprintf("%v", c.Nullable), pk, c.Default})
+				}
+				renderTable(ic.Stdout, []string{"COLUMN", "TYPE", "NULLABLE", "KEY", "DEFAULT"}, rows)
+			}
+			if len(tblRes.SampleFields) > 0 {
+				rows := make([][]string, 0, len(tblRes.SampleFields))
+				for _, f := range tblRes.SampleFields {
+					rows = append(rows, []string{f.Name, strings.Join(f.Types, "|")})
+				}
+				renderTable(ic.Stdout, []string{"FIELD", "TYPES"}, rows)
+			}
+			if len(tblRes.KeySamples) > 0 {
+				rows := make([][]string, 0, len(tblRes.KeySamples))
+				for _, k := range tblRes.KeySamples {
+					rows = append(rows, []string{k.Key, k.Type, fmt.Sprintf("%ds", k.TTL)})
+				}
+				renderTable(ic.Stdout, []string{"KEY", "TYPE", "TTL"}, rows)
+			}
+			if len(tblRes.Indexes) > 0 {
+				_, _ = fmt.Fprintf(ic.Stdout, "\nIndexes (%d):\n", len(tblRes.Indexes))
+				for _, idx := range tblRes.Indexes {
+					_, _ = fmt.Fprintf(ic.Stdout, "  - %s (%s) unique=%v\n", idx.Name, strings.Join(idx.Columns, ", "), idx.Unique)
+				}
+			}
+			if len(tblRes.ForeignKeys) > 0 {
+				_, _ = fmt.Fprintf(ic.Stdout, "\nForeign Keys (%d):\n", len(tblRes.ForeignKeys))
+				for _, fk := range tblRes.ForeignKeys {
+					_, _ = fmt.Fprintf(ic.Stdout, "  - %s -> %s.%s\n", fk.Column, fk.ReferencedTable, fk.ReferencedColumn)
+				}
+			}
+			return nil
+		},
+	}
+	dbSchemaCmd.Flags().StringVar(&dbSchemaOpts.search, "search", "", "Filter tables/collections/keys by substring")
+	dbSchemaCmd.Flags().IntVar(&dbSchemaOpts.limit, "limit", 100, "Maximum schema objects to list (1..500)")
+	dbSchemaCmd.Flags().StringVar(&dbSchemaOpts.outPath, "out", "", "Write schema JSON atomically to file path")
+	dbSchemaCmd.Flags().BoolVar(&dbSchemaOpts.force, "force", false, "Overwrite existing --out file")
+	annotateCommand(dbSchemaCmd, RiskRead, "agent-dbctl db schema prod-orders --json\nagent-dbctl db schema prod-orders orders --json")
 
 	var dbTestAll bool
 	var dbTestEnv, dbTestSys string
@@ -284,28 +486,43 @@ func Execute(version, commit string) int {
 	dbTestCmd.Flags().StringVar(&dbTestEnv, "env", "", "Filter --all by environment")
 	annotateCommand(dbTestCmd, RiskExecuteRemote, "agent-dbctl db test --all --json")
 
-	dbCmd.AddCommand(dbListCmd, dbShowCmd, dbTestCmd)
+	dbCmd.AddCommand(dbListCmd, dbShowCmd, dbSchemaCmd, dbTestCmd)
+	registerDBWriteCommands(dbCmd, ioCtx, ensureDaemon, writeClientInitErr, writeRPCErr, func(c int) { exitCode = c }, version, commit)
 
 	// ---- exec ----
 	var execOpts struct {
-		db       string
-		sql      string
-		file     string
-		stdin    bool
-		reason   string
-		dryRun   bool
+		db        string
+		sql       string
+		file      string
+		stdin     bool
+		reason    string
+		dryRun    bool
 		preflight bool
-		maxRows  int
-		maxBytes int64
-		timeout  time.Duration
-		out      string
-		force    bool
-		wait     bool
+		maxRows   int
+		maxBytes  int64
+		timeout   time.Duration
+		format    string
+		verbose   bool
+		out       string
+		force     bool
+		wait      bool
 	}
 	execCmd := &cobra.Command{
 		Use:   "exec [query]",
-		Short: "Execute verbatim SQL, MongoDB, or Redis commands through environment guardrails",
-		Args:  cobra.MaximumNArgs(1),
+		Short: "Execute verbatim engine-native queries through environment guardrails",
+		Long: `Execute verbatim queries against a configured target without handling drivers, tunnels, or passwords.
+
+Engine syntax notes:
+  - SQL (postgres/mysql/sqlite/clickhouse/mssql/oracle): standard SQL via --sql, --file, --stdin, or positional arg.
+  - MongoDB: JSON RunCommand (e.g. '{"find":"orders","filter":{"id":1},"limit":10}') or 'show collections'.
+  - Redis/Valkey: line-delimited commands (e.g. 'GET user:1' or 'SCAN 0 COUNT 50').
+  - Elasticsearch/OpenSearch: HTTP+JSON ('GET /idx/_search') or JSON search body.
+
+Agent defaults:
+  - Non-TTY calls emit JSON automatically and default to --wait=false when --wait is omitted,
+    returning exit code 7 (waiting_approval) immediately with operation_id and approval_url.
+  - Use --format objects for SQL [{col: val}] records; use --verbose for full policy and EXPLAIN trees.`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
 			if strings.TrimSpace(execOpts.db) == "" {
@@ -318,6 +535,11 @@ func Execute(version, commit string) int {
 			}
 			if execOpts.dryRun && execOpts.preflight {
 				exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, "--dry-run and --preflight are mutually exclusive.", "Use --dry-run for offline checks or --preflight for live EXPLAIN.", nil, nil, types.Meta{})
+				return nil
+			}
+			format, fmtErr := normalizeExecFormat(execOpts.format)
+			if fmtErr != nil {
+				exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, fmtErr.Error(), "Use --format auto, rows, or objects.", nil, nil, types.Meta{})
 				return nil
 			}
 
@@ -343,6 +565,10 @@ func Execute(version, commit string) int {
 			}
 			cwd, _ := os.Getwd()
 			tSec := int(execOpts.timeout.Seconds())
+			waitVal := execOpts.wait
+			if !cmd.Flags().Changed("wait") && ic.NoInput {
+				waitVal = false
+			}
 			start := time.Now()
 
 			var resp types.ExecResponse
@@ -357,7 +583,7 @@ func Execute(version, commit string) int {
 				MaxRows:          execOpts.maxRows,
 				MaxBytes:         execOpts.maxBytes,
 				TimeoutSec:       tSec,
-				Wait:             execOpts.wait,
+				Wait:             waitVal,
 			}, &resp)
 			if err != nil {
 				exitCode = writeRPCErr(ic, err)
@@ -369,7 +595,12 @@ func Execute(version, commit string) int {
 				Preflight:  execOpts.preflight,
 			}
 
-			exitCode = renderExecOutcome(ic, resp, execOpts.out, execOpts.force, meta)
+			exitCode = renderExecOutcomeWithOpts(ic, resp, execRenderOpts{
+				outPath:  execOpts.out,
+				forceOut: execOpts.force,
+				format:   format,
+				verbose:  execOpts.verbose,
+			}, meta)
 			return nil
 		},
 	}
@@ -387,7 +618,7 @@ func Execute(version, commit string) int {
 
 	execCmd.Flags().StringVar(&execOpts.file, "file", "", "Read verbatim query from file")
 	execCmd.Flags().BoolVar(&execOpts.stdin, "stdin", false, "Read verbatim query from stdin")
-	execCmd.Flags().StringVar(&execOpts.reason, "reason", "", "Business reason shown on Web approval and audit log")
+	execCmd.Flags().StringVar(&execOpts.reason, "reason", "", "Business reason shown on Web approval and audit log (required when approval is triggered)")
 	execCmd.Flags().BoolVar(&execOpts.dryRun, "dry-run", false, "Offline risk & policy analysis only (never dials DB)")
 	execCmd.Flags().BoolVar(&execOpts.preflight, "preflight", false, "Remote read-only EXPLAIN check without execution")
 	execCmd.Flags().IntVar(&execOpts.maxRows, "max-rows", 0, "Cap returned rows (alias: --limit)")
@@ -395,21 +626,30 @@ func Execute(version, commit string) int {
 	_ = execCmd.Flags().MarkHidden("limit")
 	execCmd.Flags().Int64Var(&execOpts.maxBytes, "max-bytes", 0, "Cap returned bytes")
 	execCmd.Flags().DurationVar(&execOpts.timeout, "timeout", 0, "Execution timeout override (capped by policy)")
+	execCmd.Flags().StringVar(&execOpts.format, "format", "auto", "Result row format: auto, rows, or objects")
+	execCmd.Flags().BoolVar(&execOpts.verbose, "verbose", false, "Include full policy evaluation and preflight plan_raw metadata")
 	execCmd.Flags().StringVar(&execOpts.out, "out", "", "Write result JSON atomically to file path")
 	execCmd.Flags().BoolVar(&execOpts.force, "force", false, "Overwrite existing --out file")
-	execCmd.Flags().BoolVar(&execOpts.wait, "wait", true, "Wait for human approval (false returns operation_id immediately)")
-	annotateCommand(execCmd, RiskExecuteRemote, "agent-dbctl exec --db prod-orders --preflight --sql \"SELECT id FROM orders LIMIT 20\" --json")
+	execCmd.Flags().BoolVar(&execOpts.wait, "wait", true, "Wait for human approval (defaults to true in TTY, false in non-TTY/agent mode)")
+	annotateCommand(execCmd, RiskExecuteRemote, "agent-dbctl exec --db prod-orders --sql \"SELECT id FROM orders LIMIT 20\" --json\nagent-dbctl exec --db prod-orders --format objects --sql \"SELECT id, status FROM orders LIMIT 5\" --json\nagent-dbctl exec --db prod-orders --preflight --reason \"Fix stuck order\" --sql \"UPDATE orders SET status='paid' WHERE id=42\" --json")
 
 	// ---- op ----
 	opCmd := &cobra.Command{Use: "op", Short: "Inspect or cancel execution operations"}
 	var opStatusOut string
 	var opStatusForce bool
+	var opStatusFormat string
+	var opStatusVerbose bool
 	opStatusCmd := &cobra.Command{
 		Use:   "status <operation_id>",
 		Short: "Check status and retrieve result of an operation",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
+			format, fmtErr := normalizeExecFormat(opStatusFormat)
+			if fmtErr != nil {
+				exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, fmtErr.Error(), "Use --format auto, rows, or objects.", nil, nil, types.Meta{})
+				return nil
+			}
 			client, err := ensureDaemon(ic, version, commit)
 			if err != nil {
 				exitCode = writeClientInitErr(ic, err)
@@ -420,10 +660,17 @@ func Execute(version, commit string) int {
 				exitCode = writeRPCErr(ic, err)
 				return nil
 			}
-			exitCode = renderExecOutcome(ic, resp, opStatusOut, opStatusForce, types.Meta{})
+			exitCode = renderExecOutcomeWithOpts(ic, resp, execRenderOpts{
+				outPath:  opStatusOut,
+				forceOut: opStatusForce,
+				format:   format,
+				verbose:  opStatusVerbose,
+			}, types.Meta{})
 			return nil
 		},
 	}
+	opStatusCmd.Flags().StringVar(&opStatusFormat, "format", "auto", "Result row format: auto, rows, or objects")
+	opStatusCmd.Flags().BoolVar(&opStatusVerbose, "verbose", false, "Include full policy evaluation and preflight plan_raw metadata")
 	opStatusCmd.Flags().StringVar(&opStatusOut, "out", "", "Write result JSON atomically to file path")
 	opStatusCmd.Flags().BoolVar(&opStatusForce, "force", false, "Overwrite existing --out file")
 	annotateCommand(opStatusCmd, RiskRead, "agent-dbctl op status op_012345 --json")
@@ -523,6 +770,7 @@ func Execute(version, commit string) int {
 	// ---- ui ----
 	uiCmd := &cobra.Command{Use: "ui", Short: "Open the local human Web Console"}
 	var uiNoOpen bool
+	var uiTab, uiCred string
 	uiOpenCmd := &cobra.Command{
 		Use:   "open",
 		Short: "Start daemon if needed and open the local Web Console",
@@ -538,19 +786,52 @@ func Execute(version, commit string) int {
 				exitCode = writeRPCErr(ic, err)
 				return nil
 			}
+			targetURL := strings.TrimRight(id.WebURL, "/")
+			if uiCred != "" {
+				var credRes struct {
+					Items []types.CredentialProfile `json:"items"`
+				}
+				if err := client.DoJSON(cmd.Context(), http.MethodGet, "/rpc/v1/credentials", nil, &credRes); err != nil {
+					exitCode = writeRPCErr(ic, err)
+					return nil
+				}
+				credID := ""
+				for _, c := range credRes.Items {
+					if c.ID == uiCred || strings.EqualFold(c.Name, uiCred) {
+						credID = c.ID
+						break
+					}
+				}
+				if credID == "" {
+					exitCode = ic.WriteError(types.ErrCodeNotFound, false, fmt.Sprintf("credential %q not found", uiCred), "List credentials with `cred list --json`.", nil, []string{ic.BinPath + " cred list --json"}, types.Meta{})
+					return nil
+				}
+				targetURL += "/catalog?subtab=credentials&credential=" + url.QueryEscape(credID)
+			} else if uiTab != "" {
+				tab := strings.ToLower(strings.TrimSpace(uiTab))
+				switch tab {
+				case "approvals", "targets", "catalog", "policies", "audit", "drivers":
+					targetURL += "/" + tab
+				default:
+					exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, fmt.Sprintf("unknown --tab %q", uiTab), "Supported tabs: approvals, targets, catalog, policies, audit, drivers.", nil, nil, types.Meta{})
+					return nil
+				}
+			}
 			if !uiNoOpen && os.Getenv(config.EnvNoBrowser) != "1" {
-				_ = approval.OpenBrowser(id.WebURL)
+				_ = approval.OpenBrowser(targetURL)
 			}
 			if ic.JSONMode {
-				exitCode = ic.WriteSuccess(map[string]any{"web_url": id.WebURL, "session": id.Session}, types.Meta{})
+				exitCode = ic.WriteSuccess(map[string]any{"web_url": targetURL, "base_url": id.WebURL, "session": id.Session}, types.Meta{})
 				return nil
 			}
-			_, _ = fmt.Fprintf(ic.Stdout, "Web Console: %s\n", id.WebURL)
+			_, _ = fmt.Fprintf(ic.Stdout, "Web Console: %s\n", targetURL)
 			return nil
 		},
 	}
 	uiOpenCmd.Flags().BoolVar(&uiNoOpen, "no-open", false, "Print URL without opening browser")
-	annotateCommand(uiOpenCmd, RiskWriteLocal, "agent-dbctl ui open")
+	uiOpenCmd.Flags().StringVar(&uiTab, "tab", "", "Open specific tab (approvals|targets|catalog|policies|audit|drivers)")
+	uiOpenCmd.Flags().StringVar(&uiCred, "credential", "", "Open password-entry modal for credential name or ID")
+	annotateCommand(uiOpenCmd, RiskWriteLocal, "agent-dbctl ui open --tab catalog\nagent-dbctl ui open --credential orders-ro")
 	uiCmd.AddCommand(uiOpenCmd)
 
 	// ---- daemon ----
@@ -932,13 +1213,20 @@ func Execute(version, commit string) int {
 		Short: "Report supported built-in drivers, approval providers, and contract features offline",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ic := ioCtx()
+			reg := driver.NewRegistry()
+			builtin.RegisterAll(reg)
+			metas := reg.List()
+			engines := make([]string, 0, len(metas))
+			for _, m := range metas {
+				engines = append(engines, m.Engine)
+			}
 			caps := map[string]any{
 				"version":            version,
-				"builtin_engines":    []string{"postgres", "mysql", "sqlite", "mongodb", "redis"},
-				"plugin_protocol":    "grpc-v1",
+				"builtin_engines":    engines,
+				"plugin_protocol":    "grpc-v2",
 				"host_api_version":   drvplugin.SupportedHostAPIVersion,
 				"approval_providers": []string{"local-web", "webhook"},
-				"features":           []string{"dry_run", "preflight", "async_wait_false", "op_wait", "hash_chain_audit", "audit_list_export", "crash_recovery", "system_workspace_match"},
+				"features":           []string{"cli_catalog_admin", "cli_policy_admin", "dsn_onboarding", "topology_schema_apply", "keychain_web_handoff", "web_session_csrf", "dry_run", "preflight", "dml_preflight", "schema_introspection", "format_objects", "async_wait_false", "op_wait", "hash_chain_audit", "audit_list_export", "crash_recovery", "system_workspace_match"},
 			}
 			if ic.JSONMode {
 				exitCode = ic.WriteSuccess(caps, types.Meta{})
@@ -1055,6 +1343,8 @@ func Execute(version, commit string) int {
 	skillCmd.AddCommand(skillInstallCmd, skillStatusCmd, skillUninstallCmd, skillPrintCmd)
 
 	root.AddCommand(dbCmd, execCmd, opCmd, uiCmd, daemonCmd, pluginCmd, auditCmd, doctorCmd, describeCmd, versionCmd, capabilitiesCmd, skillCmd)
+	registerCatalogCommands(root, ioCtx, ensureDaemon, writeClientInitErr, writeRPCErr, func(c int) { exitCode = c }, version, commit)
+	registerPolicyCommands(root, ioCtx, ensureDaemon, writeClientInitErr, writeRPCErr, func(c int) { exitCode = c }, version, commit)
 
 	if err := root.Execute(); err != nil {
 		ic := ioCtx()
@@ -1067,10 +1357,78 @@ func Execute(version, commit string) int {
 	return exitCode
 }
 
+type execRenderOpts struct {
+	outPath  string
+	forceOut bool
+	format   string
+	verbose  bool
+}
+
+func normalizeExecFormat(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "auto", "rows":
+		if strings.EqualFold(strings.TrimSpace(raw), "rows") {
+			return "rows", nil
+		}
+		return "auto", nil
+	case "objects":
+		return "objects", nil
+	default:
+		return "", fmt.Errorf("unsupported --format %q (expected auto, rows, or objects)", raw)
+	}
+}
+
 func renderExecOutcome(ic IOContext, resp types.ExecResponse, outPath string, forceOut bool, meta types.Meta) int {
-	if outPath != "" && resp.Result != nil {
-		raw, _ := json.MarshalIndent(resp, "", "  ")
-		absPath, err := WriteAtomicOutput(outPath, raw, forceOut)
+	return renderExecOutcomeWithOpts(ic, resp, execRenderOpts{
+		outPath:  outPath,
+		forceOut: forceOut,
+		format:   "auto",
+	}, meta)
+}
+
+func buildCompactExecOutcome(resp types.ExecResponse, format string) types.ExecCompactOutcome {
+	out := types.ExecCompactOutcome{
+		OperationID:     resp.OperationID,
+		Status:          resp.Status,
+		TargetRef:       resp.TargetRef,
+		EnvironmentCode: resp.EnvironmentCode,
+		Engine:          resp.Engine,
+		CredentialMode:  resp.CredentialMode,
+		RiskLevel:       resp.Classification.RiskLevel,
+		Reviewer:        resp.Reviewer,
+		ReviewerNote:    resp.ReviewerNote,
+	}
+	if resp.Result != nil {
+		out.Family = resp.Result.Family
+		out.Columns = resp.Result.Columns
+		out.Documents = resp.Result.Documents
+		out.KVResult = resp.Result.KVResult
+		out.RawText = resp.Result.RawText
+		out.AffectedRows = resp.Result.AffectedRows
+		out.FetchedRows = resp.Result.FetchedRows
+		out.ReturnedRows = resp.Result.ReturnedRows
+		out.ReturnedBytes = resp.Result.ReturnedBytes
+		out.Truncated = resp.Result.Truncated
+		out.CutoffReason = resp.Result.CutoffReason
+		out.Messages = resp.Result.Messages
+		out.LatencyMs = resp.Result.LatencyMs
+		if format == "objects" && len(resp.Result.Columns) > 0 {
+			out.Records = driver.BuildRecordsFromSQL(resp.Result.Columns, resp.Result.Rows)
+		} else {
+			out.Rows = resp.Result.Rows
+		}
+	}
+	return out
+}
+
+func renderExecOutcomeWithOpts(ic IOContext, resp types.ExecResponse, opts execRenderOpts, meta types.Meta) int {
+	if opts.outPath != "" && resp.Result != nil {
+		var payload any = resp
+		if !opts.verbose {
+			payload = buildCompactExecOutcome(resp, opts.format)
+		}
+		raw, _ := json.MarshalIndent(payload, "", "  ")
+		absPath, err := WriteAtomicOutput(opts.outPath, raw, opts.forceOut)
 		if err != nil {
 			code := types.ErrCodeInvalidInput
 			if errors.Is(err, errOutputExists) {
@@ -1079,14 +1437,26 @@ func renderExecOutcome(ic IOContext, resp types.ExecResponse, outPath string, fo
 			return ic.WriteError(code, false, err.Error(), "", nil, nil, meta)
 		}
 		// Return path + bounded summary rather than duplicating megabytes on stdout.
-		resp.Result.Rows = nil
-		resp.Result.Documents = nil
-		resp.Result.KVResult = nil
-		resp.Result.RawText = ""
 		if ic.JSONMode {
+			if opts.verbose {
+				resp.Result.Rows = nil
+				resp.Result.Documents = nil
+				resp.Result.KVResult = nil
+				resp.Result.RawText = ""
+				return ic.WriteSuccess(map[string]any{
+					"operation":   resp,
+					"output_file": absPath,
+				}, meta)
+			}
 			return ic.WriteSuccess(map[string]any{
-				"operation":   resp,
-				"output_file": absPath,
+				"operation_id":  resp.OperationID,
+				"target_ref":    resp.TargetRef,
+				"status":        resp.Status,
+				"output_file":   absPath,
+				"fetched_rows":  resp.Result.FetchedRows,
+				"returned_rows": resp.Result.ReturnedRows,
+				"truncated":     resp.Result.Truncated,
+				"cutoff_reason": resp.Result.CutoffReason,
 			}, meta)
 		}
 		_, _ = fmt.Fprintf(ic.Stdout, "Wrote result (%d rows, truncated=%v) to %s\n", resp.Result.ReturnedRows, resp.Result.Truncated, absPath)
@@ -1095,43 +1465,79 @@ func renderExecOutcome(ic IOContext, resp types.ExecResponse, outPath string, fo
 
 	if resp.ErrorCode != "" && resp.Status != types.OpSucceeded {
 		hint := ""
+		var next []string
+		ctxMap := map[string]any{
+			"target_ref": resp.TargetRef,
+			"status":     resp.Status,
+		}
+		if resp.OperationID != "" {
+			ctxMap["operation_id"] = resp.OperationID
+		}
+		if resp.ApprovalID != "" {
+			ctxMap["approval_id"] = resp.ApprovalID
+		}
+		if resp.ApprovalURL != "" {
+			ctxMap["approval_url"] = resp.ApprovalURL
+		}
+		if resp.ApprovalExpires != "" {
+			ctxMap["expires_at_utc"] = resp.ApprovalExpires
+		}
 		if resp.ReviewerNote != "" {
+			ctxMap["reviewer_note"] = resp.ReviewerNote
 			hint = "Reviewer note: " + resp.ReviewerNote
-		} else if resp.Status == types.OpTimedOut && !resp.Classification.IsReadOnly {
+		}
+		if len(resp.Evaluation.TriggerReasons) > 0 {
+			ctxMap["trigger_reasons"] = resp.Evaluation.TriggerReasons
+		}
+		if len(resp.Evaluation.MatchedRules) > 0 {
+			ctxMap["matched_rules"] = resp.Evaluation.MatchedRules
+		}
+		if opts.verbose {
+			ctxMap["classification"] = resp.Classification
+			if resp.Preflight != nil {
+				ctxMap["preflight"] = resp.Preflight
+			}
+		}
+
+		switch {
+		case resp.ErrorCode == types.ErrCodeReasonRequired:
+			hint = `Pass --reason "<concise business reason>" explaining why this operation is needed for human reviewers.`
+			if resp.TargetRef != "" {
+				next = append(next, fmt.Sprintf("%s exec --db %s --reason \"<reason>\" --sql \"...\" --json", ic.BinPath, resp.TargetRef))
+			}
+		case resp.Status == types.OpTimedOut && !resp.Classification.IsReadOnly:
 			hint = "Write/mutating query timed out; verify state via read-only query before retrying."
-		} else if resp.Status == types.OpWaitingApproval {
-			hint = "Human confirmation requested. Poll op status or review in browser."
+		case resp.Status == types.OpWaitingApproval:
+			hint = "Human confirmation requested. Run op wait or open approval_url in browser."
 			if len(resp.Evaluation.MatchedRules) > 0 {
 				top := resp.Evaluation.MatchedRules[0]
 				label := top.ConfirmTitle
 				if label == "" {
 					label = top.RuleName
 				}
-				hint = fmt.Sprintf("High-risk pattern matched (%s). Poll op status or confirm in browser.", label)
+				hint = fmt.Sprintf("High-risk pattern matched (%s). Run op wait or confirm in browser.", label)
 			}
-		}
-		ctxMap := map[string]any{
-			"operation_id":     resp.OperationID,
-			"target_ref":       resp.TargetRef,
-			"status":           resp.Status,
-			"approval_id":      resp.ApprovalID,
-			"approval_url":     resp.ApprovalURL,
-			"expires_at_utc":   resp.ApprovalExpires,
-			"reviewer_note":    resp.ReviewerNote,
-			"trigger_reasons":  resp.Evaluation.TriggerReasons,
-			"matched_rules":    resp.Evaluation.MatchedRules,
-			"classification":   resp.Classification,
-			"preflight":        resp.Preflight,
-		}
-		var next []string
-		if resp.OperationID != "" && resp.Status == types.OpWaitingApproval {
-			next = append(next, fmt.Sprintf("%s op status %s --json", ic.BinPath, resp.OperationID))
+			if resp.OperationID != "" {
+				next = append(next,
+					fmt.Sprintf("%s op wait %s --timeout 60s --json", ic.BinPath, resp.OperationID),
+					fmt.Sprintf("%s op status %s --json", ic.BinPath, resp.OperationID),
+				)
+			}
+		case resp.ErrorCode == types.ErrCodeDriverError:
+			drvHint, drvNext := buildDriverErrorGuidance(ic.BinPath, resp)
+			if hint == "" {
+				hint = drvHint
+			}
+			next = append(next, drvNext...)
 		}
 		return ic.WriteError(resp.ErrorCode, resp.Retryable, resp.ErrorMessage, hint, ctxMap, next, meta)
 	}
 
 	if ic.JSONMode {
-		return ic.WriteSuccess(resp, meta)
+		if meta.DryRun || meta.Preflight || opts.verbose {
+			return ic.WriteSuccess(resp, meta)
+		}
+		return ic.WriteSuccess(buildCompactExecOutcome(resp, opts.format), meta)
 	}
 
 	if resp.Result != nil && len(resp.Result.Columns) > 0 {
@@ -1267,21 +1673,133 @@ func readQueryInput(inline, filePath string, useStdin, stdinTTY bool) (string, e
 	return "", fmt.Errorf("missing query input")
 }
 
+func daemonIdentityMatches(id daemon.Identity, version, commit string) bool {
+	if id.Version != version {
+		return false
+	}
+	return commit == "dev" || id.Commit == commit
+}
+
+func daemonHasRunningOps(ctx context.Context, cl *daemon.Client) bool {
+	qCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	var res struct {
+		Items []types.Operation `json:"items"`
+	}
+	if err := cl.DoJSON(qCtx, http.MethodGet, "/rpc/v1/ops?status=running&limit=1", nil, &res); err != nil {
+		return false
+	}
+	return len(res.Items) > 0
+}
+
+func parseSemverParts(raw string) (major, minor, patch int, suffix string, ok bool) {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "v")
+	core, suf, _ := strings.Cut(s, "-")
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return 0, 0, 0, "", false
+	}
+	var nums [3]int
+	for i, p := range parts {
+		if p == "" {
+			return 0, 0, 0, "", false
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return 0, 0, 0, "", false
+		}
+		nums[i] = n
+	}
+	return nums[0], nums[1], nums[2], suf, true
+}
+
+func isGitDescribeAheadSuffix(suf string) bool {
+	countStr, rest, found := strings.Cut(suf, "-")
+	if !found || countStr == "" || !strings.HasPrefix(rest, "g") {
+		return false
+	}
+	n, err := strconv.Atoi(countStr)
+	return err == nil && n > 0
+}
+
+// compareVersions compares two semantic versions.
+// Returns (-1/0/1, true) when both are parseable semver, or (0, false) for dev/non-semver builds.
+func compareVersions(a, b string) (int, bool) {
+	majA, minA, patA, sufA, okA := parseSemverParts(a)
+	majB, minB, patB, sufB, okB := parseSemverParts(b)
+	if !okA || !okB {
+		return 0, false
+	}
+	if majA != majB {
+		if majA < majB {
+			return -1, true
+		}
+		return 1, true
+	}
+	if minA != minB {
+		if minA < minB {
+			return -1, true
+		}
+		return 1, true
+	}
+	if patA != patB {
+		if patA < patB {
+			return -1, true
+		}
+		return 1, true
+	}
+	if sufA == sufB {
+		return 0, true
+	}
+	if sufA == "" && isGitDescribeAheadSuffix(sufB) {
+		return -1, true
+	}
+	if isGitDescribeAheadSuffix(sufA) && sufB == "" {
+		return 1, true
+	}
+	return 0, true
+}
+
 func ensureDaemon(ic IOContext, version, commit string) (*daemon.Client, error) {
 	paths, err := config.ResolvePaths(ic.Session)
 	if err != nil {
 		return nil, err
 	}
 	if cl, err := daemon.NewClient(paths); err == nil {
-		if id, idErr := cl.GetIdentity(context.Background()); idErr == nil {
-			if id.Version != version || (commit != "dev" && id.Commit != commit) {
-				return nil, fmt.Errorf("%s: daemon version %s (%s) does not match CLI %s (%s)", types.ErrCodeDaemonVersionMismatch, id.Version, id.Commit, version, commit)
-			}
+		if id, idErr := cl.GetIdentity(context.Background()); idErr == nil && daemonIdentityMatches(id, version, commit) {
 			return cl, nil
 		}
 	}
+
+	startLock, lockErr := daemon.AcquireFileLock(paths.StartLock, true)
+	if lockErr == nil {
+		defer daemon.ReleaseFileLock(startLock)
+	}
+
+	if cl, err := daemon.NewClient(paths); err == nil {
+		if id, idErr := cl.GetIdentity(context.Background()); idErr == nil {
+			if daemonIdentityMatches(id, version, commit) {
+				return cl, nil
+			}
+			if os.Getenv(config.EnvNoDaemonSpawn) == "1" {
+				return nil, fmt.Errorf("%s: daemon version %s (%s) does not match CLI %s (%s)", types.ErrCodeDaemonVersionMismatch, id.Version, id.Commit, version, commit)
+			}
+			if cmp, ok := compareVersions(id.Version, version); ok && cmp > 0 {
+				return nil, fmt.Errorf("%s: running daemon version %s (%s) is newer than CLI %s (%s)", types.ErrCodeDaemonVersionMismatch, id.Version, id.Commit, version, commit)
+			}
+			if daemonHasRunningOps(context.Background(), cl) {
+				return nil, fmt.Errorf("%s: daemon version %s (%s) does not match CLI %s (%s) and has active running operation(s)", types.ErrCodeDaemonVersionMismatch, id.Version, id.Commit, version, commit)
+			}
+			_ = stopDaemonWithPID(context.Background(), paths, id.PID)
+		}
+	}
+
 	if os.Getenv(config.EnvNoDaemonSpawn) == "1" {
 		return nil, fmt.Errorf("%s: daemon not running and auto-spawn disabled", types.ErrCodeDaemonUnavailable)
+	}
+	if meta, metaErr := daemon.ReadDaemonMeta(paths); metaErr == nil && meta.PID > 0 && daemon.IsProcessAlive(meta.PID) {
+		_ = stopDaemonWithPID(context.Background(), paths, meta.PID)
 	}
 	if err := daemon.SpawnDetached(ic.BinPath, []string{"daemon", "serve", "--session", ic.Session}); err != nil {
 		return nil, fmt.Errorf("spawn daemon: %w", err)
@@ -1290,7 +1808,7 @@ func ensureDaemon(ic IOContext, version, commit string) (*daemon.Client, error) 
 	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) {
 		if cl, err := daemon.NewClient(paths); err == nil {
-			if id, idErr := cl.GetIdentity(context.Background()); idErr == nil && id.PID > 0 {
+			if id, idErr := cl.GetIdentity(context.Background()); idErr == nil && id.PID > 0 && daemonIdentityMatches(id, version, commit) {
 				return cl, nil
 			}
 		}
@@ -1300,12 +1818,24 @@ func ensureDaemon(ic IOContext, version, commit string) (*daemon.Client, error) 
 }
 
 func stopDaemon(ctx context.Context, paths config.Paths) error {
-	if cl, err := daemon.NewClient(paths); err == nil {
-		_ = cl.Shutdown(ctx)
-		time.Sleep(150 * time.Millisecond)
-	}
+	return stopDaemonWithPID(ctx, paths, 0)
+}
+
+func stopDaemonWithPID(ctx context.Context, paths config.Paths, knownPID int) error {
+	pid := knownPID
 	if meta, err := daemon.ReadDaemonMeta(paths); err == nil && meta.PID > 0 {
-		_ = daemon.KillPID(meta.PID)
+		pid = meta.PID
+	}
+	if cl, err := daemon.NewClient(paths); err == nil {
+		if pid == 0 {
+			if id, idErr := cl.GetIdentity(ctx); idErr == nil && id.PID > 0 {
+				pid = id.PID
+			}
+		}
+		_ = cl.Shutdown(ctx)
+	}
+	if pid > 0 {
+		_ = daemon.WaitOrTerminatePID(pid, 600*time.Millisecond, 1500*time.Millisecond)
 	}
 	_ = os.Remove(paths.SocketPath)
 	_ = os.Remove(paths.DaemonMeta)
@@ -1315,19 +1845,66 @@ func stopDaemon(ctx context.Context, paths config.Paths) error {
 func writeClientInitErr(ic IOContext, err error) int {
 	msg := err.Error()
 	if strings.Contains(msg, types.ErrCodeDaemonVersionMismatch) {
-		return ic.WriteError(types.ErrCodeDaemonVersionMismatch, false, msg, "Restart the daemon to match the current CLI binary.", nil, []string{ic.BinPath + " daemon restart --session " + ic.Session + " --json"}, types.Meta{})
+		hint := "Restart the daemon to match the current CLI binary."
+		if strings.Contains(msg, "is newer than CLI") {
+			hint = "The running daemon is newer than this CLI binary. Upgrade this binary (or check PATH) rather than downgrading, or run daemon restart explicitly if intended."
+		} else if strings.Contains(msg, "active running operation") {
+			hint = "Wait for active operation(s) to finish, or run daemon restart to force a restart."
+		}
+		return ic.WriteError(types.ErrCodeDaemonVersionMismatch, false, msg, hint, nil, []string{ic.BinPath + " daemon restart --session " + ic.Session + " --json"}, types.Meta{})
 	}
 	return ic.WriteError(types.ErrCodeDaemonUnavailable, true, msg, "Run doctor or daemon start to inspect local daemon state.", nil, []string{ic.BinPath + " doctor --json"}, types.Meta{})
+}
+
+func buildDriverErrorGuidance(binPath string, resp types.ExecResponse) (hint string, next []string) {
+	msg := strings.ToLower(resp.ErrorMessage)
+	ref := resp.TargetRef
+	switch {
+	case strings.Contains(msg, "json runcommand") || strings.Contains(msg, "parse mongodb command"):
+		hint = `MongoDB targets require JSON RunCommand syntax (e.g. {"find":"orders","filter":{},"limit":20}) or show collections.`
+		if ref != "" {
+			next = append(next, fmt.Sprintf("%s db schema %s --json", binPath, ref))
+		}
+	case strings.Contains(msg, "does not exist") || strings.Contains(msg, "doesn't exist") ||
+		strings.Contains(msg, "unknown column") || strings.Contains(msg, "no such table") ||
+		strings.Contains(msg, "no such column") || strings.Contains(msg, "undefined"):
+		hint = "Inspect available tables, collections, and columns via db schema before rewriting the query."
+		if ref != "" {
+			next = append(next, fmt.Sprintf("%s db schema %s --json", binPath, ref))
+		}
+	case strings.Contains(msg, "read-only") || strings.Contains(msg, "read only") || strings.Contains(msg, "readonly") ||
+		strings.Contains(msg, "permission denied") || strings.Contains(msg, "access denied") || strings.Contains(msg, "not authorized"):
+		hint = "Operation hit a read-only guardrail or lacked DB privileges; inspect target credentials and policy via db show."
+		if ref != "" {
+			next = append(next, fmt.Sprintf("%s db show %s --json", binPath, ref))
+		}
+	case strings.Contains(msg, "connection refused") || strings.Contains(msg, "dial") ||
+		strings.Contains(msg, "timed out") || strings.Contains(msg, "eof") || strings.Contains(msg, "broken pipe"):
+		hint = "Database connectivity failed; probe live reachability with db test."
+		if ref != "" {
+			next = append(next, fmt.Sprintf("%s db test %s --json", binPath, ref))
+		}
+	case strings.Contains(msg, "syntax"):
+		hint = "Fix the query syntax for this engine and retry."
+		if ref != "" {
+			next = append(next, fmt.Sprintf("%s db show %s --json", binPath, ref))
+		}
+	}
+	return hint, next
 }
 
 func writeRPCErr(ic IOContext, err error) int {
 	var le *daemon.LookupError
 	if errors.As(err, &le) {
-		ctxMap := map[string]any{
-			"similar_names":      le.SimilarNames,
-			"unsearched_sources": le.UnsearchedSources,
+		ctxMap := map[string]any{}
+		if len(le.SimilarNames) > 0 {
+			ctxMap["similar_names"] = le.SimilarNames
+		}
+		if len(le.UnsearchedSources) > 0 {
+			ctxMap["unsearched_sources"] = le.UnsearchedSources
 		}
 		var next []string
+		hint := "Pick an exact target ref or alias from context."
 		if len(le.Candidates) > 0 {
 			cands := make([]map[string]string, 0, len(le.Candidates))
 			for _, c := range le.Candidates {
@@ -1344,10 +1921,33 @@ func writeRPCErr(ic IOContext, err error) int {
 				next = append(next, fmt.Sprintf("%s db show %s --json", ic.BinPath, c.Target.Ref))
 			}
 			ctxMap["candidates"] = cands
-		} else {
+		} else if le.Code == types.ErrCodeDBNotFound {
+			if len(le.SimilarNames) > 0 {
+				hint = "Database not found; pick a similar configured target or list all targets."
+				next = append(next, ic.BinPath+" db list --json")
+			} else {
+				hint = "Database target not found. List configured targets or onboard it via `db add` / `topology apply`."
+				next = append(next,
+					ic.BinPath+" db list --json",
+					ic.BinPath+" db add --dsn <dsn> --open-secret --json",
+					ic.BinPath+" topology schema --json",
+				)
+			}
+		} else if le.Code == types.ErrCodeInvalidUsage {
 			next = append(next, ic.BinPath+" db list --json")
+		} else if le.Code == types.ErrCodeNotFound {
+			hint = "Requested catalog or policy resource does not exist; inspect configured resources first."
+		} else if le.Code == types.ErrCodeConflict {
+			hint = "Conflict or dependent resource exists; resolve dependencies before retrying."
+		} else if le.Code == types.ErrCodeInvalidInput {
+			hint = "Fix invalid input fields or flags and retry."
+		} else {
+			hint = "Inspect error message and verify target state or query."
 		}
-		return ic.WriteError(le.Code, false, le.Message, "Pick an exact target ref or alias from context.", ctxMap, next, types.Meta{})
+		if len(ctxMap) == 0 {
+			ctxMap = nil
+		}
+		return ic.WriteError(le.Code, false, le.Message, hint, ctxMap, next, types.Meta{})
 	}
 	return ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
 }

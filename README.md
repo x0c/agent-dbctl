@@ -2,7 +2,7 @@
 
 # agent-dbctl
 
-Run PostgreSQL, MySQL, SQLite, MongoDB, and Redis queries safely from Claude Code, Codex, Cursor, and OpenCode. Get EXPLAIN scan preflight, per-environment guardrails, human Web approvals, and immutable hash-chained audit logs in a single zero-JVM binary.
+Run PostgreSQL, MySQL, SQLite, ClickHouse, SQL Server, Oracle, MongoDB, Elasticsearch, and Redis queries safely from Claude Code, Codex, Cursor, and OpenCode. Get EXPLAIN scan preflight, per-environment guardrails, human Web approvals, and immutable hash-chained audit logs in a single zero-JVM binary.
 
 > **100% Local Execution · Zero Telemetry · Zero JVM · Keychain-Backed Credentials · Hash-Chained Audit**
 
@@ -49,9 +49,17 @@ make install-local
 
 ## Quick Start
 
-1. **Open the local Web Console** (`127.0.0.1`) to register a system, instance, credentials (stored in your OS Keychain / env / exec provider), and database target:
+1. **Onboard a database via CLI or the local Web Console** (`127.0.0.1`):
 
    ```sh
+   # Register via CLI without exposing passwords to the agent, then open Web UI to fill the password:
+   agent-dbctl db add --engine postgres --host 127.0.0.1 --port 5432 --database app \
+     --system order-core --env dev --user app_ro --open-secret --json
+
+   # Or import a sanitized YAML/JSON topology bundle (inspect schema with `topology schema`):
+   agent-dbctl topology apply --file topology.yaml --dry-run --json
+
+   # Or open the full Web Console directly:
    agent-dbctl ui open
    ```
 
@@ -82,8 +90,8 @@ make install-local
 | Capability | Behavior |
 |---|---|
 | **Four-Layer Enterprise Catalog** | Organize `System` (with `workspace_paths` auto-priority) -> `Environment` -> `NetworkProfile` / `CredentialProfile` -> `Instance` / `Target` (`ro_credential_id` & `rw_credential_id` split). Export/import sanitized topology as YAML/JSON. |
-| **Environment Safety Tiers** | **`dev` (`yolo`)** runs freely; **`staging` (`guarded`)** & **`prod` (`strict`)** run EXPLAIN preflight and trigger browser approval on writes, DDL, full table scans, or high-cost Redis/Mongo commands. Custom `Policies -> High-Risk Patterns` rules can enforce secondary confirmation or denials even on `dev` targets. |
-| **Verbatim Dialect Forwarding** | Native PostgreSQL, MySQL/MariaDB/TiDB, SQLite, MongoDB (`RunCommand` JSON), and Redis commands forwarded verbatim—no lossy ORM or SQL translation. |
+| **Environment Safety Tiers** | **`dev` (`yolo`)** runs freely; **`staging` (`guarded`)** & **`prod` (`strict`)** run EXPLAIN preflight and trigger bilingual (English / 中文) Web approvals (requiring `--reason` by default) on writes, DDL, full table scans, or high-cost Redis/Mongo commands. Custom `Policies -> High-Risk Patterns` rules can enforce secondary confirmation or denials even on `dev` targets. |
+| **Verbatim Dialect Forwarding** | Native PostgreSQL, MySQL/MariaDB/TiDB, SQLite, ClickHouse, SQL Server, Oracle, MongoDB (`RunCommand` JSON), Elasticsearch/OpenSearch, and Redis commands forwarded verbatim—no lossy ORM or SQL translation. |
 | **Agent-Friendly CLI Contract** | Dual-audience TTY tables + `--json` `{ok, data, error, meta}` envelope, single-source `describe`, bounded row/byte truncation on intact boundaries, atomic `--out`, and non-replayable write timeouts. |
 | **Pluggable Approvals & Drivers** | Decoupled `ApprovalProvider` (`local-web` built in; extensible to external ticket flows) plus `hashicorp/go-plugin` gRPC external driver subprocesses verified by SHA-256 and `host_api_version`. |
 | **Immutable Hash-Chain Audit** | Append-only SQLite WAL `audit_logs` chained via SHA-256 (`agent-dbctl audit verify`) with query result payloads kept out of the audit ledger. |

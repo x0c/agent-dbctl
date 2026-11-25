@@ -1,10 +1,12 @@
 package daemon
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -19,6 +21,11 @@ import (
 	"github.com/x0c/agent-dbctl/internal/webui"
 )
 
+const (
+	uiSessionCookieName = "agent_dbctl_session"
+	uiCSRFHeaderName    = "X-Agent-DBCTL-CSRF"
+)
+
 // NewWebHandler builds the local HTTP + SSE router for the embedded Web Console.
 func NewWebHandler(svc *Service) http.Handler {
 	mux := http.NewServeMux()
@@ -26,8 +33,12 @@ func NewWebHandler(svc *Service) http.Handler {
 		writeJSONResp(w, http.StatusOK, map[string]string{"status": "running"})
 	})
 
-	// Bootstrap & server-driven display catalogs.
+	// Bootstrap & server-driven display catalogs (also issues per-daemon HttpOnly session cookie + CSRF token).
 	mux.HandleFunc("GET /api/v1/bootstrap", func(w http.ResponseWriter, r *http.Request) {
+		if !isSafeBootstrapRequest(r) {
+			writeHTTPErr(w, http.StatusForbidden, "cross-origin bootstrap blocked")
+			return
+		}
 		cat, err := svc.BuildDisplayCatalog(r.Context())
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
@@ -39,12 +50,20 @@ func NewWebHandler(svc *Service) http.Handler {
 			return
 		}
 		pending, _ := svc.Store().ListApprovals(r.Context(), string(types.ApprovalPending), 200)
+		http.SetCookie(w, &http.Cookie{
+			Name:     uiSessionCookieName,
+			Value:    svc.UISessionToken(),
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+		})
 		writeJSONResp(w, http.StatusOK, map[string]any{
-			"identity":              svc.Identity(),
-			"display_catalog":       cat,
-			"global_security":       sec,
+			"identity":               svc.Identity(),
+			"display_catalog":        cat,
+			"global_security":        sec,
 			"pending_approval_count": len(pending),
-			"secret_backend":        svc.Secrets().Name(),
+			"secret_backend":         svc.Secrets().Name(),
+			"ui_csrf_token":          svc.UICSRFToken(),
 		})
 	})
 
@@ -69,6 +88,8 @@ func NewWebHandler(svc *Service) http.Handler {
 		for {
 			select {
 			case <-r.Context().Done():
+				return
+			case <-svc.Done():
 				return
 			case <-keepAlive.C:
 				_, _ = fmt.Fprintf(w, ": ping\n\n")
@@ -200,6 +221,7 @@ func NewWebHandler(svc *Service) http.Handler {
 			}
 		}
 		saved.HasSecret = svc.hasCredentialSecret(r.Context(), saved)
+		svc.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "credential", "id": saved.ID}})
 		writeJSONResp(w, http.StatusOK, saved)
 	})
 	mux.HandleFunc("DELETE /api/v1/credentials/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -558,7 +580,7 @@ func NewWebHandler(svc *Service) http.Handler {
 	// Embedded TypeScript Web Console SPA fallback.
 	mux.Handle("/", webui.Handler())
 
-	return SameOriginMiddleware(mux)
+	return WebSecurityMiddleware(svc, mux)
 }
 
 func handleApprovalDecision(w http.ResponseWriter, r *http.Request, svc *Service, approve bool) {
@@ -568,8 +590,9 @@ func handleApprovalDecision(w http.ResponseWriter, r *http.Request, svc *Service
 		Token    string `json:"token"`
 	}
 	_ = decodeJSONBody(r, &body)
-	// Same-origin SPA console submissions carry X-Agent-DBCTL-UI=1 when approving from the live queue.
-	trustedUI := r.Header.Get("X-Agent-DBCTL-UI") == "1"
+	// Require a validated per-daemon session cookie + CSRF token for session-based approval;
+	// otherwise ResolveApproval validates the one-time approval_token from the deep link.
+	trustedUI := hasValidUISession(r, svc)
 	app, err := svc.ResolveApproval(r.Context(), r.PathValue("id"), approve, body.Reviewer, body.Note, body.Token, trustedUI)
 	if err != nil {
 		if strings.Contains(err.Error(), "token") {
@@ -582,12 +605,42 @@ func handleApprovalDecision(w http.ResponseWriter, r *http.Request, svc *Service
 	writeJSONResp(w, http.StatusOK, app)
 }
 
-// SameOriginMiddleware enforces same-origin validation on mutating local HTTP endpoints:
-// - When Origin is present and != "null", verify scheme+host match r.Host.
-// - When Origin is missing or "null" (e.g. Safari same-origin POST), accept Sec-Fetch-Site: same-origin,
-//   or fallback to matching Referer origin; reject explicit external origins and cross-site null POSTs.
+// WebSecurityMiddleware protects the local Web Console against DNS rebinding, cross-site CSRF,
+// and unauthenticated loopback mutations:
+// - Every request must target a loopback Host header (127.0.0.1, localhost, or [::1]).
+// - Every mutating request must satisfy strict browser same-origin checks (Origin, Sec-Fetch-Site, or Referer;
+//   headerless loopback requests are rejected).
+// - Mutating /api/v1/* endpoints require a valid per-daemon HttpOnly session cookie + X-Agent-DBCTL-CSRF header
+//   (except approval decision endpoints, which also accept a valid one-time approval_token).
+func WebSecurityMiddleware(svc *Service, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopbackHostHeader(r.Host) {
+			writeHTTPErr(w, http.StatusForbidden, "non-loopback host forbidden")
+			return
+		}
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !isSameOriginRequest(r) {
+			writeHTTPErr(w, http.StatusForbidden, "cross-origin mutation blocked")
+			return
+		}
+		if !isApprovalDecisionPath(r.URL.Path) && !hasValidUISession(r, svc) {
+			writeHTTPErr(w, http.StatusForbidden, "missing or invalid UI session token")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// SameOriginMiddleware enforces loopback Host and strict same-origin validation on mutating HTTP requests.
 func SameOriginMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopbackHostHeader(r.Host) {
+			writeHTTPErr(w, http.StatusForbidden, "non-loopback host forbidden")
+			return
+		}
 		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
 			next.ServeHTTP(w, r)
 			return
@@ -598,6 +651,63 @@ func SameOriginMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isApprovalDecisionPath(path string) bool {
+	return strings.HasPrefix(path, "/api/v1/approvals/") &&
+		(strings.HasSuffix(path, "/approve") || strings.HasSuffix(path, "/reject"))
+}
+
+func hasValidUISession(r *http.Request, svc *Service) bool {
+	if svc == nil {
+		return false
+	}
+	cookie, err := r.Cookie(uiSessionCookieName)
+	if err != nil || cookie == nil || cookie.Value == "" {
+		return false
+	}
+	csrf := strings.TrimSpace(r.Header.Get(uiCSRFHeaderName))
+	if csrf == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(svc.UISessionToken())) == 1 &&
+		subtle.ConstantTimeCompare([]byte(csrf), []byte(svc.UICSRFToken())) == 1
+}
+
+func isLoopbackHostHeader(hostHeader string) bool {
+	trimmed := strings.TrimSpace(hostHeader)
+	if trimmed == "" {
+		return false
+	}
+	var host string
+	if h, _, err := net.SplitHostPort(trimmed); err == nil {
+		host = h
+	} else {
+		host = strings.Trim(trimmed, "[]")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isSafeBootstrapRequest(r *http.Request) bool {
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		if origin == "null" {
+			return strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "same-origin")
+		}
+		u, err := url.Parse(origin)
+		if err != nil || !strings.EqualFold(u.Host, r.Host) {
+			return false
+		}
+	}
+	if sfs := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); sfs != "" {
+		if !strings.EqualFold(sfs, "same-origin") && !strings.EqualFold(sfs, "none") {
+			return false
+		}
+	}
+	return true
 }
 
 func isSameOriginRequest(r *http.Request) bool {
@@ -624,14 +734,7 @@ func isSameOriginRequest(r *http.Request) bool {
 		return strings.EqualFold(u.Host, r.Host)
 	}
 
-	// Non-browser local CLI / unit tests without Origin/Sec-Fetch-Site/Referer headers
-	// are rejected unless explicitly targeting loopback without cross-site headers?
-	// Wait: enforce strict browser/origin check when Origin=="null" without Sec-Fetch-Site/Referer!
-	if origin == "null" {
-		return false
-	}
-	// Allow direct non-browser programmatic loopback calls (no Origin, no Sec-Fetch-Site, no Referer).
-	return true
+	return false
 }
 
 func decodeJSONBody(r *http.Request, dst any) error {

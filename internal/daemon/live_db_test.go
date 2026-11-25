@@ -506,7 +506,365 @@ func TestLiveMultiDatabaseEngines(t *testing.T) {
 		}
 	})
 
-	// ---- 5. SSH Tunnel ----
+	// ---- 5. ClickHouse ----
+	t.Run("ClickHouse", func(t *testing.T) {
+		inst, err := svc.Store().UpsertInstance(ctx, "live-test", types.Instance{
+			Name:   "live-clickhouse",
+			Engine: "clickhouse",
+			Host:   host,
+			Port:   29000,
+			Role:   types.RolePrimary,
+		})
+		if err != nil {
+			t.Fatalf("upsert clickhouse inst: %v", err)
+		}
+		devTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/dev/clickhouse",
+			Alias:           "live-dev-ch",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "dev",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders_test",
+			ROCredentialID:  pgRO,
+			RWCredentialID:  pgRW,
+		})
+		prodTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/prod/clickhouse",
+			Alias:           "live-prod-ch",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "prod",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders_test",
+			ROCredentialID:  pgRO,
+			RWCredentialID:  pgRW,
+		})
+
+		prodDet, err := svc.ResolveTarget(ctx, prodTgt.Ref, "")
+		if err != nil {
+			t.Fatalf("resolve ch prod target: %v", err)
+		}
+		ping := svc.PingTarget(ctx, prodDet)
+		if !ping.Reachable {
+			t.Fatalf("ClickHouse Ping failed: %+v", ping)
+		}
+		dbs, err := svc.DiscoverInstance(ctx, inst.ID, pgRW, "orders_test")
+		if err != nil || len(dbs) == 0 {
+			t.Fatalf("ClickHouse DiscoverDatabases failed: dbs=%v err=%v", dbs, err)
+		}
+		if _, err := svc.InspectSchema(ctx, prodTgt.Alias, "", "orders", "", 0); err != nil {
+			t.Fatalf("ClickHouse InspectSchema failed: %v", err)
+		}
+
+		devRes, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: devTgt.Alias,
+			Query:            "SELECT id, customer_email, amount_cents, status FROM orders WHERE id <= 5 ORDER BY id",
+			Wait:             true,
+		})
+		if err != nil || devRes.Status != types.OpSucceeded || len(devRes.Result.Rows) != 5 {
+			t.Fatalf("ClickHouse dev select failed: %+v err=%v", devRes, err)
+		}
+
+		prodRead, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT id, customer_email, status FROM orders WHERE id = 42 LIMIT 1",
+			Wait:             true,
+		})
+		if err != nil || prodRead.Status != types.OpSucceeded || len(prodRead.Result.Rows) != 1 {
+			t.Fatalf("ClickHouse prod PK select failed: %+v err=%v", prodRead, err)
+		}
+
+		pf, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT id, status FROM orders WHERE status = 'pending' LIMIT 10",
+			Preflight:        true,
+		})
+		if err != nil || pf.Preflight == nil || !pf.Preflight.FullScan {
+			t.Fatalf("expected ClickHouse preflight FullScan=true, got %+v err=%v", pf, err)
+		}
+		if pf.Evaluation.Decision != types.DecisionRequireApproval {
+			t.Fatalf("expected ClickHouse full scan to escalate to require_approval, got %+v", pf.Evaluation)
+		}
+
+		ins, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "INSERT INTO orders (id, customer_email, amount_cents, status) VALUES (9999, 'live-ch@example.com', 100, 'paid')",
+			Reason:           "Live ClickHouse approval test",
+			Wait:             false,
+		})
+		if err != nil || ins.Status != types.OpWaitingApproval {
+			t.Fatalf("expected ClickHouse write waiting_approval, got %+v err=%v", ins, err)
+		}
+		approvePendingHTTP(t, srv.WebURL(), ins.ApprovalID, ins.ApprovalURL, "approved ch")
+		done := waitOpTerminal(t, ctx, svc, ins.OperationID)
+		if done.Status != types.OpSucceeded {
+			t.Fatalf("expected ClickHouse approved write to succeed, got %+v", done)
+		}
+	})
+
+	// ---- 6. MSSQL ----
+	t.Run("MSSQL", func(t *testing.T) {
+		inst, err := svc.Store().UpsertInstance(ctx, "live-test", types.Instance{
+			Name:   "live-mssql",
+			Engine: "mssql",
+			Host:   host,
+			Port:   21433,
+			Role:   types.RolePrimary,
+		})
+		if err != nil {
+			t.Fatalf("upsert mssql inst: %v", err)
+		}
+		devTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/dev/mssql",
+			Alias:           "live-dev-mssql",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "dev",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders_test",
+			ROCredentialID:  pgRO,
+			RWCredentialID:  pgRW,
+		})
+		prodTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/prod/mssql",
+			Alias:           "live-prod-mssql",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "prod",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders_test",
+			ROCredentialID:  pgRO,
+			RWCredentialID:  pgRW,
+		})
+
+		prodDet, err := svc.ResolveTarget(ctx, prodTgt.Ref, "")
+		if err != nil {
+			t.Fatalf("resolve mssql prod target: %v", err)
+		}
+		ping := svc.PingTarget(ctx, prodDet)
+		if !ping.Reachable {
+			t.Fatalf("MSSQL Ping failed: %+v", ping)
+		}
+		dbs, err := svc.DiscoverInstance(ctx, inst.ID, pgRW, "orders_test")
+		if err != nil || len(dbs) == 0 {
+			t.Fatalf("MSSQL DiscoverDatabases failed: dbs=%v err=%v", dbs, err)
+		}
+		if _, err := svc.InspectSchema(ctx, prodTgt.Alias, "", "orders", "", 0); err != nil {
+			t.Fatalf("MSSQL InspectSchema failed: %v", err)
+		}
+
+		devRes, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: devTgt.Alias,
+			Query:            "SELECT TOP 5 id, customer_email, amount_cents, status FROM orders WHERE id <= 5 ORDER BY id",
+			Wait:             true,
+		})
+		if err != nil || devRes.Status != types.OpSucceeded || len(devRes.Result.Rows) != 5 {
+			t.Fatalf("MSSQL dev select failed: %+v err=%v", devRes, err)
+		}
+
+		prodRead, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT id, customer_email, status FROM orders WHERE id = 42",
+			Wait:             true,
+		})
+		if err != nil || prodRead.Status != types.OpSucceeded || len(prodRead.Result.Rows) != 1 {
+			t.Fatalf("MSSQL prod PK select failed: %+v err=%v", prodRead, err)
+		}
+
+		pf, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT TOP 10 id, status FROM orders WHERE status = 'pending'",
+			Preflight:        true,
+		})
+		if err != nil || pf.Preflight == nil || !pf.Preflight.FullScan {
+			t.Fatalf("expected MSSQL preflight FullScan=true, got %+v err=%v", pf, err)
+		}
+
+		upd, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "UPDATE orders SET amount_cents = amount_cents + 1 WHERE id = 42",
+			Reason:           "Live MSSQL approval test",
+			Wait:             false,
+		})
+		if err != nil || upd.Status != types.OpWaitingApproval {
+			t.Fatalf("expected MSSQL waiting_approval, got %+v err=%v", upd, err)
+		}
+		approvePendingHTTP(t, srv.WebURL(), upd.ApprovalID, upd.ApprovalURL, "approved mssql")
+		done := waitOpTerminal(t, ctx, svc, upd.OperationID)
+		if done.Status != types.OpSucceeded || done.Result.AffectedRows == nil || *done.Result.AffectedRows != 1 {
+			t.Fatalf("expected MSSQL write affected=1, got %+v", done)
+		}
+	})
+
+	// ---- 7. Oracle ----
+	t.Run("Oracle", func(t *testing.T) {
+		inst, err := svc.Store().UpsertInstance(ctx, "live-test", types.Instance{
+			Name:   "live-oracle",
+			Engine: "oracle",
+			Host:   host,
+			Port:   21521,
+			Role:   types.RolePrimary,
+		})
+		if err != nil {
+			t.Fatalf("upsert oracle inst: %v", err)
+		}
+		devTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/dev/oracle",
+			Alias:           "live-dev-oracle",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "dev",
+			InstanceID:      inst.ID,
+			DatabaseName:    "FREEPDB1",
+			ROCredentialID:  pgRO,
+			RWCredentialID:  pgRW,
+		})
+		prodTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/prod/oracle",
+			Alias:           "live-prod-oracle",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "prod",
+			InstanceID:      inst.ID,
+			DatabaseName:    "FREEPDB1",
+			ROCredentialID:  pgRO,
+			RWCredentialID:  pgRW,
+		})
+
+		prodDet, err := svc.ResolveTarget(ctx, prodTgt.Ref, "")
+		if err != nil {
+			t.Fatalf("resolve oracle prod target: %v", err)
+		}
+		ping := svc.PingTarget(ctx, prodDet)
+		if !ping.Reachable {
+			t.Fatalf("Oracle Ping failed: %+v", ping)
+		}
+		dbs, err := svc.DiscoverInstance(ctx, inst.ID, pgRW, "FREEPDB1")
+		if err != nil || len(dbs) == 0 {
+			t.Fatalf("Oracle DiscoverDatabases failed: dbs=%v err=%v", dbs, err)
+		}
+		if _, err := svc.InspectSchema(ctx, devTgt.Alias, "", "orders", "", 0); err != nil {
+			t.Fatalf("Oracle InspectSchema failed: %v", err)
+		}
+
+		devRes, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: devTgt.Alias,
+			Query:            "SELECT id, customer_email, amount_cents, status FROM orders WHERE id <= 5 ORDER BY id",
+			Wait:             true,
+		})
+		if err != nil || devRes.Status != types.OpSucceeded || len(devRes.Result.Rows) != 5 {
+			t.Fatalf("Oracle dev select failed: %+v err=%v", devRes, err)
+		}
+
+		prodRead, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT id, customer_email, status FROM orders WHERE id = 42",
+			Wait:             true,
+		})
+		if err != nil || prodRead.Status != types.OpSucceeded || len(prodRead.Result.Rows) != 1 {
+			t.Fatalf("Oracle prod PK select failed: %+v err=%v", prodRead, err)
+		}
+
+		pf, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT id, status FROM orders WHERE status = 'pending' FETCH FIRST 10 ROWS ONLY",
+			Preflight:        true,
+		})
+		if err != nil || pf.Preflight == nil || !pf.Preflight.FullScan {
+			t.Fatalf("expected Oracle preflight FullScan=true, got %+v err=%v", pf, err)
+		}
+
+		upd, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "UPDATE orders SET amount_cents = amount_cents + 1 WHERE id = 42",
+			Reason:           "Live Oracle approval test",
+			Wait:             false,
+		})
+		if err != nil || upd.Status != types.OpWaitingApproval {
+			t.Fatalf("expected Oracle waiting_approval, got %+v err=%v", upd, err)
+		}
+		approvePendingHTTP(t, srv.WebURL(), upd.ApprovalID, upd.ApprovalURL, "approved oracle")
+		done := waitOpTerminal(t, ctx, svc, upd.OperationID)
+		if done.Status != types.OpSucceeded || done.Result.AffectedRows == nil || *done.Result.AffectedRows != 1 {
+			t.Fatalf("expected Oracle write affected=1, got %+v", done)
+		}
+	})
+
+	// ---- 8. Elasticsearch ----
+	t.Run("Elasticsearch", func(t *testing.T) {
+		inst, err := svc.Store().UpsertInstance(ctx, "live-test", types.Instance{
+			Name:   "live-elasticsearch",
+			Engine: "elasticsearch",
+			Host:   host,
+			Port:   29200,
+			Role:   types.RolePrimary,
+		})
+		if err != nil {
+			t.Fatalf("upsert es inst: %v", err)
+		}
+		devTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/dev/es",
+			Alias:           "live-dev-es",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "dev",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders",
+		})
+		prodTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/prod/es",
+			Alias:           "live-prod-es",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "prod",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders",
+		})
+
+		prodDet, err := svc.ResolveTarget(ctx, prodTgt.Ref, "")
+		if err != nil {
+			t.Fatalf("resolve es prod target: %v", err)
+		}
+		ping := svc.PingTarget(ctx, prodDet)
+		if !ping.Reachable {
+			t.Fatalf("Elasticsearch Ping failed: %+v", ping)
+		}
+		dbs, err := svc.DiscoverInstance(ctx, inst.ID, "", "orders")
+		if err != nil || len(dbs) == 0 {
+			t.Fatalf("Elasticsearch DiscoverDatabases failed: dbs=%v err=%v", dbs, err)
+		}
+		if _, err := svc.InspectSchema(ctx, prodTgt.Alias, "", "orders", "", 0); err != nil {
+			t.Fatalf("Elasticsearch InspectSchema failed: %v", err)
+		}
+
+		devRes, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: devTgt.Alias,
+			Query:            "POST /orders/_search\n{\"query\":{\"term\":{\"order_id\":42}},\"size\":1}",
+			Wait:             true,
+		})
+		if err != nil || devRes.Status != types.OpSucceeded || len(devRes.Result.Documents) != 1 {
+			t.Fatalf("Elasticsearch dev search failed: %+v err=%v", devRes, err)
+		}
+
+		pf, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            `{"index":"orders","query":{"match_all":{}}}`,
+			Preflight:        true,
+		})
+		if err != nil || pf.Preflight == nil || !pf.Preflight.FullScan || pf.Evaluation.Decision != types.DecisionRequireApproval {
+			t.Fatalf("expected Elasticsearch match_all preflight escalation, got %+v err=%v", pf, err)
+		}
+
+		docWrite, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "POST /orders/_doc/9999\n{\"order_id\":9999,\"customer_email\":\"es@example.com\",\"amount_cents\":100,\"status\":\"paid\"}",
+			Reason:           "Live ES approval test",
+			Wait:             false,
+		})
+		if err != nil || docWrite.Status != types.OpWaitingApproval {
+			t.Fatalf("expected ES write waiting_approval, got %+v err=%v", docWrite, err)
+		}
+		approvePendingHTTP(t, srv.WebURL(), docWrite.ApprovalID, docWrite.ApprovalURL, "approved es")
+		done := waitOpTerminal(t, ctx, svc, docWrite.OperationID)
+		if done.Status != types.OpSucceeded {
+			t.Fatalf("expected ES approved write to succeed, got %+v", done)
+		}
+	})
+
+	// ---- 9. SSH Tunnel ----
 	sshHost := strings.TrimSpace(os.Getenv("AGENT_DBCTL_TEST_SSH_HOST"))
 	if sshHost != "" {
 		t.Run("SSHTunnel", func(t *testing.T) {

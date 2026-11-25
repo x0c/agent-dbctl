@@ -38,8 +38,9 @@ vuln:
 
 install-local: build
 	mkdir -p ~/.local/bin
-	cp agent-dbctl ~/.local/bin/agent-dbctl
-	chmod 755 ~/.local/bin/agent-dbctl
+	cp agent-dbctl ~/.local/bin/agent-dbctl.tmp
+	chmod 755 ~/.local/bin/agent-dbctl.tmp
+	mv -f ~/.local/bin/agent-dbctl.tmp ~/.local/bin/agent-dbctl
 
 clean:
 	rm -rf agent-dbctl agent-dbctl-plugin-sqlite dist

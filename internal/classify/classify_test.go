@@ -25,6 +25,8 @@ func TestClassifySQL(t *testing.T) {
 		{"explain_delete_no_analyze", "EXPLAIN DELETE FROM orders WHERE id = 1", types.RiskHighCostRead, true, "explain_dml"},
 		{"explain_analyze_false_select", "EXPLAIN (ANALYZE FALSE) SELECT id FROM orders WHERE id = 1 LIMIT 1", types.RiskSafeRead, true, ""},
 		{"select_star_no_where", "SELECT * FROM orders", types.RiskHighCostRead, true, "select_star_no_where"},
+		{"select_star_bounded_limit", "SELECT * FROM orders LIMIT 10", types.RiskSafeRead, true, ""},
+		{"select_star_huge_limit", "SELECT * FROM orders LIMIT 50000", types.RiskHighCostRead, true, "select_star_no_where"},
 		{"cross_join", "SELECT a.id FROM a CROSS JOIN b WHERE a.id = 1 LIMIT 10", types.RiskHighCostRead, true, "cross_join"},
 		{"implicit_comma_join", "SELECT a.id FROM a, b WHERE a.id = b.id LIMIT 10", types.RiskHighCostRead, true, "implicit_cross_join"},
 		{"locking_read", "SELECT id FROM orders WHERE id = 1 FOR UPDATE", types.RiskHighCostRead, true, "locking_read"},
@@ -173,5 +175,100 @@ func TestExtractQueryContext(t *testing.T) {
 	ctxRedis := classify.ExtractQueryContext("redis", "MEMORY USAGE mykey SAMPLES 0")
 	if len(ctxRedis.Commands) != 1 || len(ctxRedis.Commands[0]) != 5 {
 		t.Fatalf("expected parsed redis args, got %v", ctxRedis.Commands)
+	}
+}
+
+func TestHasReturningClause(t *testing.T) {
+	if !classify.HasReturningClause("INSERT INTO items(name) VALUES ('a') RETURNING id, name") {
+		t.Fatal("expected RETURNING to be detected")
+	}
+	if !classify.HasReturningClause("UPDATE items SET name = 'b'\nWHERE id = 1\nRETURNING *") {
+		t.Fatal("expected multiline RETURNING to be detected")
+	}
+	if classify.HasReturningClause("INSERT INTO items(name) VALUES (' RETURNING id ')") {
+		t.Fatal("string literal containing RETURNING must not trigger")
+	}
+	if classify.HasReturningClause("INSERT INTO items(name) VALUES ('a') /* RETURNING id */") {
+		t.Fatal("comment containing RETURNING must not trigger")
+	}
+	if classify.HasReturningClause("SELECT 1; INSERT INTO items(name) VALUES ('a') RETURNING id") {
+		t.Fatal("multi-statement input must return false")
+	}
+}
+
+func TestClassifyNewDatabaseDialectsAndElasticsearch(t *testing.T) {
+	sqlCases := []struct {
+		name     string
+		engine   string
+		sql      string
+		wantRisk types.RiskLevel
+		wantRO   bool
+		wantFlag string
+	}{
+		{"clickhouse_explain_plan", "clickhouse", "EXPLAIN PLAN indexes = 1 SELECT id FROM events WHERE day = '2026-11-25' LIMIT 10", types.RiskSafeRead, true, ""},
+		{"clickhouse_explain_estimate_delete", "clickhouse", "EXPLAIN ESTIMATE DELETE FROM events WHERE day = '2026-11-25'", types.RiskHighCostRead, true, "explain_dml"},
+		{"clickhouse_optimize_admin", "clickhouse", "OPTIMIZE TABLE events FINAL", types.RiskAdmin, false, ""},
+		{"clickhouse_system_admin", "clickhouse", "SYSTEM FLUSH LOGS", types.RiskAdmin, false, ""},
+		{"mssql_top_bounded", "sqlserver", "SELECT TOP 10 * FROM dbo.orders", types.RiskSafeRead, true, ""},
+		{"mssql_top_huge_star", "mssql", "SELECT TOP 5000 * FROM dbo.orders", types.RiskHighCostRead, true, "select_star_no_where"},
+		{"mssql_waitfor_admin", "mssql", "WAITFOR DELAY '00:00:05'", types.RiskAdmin, false, ""},
+		{"mssql_dbcc_admin", "mssql", "DBCC FREEPROCCACHE", types.RiskAdmin, false, ""},
+		{"mssql_xp_cmdshell", "mssql", "SELECT xp_cmdshell('whoami')", types.RiskAdmin, false, "dangerous_admin_function"},
+		{"oracle_dual_safe", "oracle", "SELECT SYSDATE FROM DUAL", types.RiskSafeRead, true, ""},
+		{"oracle_explain_plan_for_safe", "oracle", "EXPLAIN PLAN FOR SELECT id FROM orders WHERE id = 1", types.RiskSafeRead, true, ""},
+		{"oracle_explain_plan_for_dml", "oracle", "EXPLAIN PLAN FOR DELETE FROM orders WHERE id = 1", types.RiskHighCostRead, true, "explain_dml"},
+		{"oracle_utl_http_admin", "oracle", "SELECT UTL_HTTP.REQUEST('http://internal') FROM DUAL", types.RiskAdmin, false, "dangerous_admin_function"},
+		{"oracle_dbms_lock_sleep", "oracle", "SELECT DBMS_LOCK.SLEEP(5) FROM DUAL", types.RiskHighCostRead, true, "high_cost_function"},
+	}
+	for _, tc := range sqlCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classify.Classify(tc.engine, tc.sql)
+			if got.RiskLevel != tc.wantRisk || got.IsReadOnly != tc.wantRO {
+				t.Fatalf("Classify(%q, %q) = (%s, ro=%v), want (%s, ro=%v) flags=%v", tc.engine, tc.sql, got.RiskLevel, got.IsReadOnly, tc.wantRisk, tc.wantRO, got.RiskFlags)
+			}
+			if tc.wantFlag != "" && !slices.Contains(got.RiskFlags, tc.wantFlag) {
+				t.Fatalf("expected flag %q in %v", tc.wantFlag, got.RiskFlags)
+			}
+		})
+	}
+
+	esCases := []struct {
+		name     string
+		cmd      string
+		wantRisk types.RiskLevel
+		wantRO   bool
+		wantFlag string
+	}{
+		{"es_cat_indices", "GET /_cat/indices?format=json", types.RiskSafeRead, true, ""},
+		{"es_search_bounded", "POST /orders/_search\n{\"query\":{\"term\":{\"status\":\"paid\"}},\"size\":20}", types.RiskSafeRead, true, ""},
+		{"es_search_json_shorthand", `{"index":"orders","query":{"term":{"id":42}},"size":5}`, types.RiskSafeRead, true, ""},
+		{"es_match_all_unbounded", "POST /orders/_search\n{\"query\":{\"match_all\":{}}}", types.RiskHighCostRead, true, "unbounded_match_all"},
+		{"es_cross_index_scan", `GET /_search?q=status:error`, types.RiskHighCostRead, true, "cross_index_scan"},
+		{"es_painless_script", `{"index":"orders","script_fields":{"x":{"script":"doc['a'].value * 2"}},"size":10}`, types.RiskHighCostRead, true, "script_eval"},
+		{"es_large_size", `{"index":"orders","query":{"match_all":{}},"size":5000}`, types.RiskHighCostRead, true, "large_size"},
+		{"es_sql_safe", `{"sql":"SELECT id FROM orders WHERE id = 1 LIMIT 5"}`, types.RiskSafeRead, true, ""},
+		{"es_sql_delete", `{"sql":"DELETE FROM orders WHERE id = 1"}`, types.RiskWrite, false, ""},
+		{"es_bulk_write", "POST /_bulk\n{\"index\":{\"_index\":\"orders\",\"_id\":\"1\"}}", types.RiskWrite, false, "es_write"},
+		{"es_delete_by_query", "POST /orders/_delete_by_query\n{\"query\":{\"match_all\":{}}}", types.RiskWrite, false, "es_write"},
+		{"es_delete_index_ddl", "DELETE /orders", types.RiskDDL, false, "es_ddl"},
+		{"es_create_index_ddl", "PUT /orders_v2\n{\"settings\":{\"number_of_shards\":1}}", types.RiskDDL, false, "es_ddl"},
+		{"es_cluster_settings_admin", "PUT /_cluster/settings\n{\"transient\":{}}", types.RiskAdmin, false, "es_admin_endpoint"},
+		{"es_invalid_fail_closed", "FOOBAR /orders", types.RiskUnknown, false, "invalid_es_command"},
+	}
+	for _, tc := range esCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classify.Classify("elasticsearch", tc.cmd)
+			if got.RiskLevel != tc.wantRisk || got.IsReadOnly != tc.wantRO {
+				t.Fatalf("Classify(elasticsearch, %q) = (%s, ro=%v), want (%s, ro=%v) flags=%v", tc.cmd, got.RiskLevel, got.IsReadOnly, tc.wantRisk, tc.wantRO, got.RiskFlags)
+			}
+			if tc.wantFlag != "" && !slices.Contains(got.RiskFlags, tc.wantFlag) {
+				t.Fatalf("expected flag %q in %v", tc.wantFlag, got.RiskFlags)
+			}
+		})
+	}
+
+	ctxES := classify.ExtractQueryContext("opensearch", `{"index":"orders_prod","query":{"match_all":{}},"size":25}`)
+	if !slices.Contains(ctxES.Tables, "orders_prod") || !ctxES.HasLimit {
+		t.Fatalf("unexpected ExtractQueryContext for opensearch: %+v", ctxES)
 	}
 }

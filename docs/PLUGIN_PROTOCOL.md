@@ -80,7 +80,7 @@ type Provider interface {
 - Generates a cryptographically random one-time `approval_token` (stored hashed as SHA-256 in SQLite).
 - Returns `approval_url = http://127.0.0.1:<port>/approvals/<approval_id>?token=<approval_token>`; `SanitizeTicketURL` strips `?token=` before persisting `external_ticket_url` in SQLite.
 - Opens the system default browser unless `AGENT_DBCTL_NO_BROWSER=1`.
-- `ResolveApproval` enforces wall-clock expiry atomically (`ErrApprovalExpired`). Approval/rejection endpoints enforce same-origin checks plus `approval_token` or the current SPA `X-Agent-DBCTL-UI: 1` header (upgrade to a daemon-issued cryptographic UI session token tracked in [ARCHITECTURE.md](ARCHITECTURE.md) §6), and write the decision + audit hash-chain row in a single SQLite transaction.
+- `ResolveApproval` enforces wall-clock expiry atomically (`ErrApprovalExpired`). Approval/rejection endpoints enforce loopback `Host`, strict same-origin checks, and either a valid per-daemon session cookie + `X-Agent-DBCTL-CSRF` header or the one-time `approval_token`, writing the decision + audit hash-chain row in a single SQLite transaction.
 
 ### Built-in Provider: `webhook`
 

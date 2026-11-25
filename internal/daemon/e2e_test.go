@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/daemon"
+	"github.com/x0c/agent-dbctl/internal/store"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
 
@@ -52,6 +55,48 @@ func setupIsolatedServer(t *testing.T) (*daemon.Server, config.Paths) {
 		}
 	})
 	return srv, paths
+}
+
+func issueTestWebSession(t *testing.T, handler http.Handler) (*http.Cookie, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/bootstrap", nil)
+	req.Host = "127.0.0.1:8080"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bootstrap HTTP %d: %s", rec.Code, rec.Body.String())
+	}
+	var sessionCookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "agent_dbctl_session" {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatalf("expected agent_dbctl_session cookie from bootstrap")
+	}
+	var boot struct {
+		UICSRFToken string `json:"ui_csrf_token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &boot); err != nil || boot.UICSRFToken == "" {
+		t.Fatalf("expected ui_csrf_token in bootstrap, got %q err=%v", rec.Body.String(), err)
+	}
+	return sessionCookie, boot.UICSRFToken
+}
+
+func newAuthedWebPOST(path string, body io.Reader, cookie *http.Cookie, csrf string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, path, body)
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	req.Header.Set("Content-Type", "application/json")
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	if csrf != "" {
+		req.Header.Set("X-Agent-DBCTL-CSRF", csrf)
+	}
+	return req
 }
 
 func TestE2EExecApprovalRejectTruncationAndSameOrigin(t *testing.T) {
@@ -138,6 +183,14 @@ func TestE2EExecApprovalRejectTruncationAndSameOrigin(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Pre-populate prod via temporary YOLO env on a setup step? Even better: approve DDL in prod via real approval flow!
+	missingReasonResp, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: prodTgt.Alias,
+		Query:            "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)",
+		Wait:             false,
+	})
+	if err != nil || missingReasonResp.ErrorCode != types.ErrCodeReasonRequired || missingReasonResp.ApprovalID != "" {
+		t.Fatalf("expected reason_required without creating approval when Reason is empty, got %+v err=%v", missingReasonResp, err)
+	}
 	ddlAsync, err := svc.Execute(ctx, types.ExecRequest{
 		TargetRefOrAlias: prodTgt.Alias,
 		Query:            "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)",
@@ -214,32 +267,49 @@ func TestE2EExecApprovalRejectTruncationAndSameOrigin(t *testing.T) {
 		t.Fatalf("expected rejected with reviewer_note, got %+v err=%v", rejStatus, err)
 	}
 
-	// Same-origin middleware unit tests (external origin & cross-site null must be 403).
+	// Hardened WebSecurityMiddleware unit tests (Host, Origin/Sec-Fetch-Site, HttpOnly cookie + CSRF header).
 	handler := daemon.NewWebHandler(svc)
+	cookie, csrf := issueTestWebSession(t, handler)
 	for _, tc := range []struct {
-		name   string
-		origin string
-		sfs    string
-		want   int
+		name     string
+		host     string
+		origin   string
+		sfs      string
+		useAuth  bool
+		badCSRF  bool
+		wantCode int
 	}{
-		{"external_origin_blocked", "https://evil.example", "", http.StatusForbidden},
-		{"null_cross_site_blocked", "null", "cross-site", http.StatusForbidden},
-		{"null_without_sfs_blocked", "null", "", http.StatusForbidden},
-		{"null_same_origin_allowed", "null", "same-origin", http.StatusOK},
+		{"external_origin_blocked", "127.0.0.1:8080", "https://evil.example", "", true, false, http.StatusForbidden},
+		{"non_loopback_host_blocked", "evil.example:8080", "http://127.0.0.1:8080", "", true, false, http.StatusForbidden},
+		{"headerless_post_blocked", "127.0.0.1:8080", "", "", true, false, http.StatusForbidden},
+		{"null_cross_site_blocked", "127.0.0.1:8080", "null", "cross-site", true, false, http.StatusForbidden},
+		{"null_without_sfs_blocked", "127.0.0.1:8080", "null", "", true, false, http.StatusForbidden},
+		{"missing_session_cookie_blocked", "127.0.0.1:8080", "http://127.0.0.1:8080", "", false, false, http.StatusForbidden},
+		{"invalid_csrf_header_blocked", "127.0.0.1:8080", "http://127.0.0.1:8080", "", true, true, http.StatusForbidden},
+		{"null_same_origin_with_session_allowed", "127.0.0.1:8080", "null", "same-origin", true, false, http.StatusOK},
+		{"same_origin_with_session_allowed", "127.0.0.1:8080", "http://127.0.0.1:8080", "", true, false, http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodPost, "/api/v1/audit/verify", bytes.NewReader([]byte("{}")))
-			r.Host = "127.0.0.1:8080"
+			r.Host = tc.host
 			if tc.origin != "" {
 				r.Header.Set("Origin", tc.origin)
 			}
 			if tc.sfs != "" {
 				r.Header.Set("Sec-Fetch-Site", tc.sfs)
 			}
+			if tc.useAuth {
+				r.AddCookie(cookie)
+				if tc.badCSRF {
+					r.Header.Set("X-Agent-DBCTL-CSRF", "wrong-token")
+				} else {
+					r.Header.Set("X-Agent-DBCTL-CSRF", csrf)
+				}
+			}
 			w := httptest.NewRecorder()
 			handler.ServeHTTP(w, r)
-			if w.Code != tc.want {
-				t.Fatalf("got HTTP %d, want %d (body=%s)", w.Code, tc.want, w.Body.String())
+			if w.Code != tc.wantCode {
+				t.Fatalf("got HTTP %d, want %d (body=%s)", w.Code, tc.wantCode, w.Body.String())
 			}
 		})
 	}
@@ -411,9 +481,10 @@ func TestCustomRiskPatternApprovalDenyAndSandboxAPI(t *testing.T) {
 	}
 
 	handler := daemon.NewWebHandler(svc)
+	cookie, csrf := issueTestWebSession(t, handler)
 	// Install builtin sqlite-pragma-blob pack via HTTP API.
 	packBody := bytes.NewBufferString(`{"scope_type":"global","scope_id":"global"}`)
-	packReq := httptest.NewRequest(http.MethodPost, "/api/v1/risk-patterns/packs/sqlite-pragma-blob/install", packBody)
+	packReq := newAuthedWebPOST("/api/v1/risk-patterns/packs/sqlite-pragma-blob/install", packBody, cookie, csrf)
 	packRec := httptest.NewRecorder()
 	handler.ServeHTTP(packRec, packReq)
 	if packRec.Code != http.StatusOK {
@@ -433,7 +504,7 @@ func TestCustomRiskPatternApprovalDenyAndSandboxAPI(t *testing.T) {
 		Condition:      types.PatternCondition{Type: types.MatcherTableRef, Values: []string{"secret_ledger"}},
 		Priority:       100,
 	})
-	saveReq := httptest.NewRequest(http.MethodPost, "/api/v1/risk-patterns", bytes.NewReader(rulePayload))
+	saveReq := newAuthedWebPOST("/api/v1/risk-patterns", bytes.NewReader(rulePayload), cookie, csrf)
 	saveRec := httptest.NewRecorder()
 	handler.ServeHTTP(saveRec, saveReq)
 	if saveRec.Code != http.StatusOK {
@@ -445,7 +516,7 @@ func TestCustomRiskPatternApprovalDenyAndSandboxAPI(t *testing.T) {
 		TargetID: tgt.Ref,
 		Query:    "SELECT id, amount FROM secret_ledger WHERE id = 1 LIMIT 1",
 	})
-	testReq := httptest.NewRequest(http.MethodPost, "/api/v1/risk-patterns/test", bytes.NewReader(testPayload))
+	testReq := newAuthedWebPOST("/api/v1/risk-patterns/test", bytes.NewReader(testPayload), cookie, csrf)
 	testRec := httptest.NewRecorder()
 	handler.ServeHTTP(testRec, testReq)
 	if testRec.Code != http.StatusOK {
@@ -477,9 +548,8 @@ func TestCustomRiskPatternApprovalDenyAndSandboxAPI(t *testing.T) {
 		t.Fatalf("expected persisted approval MatchedRules, got %+v err=%v", app, err)
 	}
 
-	// Approve via Web API header -> query runs and returns row!
-	aprReq := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/"+asyncResp.ApprovalID+"/approve", bytes.NewBufferString(`{"reviewer":"owner","note":"confirmed"}`))
-	aprReq.Header.Set("X-Agent-DBCTL-UI", "1")
+	// Approve via hardened Web API (session cookie + CSRF) -> query runs and returns row!
+	aprReq := newAuthedWebPOST("/api/v1/approvals/"+asyncResp.ApprovalID+"/approve", bytes.NewBufferString(`{"reviewer":"owner","note":"confirmed"}`), cookie, csrf)
 	aprRec := httptest.NewRecorder()
 	handler.ServeHTTP(aprRec, aprReq)
 	if aprRec.Code != http.StatusOK {
@@ -522,6 +592,36 @@ func TestCustomRiskPatternApprovalDenyAndSandboxAPI(t *testing.T) {
 	})
 	if err != nil || denyResp.Status != types.OpDenied || denyResp.ErrorCode != types.ErrCodePolicyDenied {
 		t.Fatalf("expected custom pattern deny, got %+v err=%v", denyResp, err)
+	}
+
+	// Schema introspection + audit event recording.
+	if _, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: tgt.Alias,
+		Query:            "CREATE TABLE audit_demo(id INTEGER PRIMARY KEY, label TEXT)",
+		Wait:             true,
+	}); err != nil {
+		t.Fatalf("create audit_demo: %v", err)
+	}
+	schemaListAny, err := svc.InspectSchema(ctx, tgt.Alias, "", "", "", 50)
+	if err != nil {
+		t.Fatalf("InspectSchema list: %v", err)
+	}
+	schemaList := schemaListAny.(*types.SchemaListResult)
+	if schemaList.TargetRef != tgt.Ref || len(schemaList.Items) < 2 {
+		t.Fatalf("unexpected InspectSchema list result: %+v", schemaList)
+	}
+	tblAny, err := svc.InspectSchema(ctx, tgt.Alias, "", "audit_demo", "", 0)
+	if err != nil {
+		t.Fatalf("InspectSchema describe: %v", err)
+	}
+	tbl := tblAny.(*types.TableSchema)
+	if tbl.Name != "audit_demo" || len(tbl.Columns) != 2 {
+		t.Fatalf("unexpected InspectSchema table result: %+v", tbl)
+	}
+
+	entries, _, err := svc.Store().ListAuditEntriesFiltered(ctx, store.AuditFilter{Action: "schema.", Limit: 10})
+	if err != nil || len(entries) < 2 {
+		t.Fatalf("expected schema.list & schema.describe audit entries, got %+v err=%v", entries, err)
 	}
 }
 
@@ -632,5 +732,274 @@ func TestReplicaNetworkIsolationAndCapabilitiesPersistence(t *testing.T) {
 	})
 	if replicaProxyDialed.Load() == 0 {
 		t.Fatalf("expected read-only replica routing to dial replica's SOCKS5 NetworkProfile")
+	}
+}
+
+func TestNewBuiltinEnginesCatalogAndOpenSearchE2E(t *testing.T) {
+	srv, _ := setupIsolatedServer(t)
+	svc := srv.Service()
+	ctx := context.Background()
+
+	cat, err := svc.BuildDisplayCatalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenEngines := map[string]bool{}
+	for _, item := range cat.Engines {
+		seenEngines[item.Code] = true
+	}
+	for _, want := range []string{"postgres", "mysql", "sqlite", "mongodb", "redis", "clickhouse", "mssql", "oracle", "elasticsearch"} {
+		if !seenEngines[want] {
+			t.Fatalf("DisplayCatalog missing built-in engine %q (got %+v)", want, cat.Engines)
+		}
+	}
+
+	// Mock OpenSearch HTTP endpoint exercising opensearch alias -> elasticsearch driver end-to-end.
+	var writeCount atomic.Int32
+	esMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"version": map[string]any{"distribution": "opensearch", "number": "2.17.0"},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/_cat/indices":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"index": "logs", "docs.count": "500"},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/logs/_mapping":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"logs": map[string]any{
+					"mappings": map[string]any{
+						"properties": map[string]any{
+							"level": map[string]any{"type": "keyword"},
+						},
+					},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/logs/_validate/query":
+			_ = json.NewEncoder(w).Encode(map[string]any{"valid": true})
+		case r.Method == http.MethodPost && r.URL.Path == "/logs/_count":
+			_ = json.NewEncoder(w).Encode(map[string]any{"count": 500})
+		case r.Method == http.MethodPost && r.URL.Path == "/logs/_search":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"hits": map[string]any{
+					"hits": []map[string]any{
+						{"_id": "doc1", "_source": map[string]any{"level": "error"}},
+					},
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/logs/_doc":
+			writeCount.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"_id": "doc2", "result": "created"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer esMock.Close()
+
+	u, err := url.Parse(esMock.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portStr, _ := net.SplitHostPort(u.Host)
+	port, _ := strconv.Atoi(portStr)
+
+	sys, err := svc.Store().UpsertSystem(ctx, "test", types.System{Slug: "search-core", Name: "Search Core"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst, err := svc.Store().UpsertInstance(ctx, "test", types.Instance{
+		Name:   "os-prod",
+		Engine: "opensearch", // alias resolved via Registry.Get -> elasticsearch
+		Host:   host,
+		Port:   port,
+		Role:   types.RoleStandalone,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prodTgt, err := svc.Store().UpsertTarget(ctx, "test", types.Target{
+		Ref:             "search-core/prod/logs",
+		Alias:           "prod-logs",
+		OwnerSystemID:   sys.ID,
+		EnvironmentCode: "prod",
+		InstanceID:      inst.ID,
+		DatabaseName:    "logs",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	det, err := svc.ResolveTarget(ctx, prodTgt.Ref, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ping := svc.PingTarget(ctx, det)
+	if !ping.Reachable || ping.Dialect != "opensearch" {
+		t.Fatalf("expected reachable opensearch ping, got %+v", ping)
+	}
+
+	schemaAny, err := svc.InspectSchema(ctx, prodTgt.Alias, "", "logs", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl := schemaAny.(*types.TableSchema)
+	if tbl.Dialect != "opensearch" || len(tbl.Columns) != 1 || tbl.Columns[0].Name != "level" {
+		t.Fatalf("unexpected OpenSearch schema inspection: %+v", tbl)
+	}
+
+	// Bounded search executes immediately on prod
+	readRes, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: prodTgt.Alias,
+		Query:            `{"index":"logs","query":{"term":{"level":"error"}},"size":10}`,
+		Wait:             true,
+	})
+	if err != nil || readRes.Status != types.OpSucceeded || len(readRes.Result.Documents) != 1 {
+		t.Fatalf("expected bounded OpenSearch read to succeed, got %+v err=%v", readRes, err)
+	}
+
+	// Unbounded match_all escalates via preflight to waiting_approval
+	pfRes, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: prodTgt.Alias,
+		Query:            `{"index":"logs","query":{"match_all":{}}}`,
+		Preflight:        true,
+	})
+	if err != nil || pfRes.Preflight == nil || !pfRes.Preflight.FullScan || pfRes.Evaluation.Decision != types.DecisionRequireApproval {
+		t.Fatalf("expected match_all preflight escalation, got %+v err=%v", pfRes, err)
+	}
+
+	// Write in prod requires approval -> approve -> executes
+	wAsync, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: prodTgt.Alias,
+		Query:            "POST /logs/_doc\n{\"level\":\"info\"}",
+		Reason:           "Insert probe log",
+		Wait:             false,
+	})
+	if err != nil || wAsync.Status != types.OpWaitingApproval {
+		t.Fatalf("expected waiting_approval for ES write, got %+v err=%v", wAsync, err)
+	}
+	_, err = svc.ResolveApproval(ctx, wAsync.ApprovalID, true, "reviewer", "ok", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	var finalResp types.ExecResponse
+	for time.Now().Before(deadline) {
+		finalResp, err = svc.GetOperationStatus(ctx, wAsync.OperationID)
+		if err == nil && finalResp.Status == types.OpSucceeded {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if finalResp.Status != types.OpSucceeded || writeCount.Load() != 1 {
+		t.Fatalf("expected approved ES write to succeed, got %+v writes=%d", finalResp, writeCount.Load())
+	}
+}
+
+func TestParseAndRedactDSNAllNineEngines(t *testing.T) {
+	cases := []struct {
+		name       string
+		dsn        string
+		hintEngine string
+		wantEngine string
+		wantHost   string
+		wantPort   int
+		wantDB     string
+		wantUser   string
+		wantPass   bool
+		wantTLS    string
+	}{
+		{
+			name:       "postgres_url",
+			dsn:        "postgres://alice:s3cr3t@127.0.0.1:5432/orders?sslmode=require",
+			wantEngine: "postgres", wantHost: "127.0.0.1", wantPort: 5432, wantDB: "orders", wantUser: "alice", wantPass: true, wantTLS: "require",
+		},
+		{
+			name:       "mysql_url",
+			dsn:        "mysql://bob@127.0.0.1:3307/billing",
+			wantEngine: "mysql", wantHost: "127.0.0.1", wantPort: 3307, wantDB: "billing", wantUser: "bob",
+		},
+		{
+			name:       "mysql_go_dsn",
+			dsn:        "bob:pw123@tcp(127.0.0.1:3306)/billing?tls=true",
+			wantEngine: "mysql", wantHost: "127.0.0.1", wantPort: 3306, wantDB: "billing", wantUser: "bob", wantPass: true, wantTLS: "require",
+		},
+		{
+			name:       "sqlite_file",
+			dsn:        "sqlite:///tmp/local.db",
+			wantEngine: "sqlite", wantHost: "/tmp/local.db", wantPort: 0, wantDB: "/tmp/local.db",
+		},
+		{
+			name:       "sqlite_memory",
+			dsn:        ":memory:",
+			wantEngine: "sqlite", wantHost: ":memory:", wantPort: 0, wantDB: ":memory:",
+		},
+		{
+			name:       "mongodb",
+			dsn:        "mongodb://reader:pw@127.0.0.1:27017/events?authSource=admin",
+			wantEngine: "mongodb", wantHost: "127.0.0.1", wantPort: 27017, wantDB: "events", wantUser: "reader", wantPass: true,
+		},
+		{
+			name:       "rediss",
+			dsn:        "rediss://default:tok@127.0.0.1:6380/2",
+			wantEngine: "redis", wantHost: "127.0.0.1", wantPort: 6380, wantDB: "2", wantUser: "default", wantPass: true, wantTLS: "require",
+		},
+		{
+			name:       "clickhouse",
+			dsn:        "clickhouse://ch_ro:pw@127.0.0.1:9000/analytics",
+			wantEngine: "clickhouse", wantHost: "127.0.0.1", wantPort: 9000, wantDB: "analytics", wantUser: "ch_ro", wantPass: true,
+		},
+		{
+			name:       "mssql",
+			dsn:        "sqlserver://sa:pw@127.0.0.1:1433?database=sales&encrypt=true",
+			wantEngine: "mssql", wantHost: "127.0.0.1", wantPort: 1433, wantDB: "sales", wantUser: "sa", wantPass: true, wantTLS: "require",
+		},
+		{
+			name:       "oracle",
+			dsn:        "oracle://hr:pw@127.0.0.1:1521/ORCLPDB1",
+			wantEngine: "oracle", wantHost: "127.0.0.1", wantPort: 1521, wantDB: "ORCLPDB1", wantUser: "hr", wantPass: true,
+		},
+		{
+			name:       "elasticsearch_https",
+			dsn:        "https://elastic:pw@127.0.0.1:9200/logs",
+			hintEngine: "elasticsearch",
+			wantEngine: "elasticsearch", wantHost: "127.0.0.1", wantPort: 9200, wantDB: "logs", wantUser: "elastic", wantPass: true, wantTLS: "require",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := daemon.ParseDSN(tc.dsn, tc.hintEngine)
+			if err != nil {
+				t.Fatalf("ParseDSN(%q) err=%v", tc.dsn, err)
+			}
+			if got.Engine != tc.wantEngine || got.Host != tc.wantHost || got.Port != tc.wantPort ||
+				got.DatabaseName != tc.wantDB || got.Username != tc.wantUser || got.HasPassword != tc.wantPass {
+				t.Fatalf("ParseDSN(%q) = %+v, want engine=%s host=%s port=%d db=%s user=%s pass=%v",
+					tc.dsn, got, tc.wantEngine, tc.wantHost, tc.wantPort, tc.wantDB, tc.wantUser, tc.wantPass)
+			}
+			if tc.wantTLS != "" && got.TLSMode != tc.wantTLS {
+				t.Fatalf("expected tls_mode=%q, got %q", tc.wantTLS, got.TLSMode)
+			}
+			if tc.wantPass {
+				redacted := daemon.RedactDSN(tc.dsn)
+				if strings.Contains(redacted, "s3cr3t") || strings.Contains(redacted, "pw123") || strings.Contains(redacted, ":pw@") || strings.Contains(redacted, ":tok@") {
+					t.Fatalf("RedactDSN leaked secret in %q -> %q", tc.dsn, redacted)
+				}
+			}
+		})
+	}
+}
+
+func TestRPCDisallowsApprovalResolutionRoutes(t *testing.T) {
+	_, paths := setupIsolatedServer(t)
+	cl, err := daemon.NewClient(paths)
+	if err != nil {
+		t.Fatalf("new RPC client: %v", err)
+	}
+	err = cl.DoJSON(context.Background(), http.MethodPost, "/rpc/v1/approvals/apr_test/approve", map[string]string{"reviewer": "bot"}, nil)
+	if err == nil {
+		t.Fatalf("expected RPC approval route to be rejected, but succeeded")
 	}
 }

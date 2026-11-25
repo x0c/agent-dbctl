@@ -1,4 +1,5 @@
 import type { DisplayCatalog, DisplayMetaItem } from '../api'
+import type { Locale } from './i18n'
 
 const STORAGE_KEY = 'agent-dbctl.display_catalog.v1'
 
@@ -46,12 +47,13 @@ export function saveCachedCatalog(cat: DisplayCatalog): DisplayCatalog {
 export function resolveDisplayItem(
   items: DisplayMetaItem[] | undefined,
   code: string,
+  locale?: Locale,
 ): { label: string; color: string } {
   const item = items?.find((x) => x.code.toLowerCase() === code.toLowerCase())
   if (!item) {
     return { label: code, color: '#6B7280' }
   }
-  const lang = (typeof navigator !== 'undefined' ? navigator.language : 'en').toLowerCase()
+  const lang = (locale ?? (typeof navigator !== 'undefined' ? navigator.language : 'en')).toLowerCase()
   const primary = lang.split('-')[0]
   const labels = item.labels || {}
   const label = labels[lang] ?? labels[primary] ?? labels['en'] ?? code

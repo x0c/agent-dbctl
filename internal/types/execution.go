@@ -285,3 +285,109 @@ type PingResult struct {
 	LatencyMs     int64               `json:"latency_ms"`
 	Error         string              `json:"error,omitempty"`
 }
+
+// SchemaObjectSummary describes one table, view, collection, or Redis key-prefix pattern.
+type SchemaObjectSummary struct {
+	Schema        string `json:"schema,omitempty"`
+	Name          string `json:"name"`
+	Type          string `json:"type"`
+	Engine        string `json:"engine,omitempty"`
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
+	SampleCount   int    `json:"sample_count,omitempty"`
+}
+
+// SchemaListResult is returned by `db schema <ref>`.
+type SchemaListResult struct {
+	TargetRef     string                `json:"target_ref,omitempty"`
+	Engine        string                `json:"engine"`
+	Dialect       string                `json:"dialect,omitempty"`
+	Database      string                `json:"database,omitempty"`
+	Items         []SchemaObjectSummary `json:"items"`
+	TotalCount    int                   `json:"total_count"`
+	ReturnedCount int                   `json:"returned_count"`
+	Truncated     bool                  `json:"truncated"`
+	Notes         []string              `json:"notes,omitempty"`
+}
+
+// SchemaColumn describes a SQL column.
+type SchemaColumn struct {
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Nullable   bool   `json:"nullable"`
+	PrimaryKey bool   `json:"primary_key,omitempty"`
+	Default    string `json:"default,omitempty"`
+	Extra      string `json:"extra,omitempty"`
+}
+
+// SchemaIndex describes an index on a SQL table or MongoDB collection.
+type SchemaIndex struct {
+	Name    string   `json:"name"`
+	Columns []string `json:"columns,omitempty"`
+	Unique  bool     `json:"unique,omitempty"`
+	Primary bool     `json:"primary,omitempty"`
+}
+
+// SchemaForeignKey describes a SQL foreign key constraint.
+type SchemaForeignKey struct {
+	Column           string `json:"column"`
+	ReferencedTable  string `json:"referenced_table"`
+	ReferencedColumn string `json:"referenced_column"`
+}
+
+// SchemaSampleField summarizes a field name and observed types in a document collection.
+type SchemaSampleField struct {
+	Name  string   `json:"name"`
+	Types []string `json:"types"`
+}
+
+// RedisKeySample summarizes a sampled Redis/Valkey key.
+type RedisKeySample struct {
+	Key  string `json:"key"`
+	Type string `json:"type"`
+	TTL  int64  `json:"ttl_sec"`
+}
+
+// TableSchema describes one table, view, collection, or key pattern (`db schema <ref> <name>`).
+type TableSchema struct {
+	TargetRef    string              `json:"target_ref,omitempty"`
+	Engine       string              `json:"engine"`
+	Dialect      string              `json:"dialect,omitempty"`
+	Database     string              `json:"database,omitempty"`
+	Schema       string              `json:"schema,omitempty"`
+	Name         string              `json:"name"`
+	ObjectType   string              `json:"object_type"`
+	Columns      []SchemaColumn      `json:"columns,omitempty"`
+	Indexes      []SchemaIndex       `json:"indexes,omitempty"`
+	ForeignKeys  []SchemaForeignKey  `json:"foreign_keys,omitempty"`
+	SampleFields []SchemaSampleField `json:"sample_fields,omitempty"`
+	KeySamples   []RedisKeySample    `json:"key_samples,omitempty"`
+	Notes        []string            `json:"notes,omitempty"`
+}
+
+// ExecCompactOutcome is the lean default JSON payload for successful `exec` / `op status` / `op wait` calls.
+type ExecCompactOutcome struct {
+	OperationID     string           `json:"operation_id"`
+	Status          OperationStatus  `json:"status"`
+	TargetRef       string           `json:"target_ref"`
+	EnvironmentCode string           `json:"environment_code"`
+	Engine          string           `json:"engine"`
+	CredentialMode  AccessLevel      `json:"credential_mode"`
+	RiskLevel       RiskLevel        `json:"risk_level"`
+	Family          EngineFamily     `json:"family,omitempty"`
+	Columns         []Column         `json:"columns,omitempty"`
+	Rows            [][]any          `json:"rows,omitempty"`
+	Records         []map[string]any `json:"records,omitempty"`
+	Documents       []any            `json:"documents,omitempty"`
+	KVResult        any              `json:"kv_result,omitempty"`
+	RawText         string           `json:"raw_text,omitempty"`
+	AffectedRows    *int64           `json:"affected_rows,omitempty"`
+	FetchedRows     int              `json:"fetched_rows"`
+	ReturnedRows    int              `json:"returned_rows"`
+	ReturnedBytes   int64            `json:"returned_bytes,omitempty"`
+	Truncated       bool             `json:"truncated"`
+	CutoffReason    string           `json:"cutoff_reason,omitempty"`
+	Messages        []string         `json:"messages,omitempty"`
+	LatencyMs       int64            `json:"latency_ms"`
+	Reviewer        string           `json:"reviewer,omitempty"`
+	ReviewerNote    string           `json:"reviewer_note,omitempty"`
+}

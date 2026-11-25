@@ -227,3 +227,26 @@ func TestExecPositionalQueryConflictAndFallback(t *testing.T) {
 		t.Fatalf("expected positional query to reach target lookup (db_not_found), got code=%d env=%+v", code, env)
 	}
 }
+
+func TestCompareVersions(t *testing.T) {
+	cases := []struct {
+		a, b    string
+		wantCmp int
+		wantOK  bool
+	}{
+		{"v0.1.0", "v0.2.0", -1, true},
+		{"v0.2.0", "v0.1.0", 1, true},
+		{"v0.2.0", "v0.2.0", 0, true},
+		{"v0.2.0", "v0.2.0-1-g6961753", -1, true},
+		{"v0.2.0-2-gabcdef", "v0.2.0", 1, true},
+		{"v0.2.0-rc1", "v0.2.0", 0, true},
+		{"dev", "v0.2.0", 0, false},
+		{"6961753", "v0.2.0", 0, false},
+	}
+	for _, tc := range cases {
+		cmp, ok := compareVersions(tc.a, tc.b)
+		if cmp != tc.wantCmp || ok != tc.wantOK {
+			t.Fatalf("compareVersions(%q, %q) = (%d, %v), want (%d, %v)", tc.a, tc.b, cmp, ok, tc.wantCmp, tc.wantOK)
+		}
+	}
+}

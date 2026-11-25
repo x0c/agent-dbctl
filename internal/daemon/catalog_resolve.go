@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -174,6 +175,181 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string) (
 		return out[i].Target.Ref < out[j].Target.Ref
 	})
 	return out, nil
+}
+
+// SummarizeTarget projects TargetDetail into a compact agent-facing TargetSummary.
+func SummarizeTarget(d types.TargetDetail) types.TargetSummary {
+	sysSlug := ""
+	if d.OwnerSystem != nil {
+		sysSlug = d.OwnerSystem.Slug
+	}
+	eng := ""
+	if d.Instance != nil {
+		eng = d.Instance.Engine
+	}
+	hasRWPath := d.RWCredential != nil || (d.ROCredential == nil && d.RWCredential == nil)
+	frozen := d.EffectivePolicy.ProdReadOnlyFreeze && d.EffectivePolicy.SafetyTier == types.SafetyTierStrict
+	writable := d.Target.Status == types.TargetActive && hasRWPath && !frozen
+
+	return types.TargetSummary{
+		Ref:             d.Target.Ref,
+		Alias:           d.Target.Alias,
+		System:          sysSlug,
+		Env:             d.Target.EnvironmentCode,
+		SafetyTier:      d.EffectivePolicy.SafetyTier,
+		Engine:          eng,
+		Database:        d.Target.DatabaseName,
+		Status:          d.Target.Status,
+		Writable:        writable,
+		MaxRows:         d.EffectivePolicy.MaxRows,
+		ExecTimeoutSec:  d.EffectivePolicy.ExecTimeoutSec,
+		WorkspaceMatch:  d.WorkspaceMatch,
+		QuerySyntaxHint: engineQuerySyntaxHint(eng),
+		Description:     d.Target.Description,
+	}
+}
+
+// SummarizeTargetShow builds the concise default payload for `db show <ref>`.
+func SummarizeTargetShow(d types.TargetDetail) types.TargetShowSummary {
+	sum := SummarizeTarget(d)
+	endpoint := ""
+	tlsMode := ""
+	if d.Instance != nil {
+		tlsMode = d.Instance.TLSMode
+		if d.Instance.Engine == "sqlite" {
+			endpoint = d.Instance.Host
+		} else if d.Instance.Host != "" {
+			endpoint = fmt.Sprintf("%s:%d", d.Instance.Host, d.Instance.Port)
+		}
+	}
+	netMode := "direct"
+	if d.NetworkProfile != nil {
+		if d.NetworkProfile.Mode != "" {
+			netMode = string(d.NetworkProfile.Mode)
+		}
+		if tlsMode == "" {
+			tlsMode = d.NetworkProfile.TLSMode
+		}
+	}
+	ref := d.Target.Ref
+	if d.Target.Alias != "" {
+		ref = d.Target.Alias
+	}
+	return types.TargetShowSummary{
+		TargetSummary:       sum,
+		Endpoint:            endpoint,
+		NetworkMode:         netMode,
+		TLSMode:             tlsMode,
+		HasROCredential:     d.ROCredential != nil,
+		HasRWCredential:     d.RWCredential != nil,
+		AllowMultiStatement: d.EffectivePolicy.AllowMultiStatement,
+		ExplainMaxRows:      d.EffectivePolicy.ExplainMaxRows,
+		PatternRulesCount:   len(d.EffectivePolicy.PatternRules),
+		Examples:            buildTargetExamples(ref, sum.Engine),
+	}
+}
+
+func engineQuerySyntaxHint(engine string) string {
+	switch classify.CanonicalEngine(engine) {
+	case "mongodb":
+		return `JSON RunCommand (e.g. {"find":"coll","filter":{},"limit":20}) or show collections`
+	case "redis":
+		return "Redis commands (e.g. GET key, SCAN 0 COUNT 50)"
+	case "elasticsearch":
+		return `HTTP+JSON (e.g. GET /idx/_search) or JSON search ({"index":"idx","query":{"match_all":{}},"size":10})`
+	case "mssql":
+		return "T-SQL (e.g. SELECT TOP 10 * FROM dbo.orders)"
+	case "oracle":
+		return "Oracle SQL (e.g. SELECT * FROM orders FETCH FIRST 10 ROWS ONLY)"
+	default:
+		return ""
+	}
+}
+
+func buildTargetExamples(targetRef, engine string) []string {
+	out := []string{
+		fmt.Sprintf("agent-dbctl db schema %s --json", targetRef),
+	}
+	switch classify.CanonicalEngine(engine) {
+	case "mongodb":
+		out = append(out, fmt.Sprintf(`agent-dbctl exec --db %s '{"find":"orders","filter":{},"limit":10}' --json`, targetRef))
+	case "redis":
+		out = append(out, fmt.Sprintf(`agent-dbctl exec --db %s "SCAN 0 COUNT 20" --json`, targetRef))
+	case "elasticsearch":
+		out = append(out, fmt.Sprintf(`agent-dbctl exec --db %s '{"index":"logs","query":{"match_all":{}},"size":10}' --json`, targetRef))
+	case "mssql":
+		out = append(out, fmt.Sprintf(`agent-dbctl exec --db %s "SELECT TOP 10 * FROM orders" --json`, targetRef))
+	case "oracle":
+		out = append(out, fmt.Sprintf(`agent-dbctl exec --db %s "SELECT * FROM orders FETCH FIRST 10 ROWS ONLY" --json`, targetRef))
+	default:
+		out = append(out, fmt.Sprintf(`agent-dbctl exec --db %s "SELECT * FROM orders LIMIT 10" --json`, targetRef))
+	}
+	return out
+}
+
+// EngineGuide documents connection defaults, aliases, and query syntax for one registered driver.
+type EngineGuide struct {
+	Engine       string   `json:"engine"`
+	DisplayName  string   `json:"display_name"`
+	Family       string   `json:"family"`
+	Tier         string   `json:"tier"`
+	DefaultPort  int      `json:"default_port"`
+	Aliases      []string `json:"aliases,omitempty"`
+	KeyParams    []string `json:"key_params,omitempty"`
+	SyntaxHint   string   `json:"syntax_hint,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+	Verified     bool     `json:"verified"`
+}
+
+// BuildEngineGuides enriches driver metadata with onboarding defaults and syntax guidance.
+func BuildEngineGuides(drivers []types.DriverMetadata) []EngineGuide {
+	out := make([]EngineGuide, 0, len(drivers))
+	for _, d := range drivers {
+		g := EngineGuide{
+			Engine:       d.Engine,
+			DisplayName:  d.DisplayName,
+			Family:       string(d.Family),
+			Tier:         d.Tier,
+			DefaultPort:  DefaultPortForEngine(d.Engine),
+			Capabilities: d.Capabilities,
+			Verified:     d.Verified,
+			SyntaxHint:   engineQuerySyntaxHint(d.Engine),
+		}
+		switch classify.CanonicalEngine(d.Engine) {
+		case "postgres":
+			g.Aliases = []string{"postgresql", "cockroachdb", "redshift", "yugabytedb", "greenplum", "alloydb"}
+			g.KeyParams = []string{"exec_mode=simple_protocol (for PgBouncer)"}
+		case "mysql":
+			g.Aliases = []string{"mariadb", "tidb", "oceanbase_mysql", "starrocks", "doris"}
+			g.KeyParams = []string{"charset", "parseTime"}
+		case "sqlite":
+			g.Aliases = []string{"sqlite3"}
+			g.KeyParams = []string{"SQLite file path goes in instance.host (port=0)"}
+		case "mongodb":
+			g.Aliases = []string{"documentdb", "ferretdb", "cosmosdb_mongo"}
+			g.KeyParams = []string{"authSource", "replicaSet", "directConnection=true|false"}
+		case "redis":
+			g.Aliases = []string{"valkey", "dragonfly", "keydb"}
+			g.KeyParams = []string{"cluster=true", "protocol=2|3", "username"}
+		case "clickhouse":
+			g.Aliases = []string{"ch"}
+			g.KeyParams = []string{"protocol=native|http"}
+		case "mssql":
+			g.Aliases = []string{"sqlserver", "azuresql"}
+			g.KeyParams = []string{"encrypt", "TrustServerCertificate"}
+		case "oracle":
+			g.Aliases = []string{"oracledb"}
+			g.KeyParams = []string{"sid=<SID> (defaults to service name in database_name)"}
+		case "elasticsearch":
+			g.Aliases = []string{"opensearch", "es"}
+			g.KeyParams = []string{"scheme=http|https", "auth_type=basic|api_key|bearer"}
+		}
+		if g.SyntaxHint == "" {
+			g.SyntaxHint = "Standard SQL via --sql / --file / --stdin"
+		}
+		out = append(out, g)
+	}
+	return out
 }
 
 // ListTargetsFiltered filters targets and populates recovery hints when zero hits occur.

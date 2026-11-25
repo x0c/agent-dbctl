@@ -4,6 +4,8 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -62,14 +64,81 @@ func SpawnDetached(binPath string, args []string) error {
 
 // KillPID terminates an orphaned or mismatched daemon PID safely.
 func KillPID(pid int) error {
+	return WaitOrTerminatePID(pid, 0, 1500*time.Millisecond)
+}
+
+// AcquireFileLock acquires an exclusive advisory lock on path.
+func AcquireFileLock(path string, blocking bool) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	how := syscall.LOCK_EX
+	if !blocking {
+		how |= syscall.LOCK_NB
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), how)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		return f, nil
+	}
+}
+
+// ReleaseFileLock releases and closes a file lock acquired via AcquireFileLock.
+func ReleaseFileLock(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
+}
+
+// IsProcessAlive reports whether pid currently exists on this host.
+func IsProcessAlive(pid int) bool {
 	if pid <= 1 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// WaitOrTerminatePID waits for pid to exit gracefully, escalating to SIGTERM and SIGKILL if needed.
+func WaitOrTerminatePID(pid int, gracefulWait, termWait time.Duration) error {
+	if pid <= 1 || !IsProcessAlive(pid) {
 		return nil
 	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return err
+	if waitForProcessExit(pid, gracefulWait) {
+		return nil
 	}
-	_ = p.Signal(syscall.SIGTERM)
-	time.Sleep(200 * time.Millisecond)
-	return nil
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	if waitForProcessExit(pid, termWait) {
+		return nil
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	if waitForProcessExit(pid, 500*time.Millisecond) {
+		return nil
+	}
+	return fmt.Errorf("process %d did not exit after SIGKILL", pid)
+}
+
+func waitForProcessExit(pid int, timeout time.Duration) bool {
+	if timeout <= 0 {
+		return !IsProcessAlive(pid)
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if !IsProcessAlive(pid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 }

@@ -1,6 +1,7 @@
 package daemon_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -152,5 +153,72 @@ func TestCancelOperationAndWaitAndWaitForOperationTimeout(t *testing.T) {
 	cancelled, err := svc.CancelOperationAndWait(ctx, pending.OperationID, "agent-cli")
 	if err != nil || cancelled.Status != types.OpCancelled {
 		t.Fatalf("expected settled cancelled status, got %+v err=%v", cancelled, err)
+	}
+}
+
+func TestServerSessionLockPreventsDuplicateAndSSEShutdownIsFast(t *testing.T) {
+	cfgHome := t.TempDir()
+	t.Setenv(config.EnvConfigHome, cfgHome)
+	t.Setenv(config.EnvSecretBackend, "file")
+	t.Setenv(config.EnvNoBrowser, "1")
+	t.Setenv(config.EnvSession, "lock-sse-test")
+
+	paths, err := config.ResolvePaths("lock-sse-test")
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+
+	srv1, err := daemon.StartServer(context.Background(), paths, "v0.2.0-test", "abc", "")
+	if err != nil {
+		t.Fatalf("start server 1: %v", err)
+	}
+	done1 := make(chan error, 1)
+	go func() { done1 <- srv1.Run(context.Background()) }()
+
+	// Second StartServer for the same session must fail immediately while lock is held.
+	if srv2, dupErr := daemon.StartServer(context.Background(), paths, "v0.2.0-test", "def", ""); dupErr == nil {
+		srv2.TriggerShutdown()
+		t.Fatalf("expected second StartServer on same session to fail with session lock")
+	}
+
+	// Open an active SSE connection and verify TriggerShutdown completes promptly (<1.5s, not 5s).
+	sseReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv1.WebURL()+"/api/v1/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sseResp, err := http.DefaultClient.Do(sseReq)
+	if err != nil {
+		t.Fatalf("connect SSE: %v", err)
+	}
+	defer func() { _ = sseResp.Body.Close() }()
+	line, err := bufio.NewReader(sseResp.Body).ReadString('\n')
+	if err != nil || !strings.Contains(line, "ready") {
+		t.Fatalf("expected initial SSE ready event, got %q err=%v", line, err)
+	}
+
+	startStop := time.Now()
+	srv1.TriggerShutdown()
+	select {
+	case runErr := <-done1:
+		if runErr != nil {
+			t.Fatalf("srv1 shutdown error: %v", runErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("daemon shutdown with active SSE connection hung past 2s")
+	}
+	if elapsed := time.Since(startStop); elapsed > 1500*time.Millisecond {
+		t.Fatalf("expected fast SSE shutdown, took %v", elapsed)
+	}
+
+	// Lock is released once Run exits, allowing a subsequent StartServer to succeed.
+	srv3, err := daemon.StartServer(context.Background(), paths, "v0.2.0-test", "def", "")
+	if err != nil {
+		t.Fatalf("expected StartServer after shutdown to succeed, got: %v", err)
+	}
+	done3 := make(chan error, 1)
+	go func() { done3 <- srv3.Run(context.Background()) }()
+	srv3.TriggerShutdown()
+	if runErr := <-done3; runErr != nil {
+		t.Fatalf("srv3 shutdown error: %v", runErr)
 	}
 }

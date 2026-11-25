@@ -34,6 +34,7 @@ export interface GlobalSecurityConfig {
   block_multi_statement_in_prod: boolean
   default_approval_provider: string
   redact_audit_literals: boolean
+  require_reason_for_approval: boolean
   updated_at_utc?: string
 }
 
@@ -43,6 +44,7 @@ export interface BootstrapPayload {
   global_security: GlobalSecurityConfig
   pending_approval_count: number
   secret_backend: string
+  ui_csrf_token?: string
 }
 
 export interface SystemRecord {
@@ -440,19 +442,65 @@ export interface PingResult {
   error?: string
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers)
-  if (init?.method && init.method !== 'GET') {
-    headers.set('X-Agent-DBCTL-UI', '1')
-    if (!headers.has('Content-Type') && typeof init.body === 'string') {
-      headers.set('Content-Type', 'application/json')
+let uiCSRFToken: string | null = null
+
+async function fetchBootstrap(): Promise<BootstrapPayload> {
+  const resp = await fetch('/api/v1/bootstrap', { credentials: 'same-origin' })
+  const text = await resp.text()
+  let parsed: unknown = {}
+  if (text) {
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      parsed = text
     }
   }
-  const resp = await fetch(path, {
-    ...init,
-    credentials: 'same-origin',
-    headers,
-  })
+  if (!resp.ok) {
+    const errObj = parsed as { error?: string }
+    throw new Error(errObj?.error || `HTTP ${resp.status}`)
+  }
+  const payload = parsed as BootstrapPayload
+  if (payload.ui_csrf_token) {
+    uiCSRFToken = payload.ui_csrf_token
+  }
+  return payload
+}
+
+async function ensureCSRFToken(forceRefresh = false): Promise<string> {
+  if (!forceRefresh && uiCSRFToken) {
+    return uiCSRFToken
+  }
+  const boot = await fetchBootstrap()
+  return boot.ui_csrf_token ?? uiCSRFToken ?? ''
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const isMutation = Boolean(init?.method && init.method !== 'GET' && init.method !== 'HEAD')
+  const send = async (csrfToken: string | null) => {
+    const headers = new Headers(init?.headers)
+    if (isMutation) {
+      if (csrfToken) {
+        headers.set('X-Agent-DBCTL-CSRF', csrfToken)
+      }
+      if (!headers.has('Content-Type') && typeof init?.body === 'string') {
+        headers.set('Content-Type', 'application/json')
+      }
+    }
+    return fetch(path, {
+      ...init,
+      credentials: 'same-origin',
+      headers,
+    })
+  }
+
+  let resp = await send(isMutation ? await ensureCSRFToken() : null)
+  if (isMutation && resp.status === 403) {
+    const refreshed = await ensureCSRFToken(true)
+    if (refreshed) {
+      resp = await send(refreshed)
+    }
+  }
+
   const text = await resp.text()
   let parsed: unknown = {}
   if (text) {
@@ -470,7 +518,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  bootstrap: () => request<BootstrapPayload>('/api/v1/bootstrap'),
+  bootstrap: () => fetchBootstrap(),
 
   listSystems: () => request<{ items: SystemRecord[] }>('/api/v1/systems'),
   saveSystem: (s: Partial<SystemRecord>) =>

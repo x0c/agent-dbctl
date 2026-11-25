@@ -118,3 +118,14 @@ func TestRedactQueryMongoJSON(t *testing.T) {
 		t.Fatalf("expected structural $lookup keys preserved in %s", got)
 	}
 }
+
+func TestRedactQueryElasticsearchHTTPJSON(t *testing.T) {
+	in := "POST /orders/_search\n" + `{"query":{"term":{"customer_email":"alice@secret.io"}},"api_key":"es_secret_123"}`
+	got := audit.RedactQuery(in)
+	if !strings.HasPrefix(got, "POST /orders/_search\n") {
+		t.Fatalf("expected HTTP header line preserved, got %q", got)
+	}
+	if strings.Contains(got, "alice@secret.io") || strings.Contains(got, "es_secret_123") {
+		t.Fatalf("expected JSON body values redacted, got %q", got)
+	}
+}

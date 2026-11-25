@@ -224,6 +224,7 @@ CREATE TABLE IF NOT EXISTS global_security_config (
 	block_multi_statement_in_prod INTEGER NOT NULL,
 	default_approval_provider TEXT NOT NULL,
 	redact_audit_literals INTEGER NOT NULL,
+	require_reason_for_approval INTEGER NOT NULL DEFAULT 1,
 	updated_at_utc TEXT NOT NULL
 );
 
@@ -363,6 +364,9 @@ CREATE INDEX IF NOT EXISTS idx_risk_patterns_scope ON risk_pattern_rules(scope_t
 	if err := s.ensureColumnLocked(ctx, "instances", "capabilities_detected_at_utc", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := s.ensureColumnLocked(ctx, "global_security_config", "require_reason_for_approval", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
 	now := nowUTC()
 	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (1, ?), (2, ?), (3, ?)`, now, now, now); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
@@ -413,8 +417,8 @@ func (s *Store) seedDefaults(ctx context.Context) error {
 				INSERT INTO global_security_config(
 					id, exec_timeout_sec, approval_timeout_sec, max_rows, max_bytes,
 					explain_max_rows, prod_read_only_freeze, block_multi_statement_in_prod,
-					default_approval_provider, redact_audit_literals, updated_at_utc
-				) VALUES (1, 15, 120, 200, 262144, 100000, 0, 1, 'local-web', 1, ?)`, now)
+					default_approval_provider, redact_audit_literals, require_reason_for_approval, updated_at_utc
+				) VALUES (1, 15, 120, 200, 262144, 100000, 0, 1, 'local-web', 1, 1, ?)`, now)
 			if err != nil {
 				return err
 			}

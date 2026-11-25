@@ -90,6 +90,20 @@ func ExtractQueryContext(engine, raw string) QueryContext {
 		trimmed := strings.TrimSpace(raw)
 		ctx.Normalized = strings.Join(strings.Fields(trimmed), " ")
 		ctx.NormalizedNoLit = ctx.Normalized
+		if normalizeEngine(engine) == "elasticsearch" {
+			if esCmd, err := ParseElasticsearchCommand(raw); err == nil {
+				if esCmd.Index != "" {
+					ctx.Tables = []string{strings.ToLower(esCmd.Index)}
+				}
+				if esCmd.Doc != nil {
+					ctx.MongoDoc = esCmd.Doc
+					if sizeVal, ok := asESInt(esCmd.Doc["size"]); ok && sizeVal > 0 {
+						ctx.HasLimit = true
+					}
+				}
+			}
+			return ctx
+		}
 		if strings.HasPrefix(trimmed, "{") {
 			var doc map[string]any
 			if err := json.Unmarshal([]byte(trimmed), &doc); err == nil {

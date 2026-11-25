@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 
+	"github.com/x0c/agent-dbctl/internal/classify"
 	"github.com/x0c/agent-dbctl/internal/secrets"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
@@ -66,6 +68,18 @@ type ExecOpts struct {
 	MaxBytes int64
 }
 
+// SchemaListOpts filters and bounds schema object enumeration.
+type SchemaListOpts struct {
+	Search string
+	Limit  int
+}
+
+// SchemaInspector is optionally implemented by drivers supporting read-only schema introspection.
+type SchemaInspector interface {
+	ListTables(ctx context.Context, opts SchemaListOpts) (*types.SchemaListResult, error)
+	DescribeTable(ctx context.Context, name string) (*types.TableSchema, error)
+}
+
 // Driver defines the engine-level contract (zero cross-dialect rewriting).
 type Driver interface {
 	Metadata() types.DriverMetadata
@@ -100,7 +114,7 @@ func (r *Registry) Register(d Driver) {
 	meta := d.Metadata()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.drivers[meta.Engine] = d
+	r.drivers[strings.ToLower(strings.TrimSpace(meta.Engine))] = d
 }
 
 // ClearTier removes all drivers matching a tier (e.g. "plugin") prior to reload.
@@ -114,12 +128,21 @@ func (r *Registry) ClearTier(tier string) {
 	}
 }
 
-// Get retrieves a registered driver by engine name.
+// Get retrieves a registered driver by exact engine name, falling back to compatible dialect aliases
+// when no explicit plugin overrides the requested engine name.
 func (r *Registry) Get(engine string) (Driver, bool) {
+	key := strings.ToLower(strings.TrimSpace(engine))
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	d, ok := r.drivers[engine]
-	return d, ok
+	if d, ok := r.drivers[key]; ok {
+		return d, true
+	}
+	if canonical := classify.CanonicalEngine(key); canonical != "" && canonical != key {
+		if d, ok := r.drivers[canonical]; ok {
+			return d, true
+		}
+	}
+	return nil, false
 }
 
 // List returns metadata for all registered drivers sorted by tier and engine.

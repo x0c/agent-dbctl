@@ -1,29 +1,79 @@
-import { AdminShell, type AdminNavItem, Badge, Toaster, toast } from '@x0c/ui'
-import { Cpu, Database, ScrollText, ShieldCheck, ShieldAlert } from 'lucide-react'
+import { AdminShell, type AdminNavItem, Badge, Button, Toaster, toast } from '@x0c/ui'
+import { Cpu, Database, Languages, ScrollText, ShieldAlert, ShieldCheck } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api, type BootstrapPayload, type DisplayCatalog } from './api'
 import { ApprovalsTab } from './components/ApprovalsTab'
 import { AuditTab } from './components/AuditTab'
-import { CatalogTab } from './components/CatalogTab'
+import { CatalogTab, type CatalogSubTab } from './components/CatalogTab'
 import { DriversTab } from './components/DriversTab'
 import { PoliciesTab } from './components/PoliciesTab'
 import { loadCachedCatalog, saveCachedCatalog } from './lib/catalog'
+import { useI18n } from './lib/i18n'
 
 type Tab = 'approvals' | 'catalog' | 'policies' | 'audit' | 'drivers'
 
-function parseApprovalDeepLink(): { tab: Tab; id: string | null; token: string | null } {
+const CATALOG_SUBTABS = new Set<CatalogSubTab>(['targets', 'systems', 'instances', 'networks', 'credentials', 'environments'])
+
+function parseDeepLink(): {
+  tab: Tab
+  approvalId: string | null
+  approvalToken: string | null
+  catalogSubTab: CatalogSubTab
+  credentialId: string | null
+} {
   const path = window.location.pathname
-  const match = path.match(/^\/approvals\/([^/]+)$/)
   const sp = new URLSearchParams(window.location.search)
-  const token = sp.get('token')
-  if (match) {
-    return { tab: 'approvals', id: decodeURIComponent(match[1]), token }
+  const approvalMatch = path.match(/^\/approvals\/([^/]+)$/)
+  if (approvalMatch) {
+    return {
+      tab: 'approvals',
+      approvalId: decodeURIComponent(approvalMatch[1]),
+      approvalToken: sp.get('token'),
+      catalogSubTab: 'targets',
+      credentialId: null,
+    }
   }
-  return { tab: 'approvals', id: null, token: null }
+  if (path === '/targets' || path.startsWith('/targets/')) {
+    return {
+      tab: 'catalog',
+      approvalId: null,
+      approvalToken: null,
+      catalogSubTab: 'targets',
+      credentialId: null,
+    }
+  }
+  if (path === '/catalog' || path.startsWith('/catalog/')) {
+    const rawSub = sp.get('subtab') as CatalogSubTab | null
+    const credential = sp.get('credential')
+    const catalogSubTab: CatalogSubTab =
+      rawSub && CATALOG_SUBTABS.has(rawSub)
+        ? rawSub
+        : credential
+          ? 'credentials'
+          : 'targets'
+    return {
+      tab: 'catalog',
+      approvalId: null,
+      approvalToken: null,
+      catalogSubTab,
+      credentialId: credential,
+    }
+  }
+  if (path === '/policies' || path.startsWith('/policies/')) {
+    return { tab: 'policies', approvalId: null, approvalToken: null, catalogSubTab: 'targets', credentialId: null }
+  }
+  if (path === '/audit' || path.startsWith('/audit/')) {
+    return { tab: 'audit', approvalId: null, approvalToken: null, catalogSubTab: 'targets', credentialId: null }
+  }
+  if (path === '/drivers' || path.startsWith('/drivers/')) {
+    return { tab: 'drivers', approvalId: null, approvalToken: null, catalogSubTab: 'targets', credentialId: null }
+  }
+  return { tab: 'approvals', approvalId: null, approvalToken: null, catalogSubTab: 'targets', credentialId: null }
 }
 
 export function App() {
-  const initialLink = parseApprovalDeepLink()
+  const { locale, setLocale, t } = useI18n()
+  const initialLink = parseDeepLink()
   const [tab, setTab] = useState<Tab>(initialLink.tab)
   const [catalog, setCatalog] = useState<DisplayCatalog>(() => loadCachedCatalog())
   const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null)
@@ -49,14 +99,14 @@ export function App() {
   const navItems: Array<AdminNavItem & { id: Tab }> = [
     {
       id: 'approvals',
-      label: pendingCount > 0 ? `Approvals (${pendingCount})` : 'Approvals',
+      label: pendingCount > 0 ? t('nav.approvalsCount', { count: pendingCount }) : t('nav.approvals'),
       icon: ShieldAlert,
-      section: 'Gate',
+      section: t('nav.section.gate'),
     },
-    { id: 'catalog', label: 'Systems & DBs', icon: Database, section: 'Control Plane' },
-    { id: 'policies', label: 'Policies', icon: ShieldCheck, section: 'Control Plane' },
-    { id: 'audit', label: 'Audit Logs', icon: ScrollText, section: 'Observability' },
-    { id: 'drivers', label: 'Drivers', icon: Cpu, section: 'Observability' },
+    { id: 'catalog', label: t('nav.catalog'), icon: Database, section: t('nav.section.assets') },
+    { id: 'policies', label: t('nav.policies'), icon: ShieldCheck, section: t('nav.section.assets') },
+    { id: 'audit', label: t('nav.audit'), icon: ScrollText, section: t('nav.section.observability') },
+    { id: 'drivers', label: t('nav.drivers'), icon: Cpu, section: t('nav.section.observability') },
   ]
 
   const handleToggleFreeze = async (next: boolean) => {
@@ -67,9 +117,9 @@ export function App() {
         prod_read_only_freeze: next,
       })
       setBootstrap((prev) => (prev ? { ...prev, global_security: updated } : prev))
-      toast.success(next ? 'Production freeze enabled' : 'Production freeze disabled')
+      toast.success(next ? t('freeze.enabledToast') : t('freeze.disabledToast'))
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to toggle freeze')
+      toast.error(e instanceof Error ? e.message : t('freeze.toggleFailed'))
     }
   }
 
@@ -81,27 +131,46 @@ export function App() {
         activeId={tab}
         onSelectNav={(id) => setTab(id as Tab)}
         onBrandClick={() => setTab('approvals')}
+        navAriaLabel={t('nav.ariaLabel')}
         enableCommandPalette
         topbarExtra={
-          bootstrap ? (
-            <Badge variant="outline" className="font-mono text-[11px]">
-              {bootstrap.identity.session} · {bootstrap.identity.version}
-            </Badge>
-          ) : null
+          <div className="flex items-center gap-2">
+            {bootstrap && (
+              <Badge variant="outline" className="font-mono text-[11px]">
+                {bootstrap.identity.session} · {bootstrap.identity.version}
+              </Badge>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              title={t('common.langToggleTitle')}
+              aria-label={t('common.langToggleTitle')}
+              onClick={() => setLocale(locale === 'zh' ? 'en' : 'zh')}
+            >
+              <Languages className="size-3.5" />
+              {t('common.langToggle')}
+            </Button>
+          </div>
         }
       >
         {tab === 'approvals' && (
           <ApprovalsTab
             catalog={catalog}
             globalSecurity={bootstrap?.global_security ?? null}
-            deepLinkId={initialLink.id}
-            deepLinkToken={initialLink.token}
+            deepLinkId={initialLink.approvalId}
+            deepLinkToken={initialLink.approvalToken}
             onToggleFreeze={handleToggleFreeze}
             onCountChange={setPendingCount}
           />
         )}
         {tab === 'catalog' && (
-          <CatalogTab catalog={catalog} onRefreshBootstrap={refreshBootstrap} />
+          <CatalogTab
+            catalog={catalog}
+            onRefreshBootstrap={refreshBootstrap}
+            initialSubTab={initialLink.catalogSubTab}
+            deepLinkCredential={initialLink.credentialId}
+          />
         )}
         {tab === 'policies' && (
           <PoliciesTab

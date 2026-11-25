@@ -31,7 +31,7 @@ func (d *MySQLDriver) Metadata() types.DriverMetadata {
 		Family:       types.FamilySQL,
 		Tier:         "builtin",
 		Version:      "1.1.0",
-		Capabilities: []string{"ping", "list_databases", "preflight", "execute"},
+		Capabilities: []string{"ping", "list_databases", "schema", "preflight", "execute"},
 		Verified:     true,
 		Labels:       map[string]string{"en": "MySQL", "zh": "MySQL"},
 	}
@@ -250,8 +250,8 @@ func (c *mysqlConn) Preflight(ctx context.Context, raw string, _ driver.Prefligh
 		Executed:  false,
 		Format:    "mysql_json",
 	}
-	if !cls.IsReadOnly || cls.StatementCount != 1 {
-		report.Warnings = append(report.Warnings, "EXPLAIN skipped for non-read or multi-statement SQL")
+	if !driver.CanPreflightSQL(cls) {
+		report.Warnings = append(report.Warnings, "EXPLAIN skipped for DDL/admin/multi-statement SQL")
 		return report, nil
 	}
 	if caps := c.Capabilities(); caps != nil && caps.SupportsExplain && !caps.SupportsExplainJSON {
@@ -389,7 +389,7 @@ func asInt64(v any) (int64, bool) {
 func (c *mysqlConn) Execute(ctx context.Context, raw string, opts driver.ExecOpts) (*types.ExecResult, error) {
 	start := time.Now()
 	cls := classify.Classify("mysql", raw)
-	if cls.IsReadOnly && cls.StatementCount == 1 {
+	if cls.StatementCount == 1 && (cls.IsReadOnly || classify.HasReturningClause(raw)) {
 		rows, err := c.db.QueryContext(ctx, raw)
 		if err != nil {
 			return nil, err
@@ -415,6 +415,169 @@ func (c *mysqlConn) Execute(ctx context.Context, raw string, opts driver.ExecOpt
 		Family:       types.FamilySQL,
 		AffectedRows: affPtr,
 		LatencyMs:    time.Since(start).Milliseconds(),
+	}, nil
+}
+
+func (c *mysqlConn) ListTables(ctx context.Context, opts driver.SchemaListOpts) (*types.SchemaListResult, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT table_name, table_type, COALESCE(engine, ''), table_rows
+		FROM information_schema.tables
+		WHERE table_schema = DATABASE()
+		ORDER BY table_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var all []types.SchemaObjectSummary
+	for rows.Next() {
+		var name, ttype, eng string
+		var estRows sql.NullInt64
+		if err := rows.Scan(&name, &ttype, &eng, &estRows); err != nil {
+			return nil, err
+		}
+		objType := "table"
+		if strings.Contains(strings.ToUpper(ttype), "VIEW") {
+			objType = "view"
+		}
+		var estPtr *int64
+		if estRows.Valid {
+			v := estRows.Int64
+			estPtr = &v
+		}
+		all = append(all, types.SchemaObjectSummary{
+			Schema:        c.cfg.DatabaseName,
+			Name:          name,
+			Type:          objType,
+			Engine:        eng,
+			EstimatedRows: estPtr,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	items, total, truncated := driver.FilterAndCapSchemaObjects(all, opts.Search, opts.Limit)
+	dialect := "mysql"
+	if caps := c.Capabilities(); caps != nil && caps.Dialect != "" {
+		dialect = caps.Dialect
+	}
+	return &types.SchemaListResult{
+		Engine:        "mysql",
+		Dialect:       dialect,
+		Database:      c.cfg.DatabaseName,
+		Items:         items,
+		TotalCount:    total,
+		ReturnedCount: len(items),
+		Truncated:     truncated,
+	}, nil
+}
+
+func (c *mysqlConn) DescribeTable(ctx context.Context, name string) (*types.TableSchema, error) {
+	sch, tbl := driver.SplitQualifiedObject(name)
+	if tbl == "" {
+		return nil, fmt.Errorf("table name is required")
+	}
+	if sch == "" {
+		_ = c.db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&sch)
+	}
+	if sch == "" {
+		sch = c.cfg.DatabaseName
+	}
+
+	colRows, err := c.db.QueryContext(ctx, `
+		SELECT column_name, column_type, is_nullable, column_key, COALESCE(column_default, ''), COALESCE(extra, '')
+		FROM information_schema.columns
+		WHERE table_schema = ? AND table_name = ?
+		ORDER BY ordinal_position`, sch, tbl)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = colRows.Close() }()
+
+	var cols []types.SchemaColumn
+	for colRows.Next() {
+		var cname, ctype, nullable, ckey, defVal, extra string
+		if err := colRows.Scan(&cname, &ctype, &nullable, &ckey, &defVal, &extra); err != nil {
+			return nil, err
+		}
+		cols = append(cols, types.SchemaColumn{
+			Name:       cname,
+			Type:       ctype,
+			Nullable:   strings.EqualFold(nullable, "YES"),
+			PrimaryKey: strings.EqualFold(ckey, "PRI"),
+			Default:    defVal,
+			Extra:      extra,
+		})
+	}
+	if err := colRows.Err(); err != nil {
+		return nil, err
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("table or view %s.%s not found", sch, tbl)
+	}
+
+	var idxs []types.SchemaIndex
+	idxMap := map[string]*types.SchemaIndex{}
+	var idxOrder []string
+	idxRows, err := c.db.QueryContext(ctx, `
+		SELECT index_name, non_unique, column_name
+		FROM information_schema.statistics
+		WHERE table_schema = ? AND table_name = ?
+		ORDER BY index_name, seq_in_index`, sch, tbl)
+	if err == nil {
+		for idxRows.Next() {
+			var idxName, colName string
+			var nonUnique int
+			if idxRows.Scan(&idxName, &nonUnique, &colName) == nil {
+				item, exists := idxMap[idxName]
+				if !exists {
+					item = &types.SchemaIndex{
+						Name:    idxName,
+						Unique:  nonUnique == 0,
+						Primary: strings.EqualFold(idxName, "PRIMARY"),
+					}
+					idxMap[idxName] = item
+					idxOrder = append(idxOrder, idxName)
+				}
+				item.Columns = append(item.Columns, colName)
+			}
+		}
+		_ = idxRows.Close()
+		for _, k := range idxOrder {
+			idxs = append(idxs, *idxMap[k])
+		}
+	}
+
+	var fks []types.SchemaForeignKey
+	fkRows, err := c.db.QueryContext(ctx, `
+		SELECT column_name, referenced_table_name, referenced_column_name
+		FROM information_schema.key_column_usage
+		WHERE table_schema = ? AND table_name = ? AND referenced_table_name IS NOT NULL
+		ORDER BY ordinal_position`, sch, tbl)
+	if err == nil {
+		for fkRows.Next() {
+			var fk types.SchemaForeignKey
+			if fkRows.Scan(&fk.Column, &fk.ReferencedTable, &fk.ReferencedColumn) == nil {
+				fks = append(fks, fk)
+			}
+		}
+		_ = fkRows.Close()
+	}
+
+	dialect := "mysql"
+	if caps := c.Capabilities(); caps != nil && caps.Dialect != "" {
+		dialect = caps.Dialect
+	}
+	return &types.TableSchema{
+		Engine:      "mysql",
+		Dialect:     dialect,
+		Database:    c.cfg.DatabaseName,
+		Schema:      sch,
+		Name:        tbl,
+		ObjectType:  "table",
+		Columns:     cols,
+		Indexes:     idxs,
+		ForeignKeys: fks,
 	}, nil
 }
 

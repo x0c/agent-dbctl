@@ -36,6 +36,13 @@ type AuditFilter struct {
 	Offset      int
 }
 
+// RecordAuditEvent writes a standalone append-only audit entry in its own transaction.
+func (s *Store) RecordAuditEvent(ctx context.Context, actor, action, targetID, opID string, payload any) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		return s.appendAuditTx(ctx, tx, actor, action, targetID, opID, payload, "")
+	})
+}
+
 // CreateOperation writes the initial WAL operation and audit record in a single transaction.
 func (s *Store) CreateOperation(ctx context.Context, op types.Operation) (types.Operation, error) {
 	now := nowUTC()

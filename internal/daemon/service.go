@@ -2,9 +2,12 @@ package daemon
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -64,6 +67,9 @@ type Service struct {
 
 	sseMu   sync.Mutex
 	sseSubs map[chan Event]struct{}
+
+	uiSessionToken string
+	uiCSRFToken    string
 }
 
 // NewService wires up Store, Secrets, Drivers, Plugins, Approvals, and ResultSlots.
@@ -84,13 +90,13 @@ func NewService(ctx context.Context, paths config.Paths, version, commit string)
 
 	rootCtx, cancelRoot := context.WithCancel(context.Background())
 	svc := &Service{
-		paths:   paths,
-		store:   st,
-		secrets: sec,
-		drivers: reg,
-		plugins: pm,
+		paths:     paths,
+		store:     st,
+		secrets:   sec,
+		drivers:   reg,
+		plugins:   pm,
 		approvals: appMgr,
-		slots:   slots,
+		slots:     slots,
 		identity: Identity{
 			Version:    version,
 			Commit:     commit,
@@ -99,11 +105,13 @@ func NewService(ctx context.Context, paths config.Paths, version, commit string)
 			ConfigHome: paths.ConfigHome,
 			StartedAt:  time.Now().UTC().Format(time.RFC3339),
 		},
-		rootCtx:    rootCtx,
-		cancelRoot: cancelRoot,
-		opWaiters:  make(map[string]chan types.ExecResponse),
-		opActive:   make(map[string]context.CancelFunc),
-		sseSubs:    make(map[chan Event]struct{}),
+		rootCtx:        rootCtx,
+		cancelRoot:     cancelRoot,
+		opWaiters:      make(map[string]chan types.ExecResponse),
+		opActive:       make(map[string]context.CancelFunc),
+		sseSubs:        make(map[chan Event]struct{}),
+		uiSessionToken: randomHexToken(32),
+		uiCSRFToken:    randomHexToken(32),
 	}
 
 	lw := approval.NewLocalWebProvider(func(approvalID string) {
@@ -145,6 +153,41 @@ func (s *Service) Drivers() *driver.Registry {
 // Plugins exposes the external plugin manager.
 func (s *Service) Plugins() *drvplugin.Manager {
 	return s.plugins
+}
+
+// UISessionToken returns the daemon-scoped cryptographic browser session cookie token.
+func (s *Service) UISessionToken() string {
+	return s.uiSessionToken
+}
+
+// UICSRFToken returns the daemon-scoped cryptographic CSRF token required on mutating Web API calls.
+func (s *Service) UICSRFToken() string {
+	return s.uiCSRFToken
+}
+
+// CredentialSetupURL builds a deep-link URL to open the password-entry dialog for a credential in Web UI.
+func (s *Service) CredentialSetupURL(credID string) string {
+	base := strings.TrimRight(s.identity.WebURL, "/")
+	if base == "" || credID == "" {
+		return ""
+	}
+	return base + "/catalog?subtab=credentials&credential=" + url.QueryEscape(credID)
+}
+
+func randomHexToken(nBytes int) string {
+	b := make([]byte, nBytes)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// Done returns a channel closed when the daemon begins shutting down.
+func (s *Service) Done() <-chan struct{} {
+	return s.rootCtx.Done()
+}
+
+// CancelBackground cancels long-lived background streams/waiters at shutdown start.
+func (s *Service) CancelBackground() {
+	s.cancelRoot()
 }
 
 // Shutdown gracefully stops background workers, slots, approvals, plugins, and SQLite.
@@ -541,6 +584,88 @@ func (s *Service) DiscoverInstance(ctx context.Context, instanceID, credID, dbNa
 	return conn.ListDatabases(connCtx)
 }
 
+// InspectSchema lists tables/collections/key prefixes or describes one object on a target using read-only credentials.
+func (s *Service) InspectSchema(ctx context.Context, targetRefOrAlias, workspaceCWD, table, search string, limit int) (any, error) {
+	detail, err := s.ResolveTarget(ctx, targetRefOrAlias, workspaceCWD)
+	if err != nil {
+		return nil, err
+	}
+	if detail.Target.Status == types.TargetDisabled || detail.Target.Status == types.TargetMaintenance {
+		return nil, &TargetLookupError{
+			Code:    types.ErrCodeTargetMaintenance,
+			Message: fmt.Sprintf("Target %q is currently %s", detail.Target.Ref, detail.Target.Status),
+		}
+	}
+	if !detail.EffectivePolicy.AllowSafeRead {
+		return nil, &TargetLookupError{
+			Code:    types.ErrCodePolicyDenied,
+			Message: fmt.Sprintf("Target %q disallows safe read inspection", detail.Target.Ref),
+		}
+	}
+	timeoutSec := detail.EffectivePolicy.ExecTimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = 15
+	}
+	schemaCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	conn, err := s.openDriverConn(schemaCtx, detail, types.AccessReadOnly, true)
+	if err != nil {
+		return nil, &TargetLookupError{
+			Code:    types.ErrCodeDriverError,
+			Message: err.Error(),
+		}
+	}
+	defer func() { _ = conn.Close() }()
+
+	si, ok := conn.(driver.SchemaInspector)
+	if !ok {
+		eng := ""
+		if detail.Instance != nil {
+			eng = detail.Instance.Engine
+		}
+		return nil, &TargetLookupError{
+			Code:    types.ErrCodeDriverError,
+			Message: fmt.Sprintf("driver for engine %q does not support db schema introspection; run a read-only query with exec", eng),
+		}
+	}
+
+	if strings.TrimSpace(table) == "" {
+		res, err := driver.ExecuteWithCancelGuard(schemaCtx, conn, func(cctx context.Context) (*types.SchemaListResult, error) {
+			return si.ListTables(cctx, driver.SchemaListOpts{Search: search, Limit: limit})
+		})
+		if err != nil {
+			return nil, &TargetLookupError{
+				Code:    types.ErrCodeDriverError,
+				Message: err.Error(),
+			}
+		}
+		res.TargetRef = detail.Target.Ref
+		_ = s.store.RecordAuditEvent(ctx, "agent-cli", "schema.list", detail.Target.ID, "", map[string]any{
+			"target_ref": detail.Target.Ref,
+			"search":     search,
+			"returned":   res.ReturnedCount,
+		})
+		return res, nil
+	}
+
+	tblSchema, err := driver.ExecuteWithCancelGuard(schemaCtx, conn, func(cctx context.Context) (*types.TableSchema, error) {
+		return si.DescribeTable(cctx, table)
+	})
+	if err != nil {
+		return nil, &TargetLookupError{
+			Code:    types.ErrCodeDriverError,
+			Message: err.Error(),
+		}
+	}
+	tblSchema.TargetRef = detail.Target.Ref
+	_ = s.store.RecordAuditEvent(ctx, "agent-cli", "schema.describe", detail.Target.ID, "", map[string]any{
+		"target_ref": detail.Target.Ref,
+		"table":      tblSchema.Name,
+	})
+	return tblSchema, nil
+}
+
 // Execute runs the full dry-run / preflight / policy / approval / driver execution pipeline.
 func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.ExecResponse, error) {
 	detail, err := s.ResolveTarget(ctx, req.TargetRefOrAlias, req.WorkspaceCWD)
@@ -580,7 +705,10 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 	}
 	defer closePreflightConn()
 
-	needAutoPreflight := cls.IsReadOnly && ((eff.SafetyTier != types.SafetyTierYOLO && cls.RiskLevel == types.RiskSafeRead) || policy.HasPreflightPatternRule(eff.PatternRules))
+	canPreflightWrite := !cls.IsReadOnly && cls.RiskLevel == types.RiskWrite && driver.CanPreflightSQL(cls) &&
+		(!eff.ProdReadOnlyFreeze || eff.SafetyTier != types.SafetyTierStrict)
+	needAutoPreflight := (cls.IsReadOnly && ((eff.SafetyTier != types.SafetyTierYOLO && cls.RiskLevel == types.RiskSafeRead) || policy.HasPreflightPatternRule(eff.PatternRules))) ||
+		(canPreflightWrite && eff.SafetyTier != types.SafetyTierYOLO && eff.RequireApprovalOnWrite)
 	if req.Preflight || needAutoPreflight {
 		pfCtx, cancel := context.WithTimeout(ctx, time.Duration(minPositive(req.TimeoutSec, eff.ExecTimeoutSec))*time.Second)
 		conn, openErr := s.openDriverConn(pfCtx, detail, types.AccessReadOnly, true)
@@ -588,7 +716,7 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 			pf, _ = driver.ExecuteWithCancelGuard(pfCtx, conn, func(cctx context.Context) (*types.PreflightReport, error) {
 				return conn.Preflight(cctx, req.Query, driver.PreflightOpts{})
 			})
-			if req.Preflight {
+			if req.Preflight || !cls.IsReadOnly {
 				_ = conn.Close()
 			} else {
 				preflightConn = conn
@@ -596,7 +724,7 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 		} else if req.Preflight {
 			cancel()
 			return types.ExecResponse{}, openErr
-		} else {
+		} else if cls.IsReadOnly {
 			preflightOpenErr = openErr
 		}
 		cancel()
@@ -610,7 +738,17 @@ func (s *Service) Execute(ctx context.Context, req types.ExecRequest) (types.Exe
 		closePreflightConn()
 	}
 
-	globalCfg, _ := s.store.GetGlobalSecurityConfig(ctx)
+	globalCfg, cfgErr := s.store.GetGlobalSecurityConfig(ctx)
+	requireReason := true
+	if cfgErr == nil {
+		requireReason = globalCfg.RequireReasonForApproval
+	}
+	if eval.Decision == types.DecisionRequireApproval && requireReason && strings.TrimSpace(req.Reason) == "" {
+		resp := buildExecResponseSkeleton(detail, cls, pf, eval, types.OpDenied)
+		resp.ErrorCode = types.ErrCodeReasonRequired
+		resp.ErrorMessage = "A business reason (--reason) is required when requesting human approval."
+		return resp, nil
+	}
 	redacted := req.Query
 	if globalCfg.RedactAuditLiterals {
 		redacted = audit.RedactQuery(req.Query)
@@ -1051,8 +1189,9 @@ func (s *Service) TestRiskPattern(ctx context.Context, req types.PatternTestRequ
 				ApprovalTimeoutSec:      120,
 				MaxRows:                 200,
 				MaxBytes:                262144,
-				ExplainMaxRows:          100000,
-				DefaultApprovalProvider: "local-web",
+				ExplainMaxRows:           100000,
+				DefaultApprovalProvider:  "local-web",
+				RequireReasonForApproval: true,
 			}
 		}
 		env := &types.Environment{Code: string(tier), SafetyTier: tier}

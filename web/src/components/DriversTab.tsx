@@ -12,8 +12,10 @@ import {
 import { RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api, type DiscoveredPlugin, type DriverMetadata } from '../api'
+import { useI18n } from '../lib/i18n'
 
 export function DriversTab() {
+  const { t } = useI18n()
   const [drivers, setDrivers] = useState<DriverMetadata[]>([])
   const [plugins, setPlugins] = useState<DiscoveredPlugin[]>([])
   const [loading, setLoading] = useState(true)
@@ -27,7 +29,7 @@ export function DriversTab() {
       setDrivers(res.drivers ?? [])
       setPlugins(res.plugins ?? [])
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load drivers')
+      setError(e instanceof Error ? e.message : t('drivers.loadFailed'))
     } finally {
       setLoading(false)
     }
@@ -42,21 +44,41 @@ export function DriversTab() {
     try {
       await api.reloadPlugins()
       await load()
-      toast.success('Reloaded external driver plugins')
+      toast.success(t('drivers.reloadedToast'))
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Plugin reload failed')
+      toast.error(e instanceof Error ? e.message : t('drivers.reloadFailed'))
       setLoading(false)
     }
   }
 
   const driverCols: ColumnDef<DriverMetadata, unknown>[] = [
-    { accessorKey: 'engine', header: 'Engine', cell: ({ row }) => <span className="font-mono text-xs font-semibold">{row.original.engine}</span> },
-    { accessorKey: 'display_name', header: 'Name' },
-    { accessorKey: 'family', header: 'Family', cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.family}</Badge> },
-    { accessorKey: 'tier', header: 'Tier', cell: ({ row }) => <Badge variant="outline" className="font-mono text-[11px]">{row.original.tier}</Badge> },
+    {
+      accessorKey: 'engine',
+      header: t('drivers.col.engine'),
+      cell: ({ row }) => <span className="font-mono text-xs font-semibold">{row.original.engine}</span>,
+    },
+    { accessorKey: 'display_name', header: t('drivers.col.name') },
+    {
+      accessorKey: 'family',
+      header: t('drivers.col.family'),
+      cell: ({ row }) => (
+        <Badge variant="outline" className="font-mono text-[11px]">
+          {row.original.family}
+        </Badge>
+      ),
+    },
+    {
+      accessorKey: 'tier',
+      header: t('drivers.col.tier'),
+      cell: ({ row }) => (
+        <Badge variant="outline" className="font-mono text-[11px]">
+          {row.original.tier}
+        </Badge>
+      ),
+    },
     {
       id: 'capabilities',
-      header: 'Capabilities',
+      header: t('drivers.col.capabilities'),
       cell: ({ row }) => (
         <span className="truncate font-mono text-xs text-muted-foreground">
           {(row.original.capabilities ?? []).join(', ')}
@@ -65,26 +87,40 @@ export function DriversTab() {
     },
     {
       id: 'status',
-      header: 'Status',
+      header: t('drivers.col.status'),
       cell: ({ row }) => (
         <StatusDot tone={row.original.verified ? 'success' : 'danger'}>
-          {row.original.verified ? 'Verified' : 'Invalid'}
+          {row.original.verified ? t('drivers.verified') : t('drivers.invalid')}
         </StatusDot>
       ),
     },
   ]
 
   const pluginCols: ColumnDef<DiscoveredPlugin, unknown>[] = [
-    { id: 'id', header: 'Plugin ID', cell: ({ row }) => <span className="font-mono text-xs font-semibold">{row.original.Manifest.id || '—'}</span> },
-    { id: 'engine', header: 'Engine', cell: ({ row }) => <span className="font-mono text-xs">{row.original.Manifest.engine || '—'}</span> },
-    { id: 'version', header: 'Version', cell: ({ row }) => <span className="font-mono text-xs">{row.original.Manifest.version || '—'}</span> },
+    {
+      id: 'id',
+      header: t('drivers.col.pluginId'),
+      cell: ({ row }) => <span className="font-mono text-xs font-semibold">{row.original.Manifest.id || '—'}</span>,
+    },
+    {
+      id: 'engine',
+      header: t('drivers.col.engine'),
+      cell: ({ row }) => <span className="font-mono text-xs">{row.original.Manifest.engine || '—'}</span>,
+    },
+    {
+      id: 'version',
+      header: t('drivers.col.version'),
+      cell: ({ row }) => <span className="font-mono text-xs">{row.original.Manifest.version || '—'}</span>,
+    },
     {
       id: 'verified',
-      header: 'SHA-256 & API Check',
+      header: t('drivers.col.check'),
       cell: ({ row }) => (
         <StatusDot tone={row.original.Verified ? 'success' : 'danger'}>
           <span className="truncate font-mono text-xs">
-            {row.original.Verified ? `Verified (API v${row.original.Manifest.host_api_version})` : row.original.VerificationErr}
+            {row.original.Verified
+              ? t('drivers.verifiedApi', { ver: row.original.Manifest.host_api_version })
+              : row.original.VerificationErr}
           </span>
         </StatusDot>
       ),
@@ -94,23 +130,33 @@ export function DriversTab() {
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Drivers & Plugins"
+        title={t('drivers.title')}
         actions={
           <Button variant="outline" size="sm" onClick={() => void reloadPlugins()} disabled={loading}>
             <RefreshCw className={loading ? 'animate-spin' : undefined} />
-            Reload Plugins
+            {t('drivers.reloadPlugins')}
           </Button>
         }
       />
 
       {error && <Notice tone="error">{error}</Notice>}
 
-      <Panel title="Active Drivers (Built-in Pure Go + Verified gRPC Plugins)" flush>
-        <DataTable columns={driverCols} data={drivers} emptyLabel="No drivers registered." />
+      <Panel title={t('drivers.activeTitle')} flush>
+        <DataTable
+          columns={driverCols}
+          data={drivers}
+          searchPlaceholder={t('common.search')}
+          emptyLabel={t('drivers.emptyDrivers')}
+        />
       </Panel>
 
-      <Panel title="External gRPC Plugin Manifests (~/.config/agent-dbctl/plugins)" flush>
-        <DataTable columns={pluginCols} data={plugins} emptyLabel="No external plugins installed." />
+      <Panel title={t('drivers.pluginsTitle')} flush>
+        <DataTable
+          columns={pluginCols}
+          data={plugins}
+          searchPlaceholder={t('common.search')}
+          emptyLabel={t('drivers.emptyPlugins')}
+        />
       </Panel>
     </div>
   )
