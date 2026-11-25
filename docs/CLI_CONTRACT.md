@@ -198,6 +198,6 @@ agent-dbctl skill print
 When targeting a remote context (`mode: remote`):
 
 1. **No Local Daemon Spawn**: `daemon start|stop|restart` return exit `2` (`invalid_usage` / `unsupported_in_remote_mode`), and `audit list|export` query `/rpc/v1/audit` directly without local SQLite fallback.
-2. **HTTPS Transport & Auth**: Non-loopback endpoints require `https://` and attach `Authorization: Bearer <token>` (from Keychain/`0600` credential store or `AGENT_DBCTL_TOKEN`), supporting custom CA and mTLS client certificates.
+2. **HTTPS Transport & Auth**: Non-loopback endpoints require `https://` and attach `Authorization: Bearer <token>` (from Keychain/`0600` credential store or `AGENT_DBCTL_TOKEN`), supporting custom CA and mTLS client certificates. `agent-dbctl logout` calls `POST /rpc/v1/auth/logout` best-effort to revoke the active interactive server token (`server_revoked: true|false`) before deleting local `ctx-token:<name>` storage.
 3. **Chunked Long-Poll Wait**: `op wait` uses bounded server-side wait intervals (`/rpc/v1/ops/{id}/wait?timeout=25s`) in a loop until terminal state or overall client timeout, avoiding reverse-proxy gateway timeouts.
 4. **Remote Web URL**: `ui open` and `--open-secret` use the server's configured `public_url` rather than `127.0.0.1` and never launch a browser on the server host.
