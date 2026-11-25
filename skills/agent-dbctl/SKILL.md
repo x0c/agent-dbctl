@@ -40,9 +40,10 @@ Pin and reuse the verified absolute binary path (`"$BIN"`) for the rest of the s
    ```
    - `--dry-run` evaluates classification and policy locally without touching the database.
    - `--preflight` connects read-only and runs non-mutating `EXPLAIN` (never `ANALYZE`) to surface full scans and row estimates before execution.
+   - Human TTY output prints a concise summary; pass `--json` when you need full classification, `preflight` (`plan_raw`), and `evaluation` (`matched_rules`, `effective_policy`) details.
 3. **Execute verbatim queries with a clear business reason**:
    - Pass verbatim engine syntax (PostgreSQL/MySQL/SQLite SQL, MongoDB JSON `RunCommand`, or Redis commands). Do not ask `agent-dbctl` to translate dialects.
-   - Prefer `--file <path>` or `--stdin` for multi-line SQL or JSON queries to avoid shell escaping errors.
+   - Pass queries via `--sql`, `--file <path>`, `--stdin`, or as a single optional positional argument (`exec --db <ref> "<query>"`). Prefer `--file <path>` or `--stdin` for multi-line SQL or JSON queries to avoid shell escaping errors.
    - Always pass `--reason "<concise reason>"` so human reviewers on the Web approval screen see why the operation is needed.
    - Use `--wait=false` when targeting `guarded`/`strict` (`staging`/`prod`) writes or broad reads, then poll `op status` or wait cleanly with `op wait`:
      ```sh
@@ -59,8 +60,8 @@ Pin and reuse the verified absolute binary path (`"$BIN"`) for the rest of the s
 ## 3. Reading Output & Recovering Safely
 
 - Check `ok == true` (exit code `0`) rather than assuming non-empty stdout means success.
-- **Exit `7` (`waiting_approval`)**: human confirmation is open in the Web Console. Poll `"$BIN" op status <operation_id> --json` or share `error.context.approval_url` with the user.
-- **Exit `4` (`approval_rejected` / `policy_denied` / `prod_frozen`)**: read `error.hint` and `error.context.reviewer_note`. Never replay a rejected query verbatim; rewrite it according to the reviewer's feedback or stop.
+- **Exit `7` (`waiting_approval`)**: human confirmation is open in the Web Console. Poll `"$BIN" op status <operation_id> --json` or share `error.context.approval_url` with the user. Note that custom high-risk pattern rules (`error.context.matched_rules`) can force secondary confirmation even on `dev`/`yolo` targets; surface `confirm_title` and `confirm_message` alongside `approval_url`.
+- **Exit `4` (`approval_rejected` / `policy_denied` / `prod_frozen`)**: read `error.hint`, `error.context.matched_rules` (when a custom high-risk pattern denied the statement), and `error.context.reviewer_note`. Never replay a rejected query verbatim; rewrite it according to the reviewer's feedback or stop.
 - **Exit `6` (`query_timeout`)**: if `error.retryable` is `false` (write/DDL/unknown), **do not auto-replay**. Run a bounded read-only query first to verify whether the write landed.
 - **Truncation honesty**: always check `data.truncated`, `data.fetched_rows`, and `data.returned_rows`. Never claim a table has only `returned_rows` records when `truncated == true`.
 
