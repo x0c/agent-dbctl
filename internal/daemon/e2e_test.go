@@ -1431,4 +1431,50 @@ func TestOnboardingDefaultsInlineEnvAndScanReadMode(t *testing.T) {
 	if err != nil || writeROTarget.Status != types.OpDenied || writeROTarget.ErrorCode != types.ErrCodePolicyDenied {
 		t.Fatalf("expected ro-only target write denial, got %+v err=%v", writeROTarget, err)
 	}
+
+	// Kingbase default TLSMode avoids unsupported sslmode=prefer; probe failure returns explicit driver error.
+	ln, lnErr := net.Listen("tcp", "127.0.0.1:0")
+	if lnErr != nil {
+		t.Fatal(lnErr)
+	}
+	closedPort := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	kbRes, err := svc.AdminAddDatabase(ctx, "qa", daemon.DBAddRequest{
+		Engine:         "kingbase",
+		Host:           "127.0.0.1",
+		Port:           closedPort,
+		Database:       "app",
+		System:         "kb-sys",
+		Env:            "shared/base-legacy",
+		SafetyTier:     types.SafetyTierGuarded,
+		Alias:          "kb-legacy",
+		User:           "system",
+		SecretValue:    "pw",
+		SecretProvided: true,
+		Test:           true,
+	})
+	if err != nil {
+		t.Fatalf("AdminAddDatabase kingbase: %v", err)
+	}
+	if kbRes.Ping == nil || kbRes.Ping.Reachable || kbRes.Ping.Error == "" {
+		t.Fatalf("expected Ping with explicit error on unreachable kingbase, got %+v", kbRes.Ping)
+	}
+	if strings.Contains(kbRes.Ping.Error, "unsupported sslmode") {
+		t.Fatalf("expected kingbase default tls_mode to avoid unsupported sslmode=prefer, got %q", kbRes.Ping.Error)
+	}
+
+	// Deleting target reports newly orphaned instance, credential, and custom environment; env delete removes it cleanly.
+	if err := svc.AdminDeleteEnvironment(ctx, "qa", "shared/base-legacy"); err == nil {
+		t.Fatalf("expected deleting in-use env shared/base-legacy to fail")
+	}
+	delRes, err := svc.AdminDeleteTarget(ctx, "qa", "kb-legacy")
+	if err != nil {
+		t.Fatalf("AdminDeleteTarget: %v", err)
+	}
+	if !delRes.Deleted || len(delRes.Orphans) < 3 || len(delRes.NextCommands) < 3 {
+		t.Fatalf("expected orphaned instance, credential, and custom env after db delete, got %+v", delRes)
+	}
+	if err := svc.AdminDeleteEnvironment(ctx, "qa", "shared/base-legacy"); err != nil {
+		t.Fatalf("expected env delete after target removal to succeed, got %v", err)
+	}
 }

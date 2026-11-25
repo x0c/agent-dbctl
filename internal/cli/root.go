@@ -468,7 +468,28 @@ Typical agent workflow:
 			partial := len(res.Results) > 1 && reachableCount > 0 && reachableCount < len(res.Results)
 			if ic.JSONMode {
 				if reachableCount == 0 && len(res.Results) > 0 {
-					exitCode = ic.WriteError(types.ErrCodeDriverError, true, "All tested database targets are unreachable.", "Inspect per-target errors in context and verify network/credentials.", map[string]any{"results": res.Results}, []string{ic.BinPath + " doctor --live --json"}, types.Meta{Partial: partial})
+					errMsg := "All tested database targets are unreachable."
+					next := []string{ic.BinPath + " doctor --live --json"}
+					if len(res.Results) == 1 {
+						r0 := res.Results[0]
+						if r0.Error != "" {
+							errMsg = fmt.Sprintf("Target %s is unreachable: %s", r0.TargetRef, r0.Error)
+						}
+						if r0.TargetRef != "" {
+							next = append([]string{fmt.Sprintf("%s db show %s --json", ic.BinPath, r0.TargetRef)}, next...)
+						}
+					} else {
+						var details []string
+						for _, r := range res.Results {
+							if r.Error != "" {
+								details = append(details, fmt.Sprintf("%s: %s", r.TargetRef, r.Error))
+							}
+						}
+						if len(details) > 0 {
+							errMsg = "Targets unreachable: " + strings.Join(details, "; ")
+						}
+					}
+					exitCode = ic.WriteError(types.ErrCodeDriverError, true, errMsg, "Inspect per-target errors in context and verify endpoint, TLS mode, network profile, or credentials.", map[string]any{"results": res.Results}, next, types.Meta{Partial: partial})
 					return nil
 				}
 				exitCode = ic.WriteSuccess(map[string]any{"results": res.Results}, types.Meta{Partial: partial})

@@ -517,6 +517,27 @@ func TestDamengOpenGaussKingbaseDSNAndPlans(t *testing.T) {
 	if !strings.HasPrefix(kbDSN, "kingbase://system:pw@kb.internal:54321/app?") || !strings.Contains(kbDSN, "sslmode=disable") {
 		t.Fatalf("unexpected kingbase DSN: %q", kbDSN)
 	}
+	for _, mode := range []string{"", "prefer"} {
+		kbDefault := buildKingbaseDSN(driver.ConnectionConfig{
+			Engine:       "kingbase",
+			Host:         "kb.internal",
+			DatabaseName: "app",
+			TLSMode:      mode,
+			Credential:   secrets.ResolvedSecret{Username: "system", Secret: "pw"},
+		})
+		if !strings.Contains(kbDefault, "sslmode=disable") || strings.Contains(kbDefault, "sslmode=prefer") {
+			t.Fatalf("expected kingbase TLSMode=%q to avoid unsupported sslmode=prefer and default to disable, got %q", mode, kbDefault)
+		}
+	}
+	kbReq := buildKingbaseDSN(driver.ConnectionConfig{
+		Engine:       "kingbase",
+		Host:         "kb.internal",
+		DatabaseName: "app",
+		TLSMode:      "require",
+	})
+	if !strings.Contains(kbReq, "sslmode=require") {
+		t.Fatalf("expected kingbase require mode preserved, got %q", kbReq)
+	}
 }
 
 func TestTDengineEndToEndMockServer(t *testing.T) {

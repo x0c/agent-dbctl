@@ -534,6 +534,9 @@ func (s *Service) PingTarget(ctx context.Context, detail types.TargetDetail) typ
 	}
 	res.Reachable = pingOut.Reachable
 	res.Error = pingOut.Error
+	if !res.Reachable && strings.TrimSpace(res.Error) == "" {
+		res.Error = "connectivity probe failed without a driver error message"
+	}
 	if res.Reachable && res.Capabilities != nil && detail.Instance != nil {
 		_ = s.store.UpdateInstanceCapabilities(ctx, detail.Instance.ID, res.Capabilities)
 	}

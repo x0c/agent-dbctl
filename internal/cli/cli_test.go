@@ -946,4 +946,27 @@ func TestCLIFrictionFixesAndPatternPartialUpdate(t *testing.T) {
 	if item["enabled"] != false || item["action"] != "deny" || item["scope_type"] != "env" || cond["pattern"] != `\bUPDATE\b` {
 		t.Fatalf("expected partial pattern set to preserve condition/action/scope, got %+v", item)
 	}
+
+	// 5. `db test` surfaces concrete driver error in error.message, and `db delete` reports orphans including custom `env delete`.
+	t.Setenv("AGENT_DBCTL_TEST_KB_PASS", "pw")
+	code, env = runCLI("db", "add", "--engine", "kingbase", "--host", "127.0.0.1", "--port", "59999", "--database", "kb", "--system", "kbcli", "--env", "legacy/qa", "--safety-tier", "guarded", "--user", "system", "--secret-env", "AGENT_DBCTL_TEST_KB_PASS", "--alias", "kb-qa", "--no-workspace", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("kingbase db add failed: code=%d env=%+v", code, env)
+	}
+	code, env = runCLI("db", "test", "kb-qa", "--json")
+	if code == 0 || env.OK || env.Error == nil || !strings.Contains(env.Error.Message, "kbcli/legacy/qa/kb") || strings.Contains(env.Error.Message, "unsupported sslmode") {
+		t.Fatalf("expected db test error.message to include concrete target ref and driver error (and not sslmode=prefer), got code=%d env=%+v err=%+v", code, env, env.Error)
+	}
+	code, env = runCLI("db", "delete", "kb-qa", "--yes", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("db delete failed: code=%d env=%+v", code, env)
+	}
+	orphans, _ := env.Data.(map[string]any)["orphans"].([]any)
+	if len(orphans) < 2 {
+		t.Fatalf("expected orphaned assets reported on db delete, got %+v", env.Data)
+	}
+	code, env = runCLI("env", "delete", "legacy/qa", "--yes", "--json")
+	if code != 0 || !env.OK {
+		t.Fatalf("env delete legacy/qa failed: code=%d env=%+v", code, env)
+	}
 }

@@ -44,7 +44,7 @@ When a database is not yet registered (`db list` returns empty or `db_not_found`
    - Preview and apply sanitized topology: `"$BIN" topology apply --file topology.yaml --dry-run --json` then `"$BIN" topology apply --file topology.yaml --open-secret --json`
    - Export sanitized topology: `"$BIN" topology export --format yaml --out topology.yaml --json`
 3. **Granular catalog, discovery, and guardrails**:
-   - Assets: `system list|set|delete`, `env list|set`, `network list|set|delete`, `cred list|set|delete`, `instance list|set|delete|test|discover`, `db set|delete`
+   - Assets: `system list|set|delete`, `env list|set|delete`, `network list|set|delete`, `cred list|set|delete`, `instance list|set|delete|test|discover`, `db set|delete` (note: `db delete` preserves shared instances/credentials and reports any newly orphaned resources with cleanup commands)
    - Drivers & syntax hints: `"$BIN" driver list --json` (shows all built-in + plugin engines, aliases, default ports, `params`, and query syntax)
    - Guardrails & approvals: `security get|set`, `policy list|set|delete`, `pattern list|set|delete|install-pack|test`, `approval list|show`
 

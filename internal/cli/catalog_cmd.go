@@ -344,16 +344,32 @@ with --open-secret or 'agent-dbctl ui open --credential <name>'.`,
 				setExitCode(writeClientInitErr(ic, err))
 				return nil
 			}
-			var out map[string]bool
-			if err := client.DoJSON(cmd.Context(), http.MethodDelete, "/rpc/v1/targets/"+url.PathEscape(args[0]), nil, &out); err != nil {
+			var res daemon.TargetDeleteResult
+			if err := client.DoJSON(cmd.Context(), http.MethodDelete, "/rpc/v1/targets/"+url.PathEscape(args[0]), nil, &res); err != nil {
 				setExitCode(writeRPCErr(ic, err))
 				return nil
 			}
+			for i, nextCmd := range res.NextCommands {
+				if strings.HasPrefix(nextCmd, "agent-dbctl ") {
+					res.NextCommands[i] = ic.BinPath + nextCmd[len("agent-dbctl"):]
+				}
+			}
+			for i, o := range res.Orphans {
+				if strings.HasPrefix(o.Command, "agent-dbctl ") {
+					res.Orphans[i].Command = ic.BinPath + o.Command[len("agent-dbctl"):]
+				}
+			}
 			if ic.JSONMode {
-				setExitCode(ic.WriteSuccess(map[string]any{"deleted": true, "target": args[0]}, types.Meta{}))
+				setExitCode(ic.WriteSuccess(res, types.Meta{}))
 				return nil
 			}
-			_, _ = fmt.Fprintf(ic.Stdout, "Deleted target %s\n", args[0])
+			_, _ = fmt.Fprintf(ic.Stdout, "Deleted target %s\n", firstNonEmpty(res.Target, args[0]))
+			if len(res.Orphans) > 0 {
+				_, _ = fmt.Fprintln(ic.Stdout, "Orphaned resources remaining:")
+				for _, o := range res.Orphans {
+					_, _ = fmt.Fprintf(ic.Stdout, "  - %s %s -> cleanup: %s\n", o.Kind, o.Name, o.Command)
+				}
+			}
 			return nil
 		},
 	}
@@ -634,7 +650,35 @@ func registerCatalogCommands(
 	envSetCmd.Flags().StringArrayVar(&envSet.labels, "label", nil, "Localized label as key=value (repeatable)")
 	envSetCmd.Flags().BoolVar(&envSet.dryRun, "dry-run", false, "Preview change without saving")
 	annotateCommand(envSetCmd, RiskWriteLocal, "agent-dbctl env set staging --safety-tier guarded --json")
-	envCmd.AddCommand(envListCmd, envSetCmd)
+
+	var envDelYes bool
+	envDeleteCmd := &cobra.Command{
+		Use:   "delete <code>",
+		Short: "Delete an unused environment tier",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ic := ioCtx()
+			client, err := ensureDaemon(ic, version, commit)
+			if err != nil {
+				setExitCode(writeClientInitErr(ic, err))
+				return nil
+			}
+			var out map[string]bool
+			if err := client.DoJSON(cmd.Context(), http.MethodDelete, "/rpc/v1/environments/"+url.PathEscape(args[0]), nil, &out); err != nil {
+				setExitCode(writeRPCErr(ic, err))
+				return nil
+			}
+			if ic.JSONMode {
+				setExitCode(ic.WriteSuccess(map[string]any{"deleted": true, "env": args[0]}, types.Meta{}))
+				return nil
+			}
+			_, _ = fmt.Fprintf(ic.Stdout, "Deleted environment %s\n", args[0])
+			return nil
+		},
+	}
+	envDeleteCmd.Flags().BoolVarP(&envDelYes, "yes", "y", false, "Confirm deletion non-interactively")
+	annotateCommand(envDeleteCmd, RiskWriteLocal, "agent-dbctl env delete uat --yes --json")
+	envCmd.AddCommand(envListCmd, envSetCmd, envDeleteCmd)
 
 	// ---- network ----
 	netCmd := &cobra.Command{Use: "network", Short: "Manage network/tunnel profiles (direct, ssh_tunnel, socks5, http_proxy)"}

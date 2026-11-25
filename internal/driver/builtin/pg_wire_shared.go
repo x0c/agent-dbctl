@@ -489,6 +489,10 @@ func (c *pgWireConn) Close() error {
 
 // buildPGWireURI constructs a libpq-compatible connection URI safely escaping credentials and query parameters.
 func buildPGWireURI(scheme string, cfg driver.ConnectionConfig, defaultPort int, defaultDB string) string {
+	return buildPGWireURIWithSSL(scheme, cfg, defaultPort, defaultDB, mapLibpqSSLMode(cfg.TLSMode))
+}
+
+func buildPGWireURIWithSSL(scheme string, cfg driver.ConnectionConfig, defaultPort int, defaultDB, sslMode string) string {
 	port := cfg.Port
 	if port <= 0 {
 		port = defaultPort
@@ -514,7 +518,7 @@ func buildPGWireURI(scheme string, cfg driver.ConnectionConfig, defaultPort int,
 	q := url.Values{}
 	q.Set("connect_timeout", "10")
 	q.Set("application_name", "agent-dbctl")
-	q.Set("sslmode", mapLibpqSSLMode(cfg.TLSMode))
+	q.Set("sslmode", sslMode)
 
 	for k, v := range cfg.Params {
 		kl := strings.ToLower(strings.TrimSpace(k))

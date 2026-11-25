@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	sqldriver "database/sql/driver"
 	"net"
+	"strings"
 	"time"
 
 	"gitea.com/kingbase/gokb"
@@ -84,12 +85,30 @@ func (c *kingbaseConnector) Driver() sqldriver.Driver {
 	return &gokb.Driver{}
 }
 
-func buildKingbaseDSN(cfg driver.ConnectionConfig) string {
-	return buildPGWireURI("kingbase", cfg, kingbaseDialectConfig.DefaultPort, kingbaseDialectConfig.DefaultDatabase)
+func mapKingbaseSSLMode(tlsMode string, hasTLSConfig bool) string {
+	switch strings.ToLower(strings.TrimSpace(tlsMode)) {
+	case "require":
+		return "require"
+	case "verify-ca":
+		return "verify-ca"
+	case "verify-full":
+		return "verify-full"
+	case "disable":
+		return "disable"
+	default:
+		// gokb rejects sslmode=prefer; default to disable unless TLSConfig is supplied.
+		if hasTLSConfig {
+			return "require"
+		}
+		return "disable"
+	}
 }
 
-func (d *KingbaseDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (driver.Conn, error) {
-	dsn := buildKingbaseDSN(cfg)
+func buildKingbaseDSN(cfg driver.ConnectionConfig) string {
+	return buildPGWireURIWithSSL("kingbase", cfg, kingbaseDialectConfig.DefaultPort, kingbaseDialectConfig.DefaultDatabase, mapKingbaseSSLMode(cfg.TLSMode, cfg.TLSConfig != nil))
+}
+
+func openKingbaseSQLDB(ctx context.Context, cfg driver.ConnectionConfig, dsn string) (*sql.DB, error) {
 	var baseConn sqldriver.Connector = &kingbaseConnector{dsn: dsn}
 	if cfg.DialContext != nil {
 		baseConn = &kingbaseConnector{
@@ -115,6 +134,33 @@ func (d *KingbaseDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) 
 	db.SetMaxIdleConns(1)
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func isKingbaseSSLRequiredErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "ssl") || strings.Contains(lower, "tls") || strings.Contains(lower, "pg_hba")
+}
+
+func (d *KingbaseDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (driver.Conn, error) {
+	dsn := buildKingbaseDSN(cfg)
+	db, err := openKingbaseSQLDB(ctx, cfg, dsn)
+	if err != nil {
+		mode := strings.ToLower(strings.TrimSpace(cfg.TLSMode))
+		if (mode == "" || mode == "prefer") && cfg.TLSConfig == nil && isKingbaseSSLRequiredErr(err) {
+			reqDSN := buildPGWireURIWithSSL("kingbase", cfg, kingbaseDialectConfig.DefaultPort, kingbaseDialectConfig.DefaultDatabase, "require")
+			if reqDB, reqErr := openKingbaseSQLDB(ctx, cfg, reqDSN); reqErr == nil {
+				db = reqDB
+				err = nil
+			}
+		}
+	}
+	if err != nil {
 		return nil, err
 	}
 	return newPGWireConn(db, cfg, kingbaseDialectConfig), nil

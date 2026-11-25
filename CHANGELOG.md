@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.4.1
+
+### English
+
+- **KingbaseES default TLS compatibility (`gokb`)**: Mapped unset/`prefer` TLS modes on `kingbase` away from unsupported `sslmode=prefer` to `sslmode=disable` (with automatic fallback retry to `sslmode=require` when the server mandates TLS and no custom `TLSConfig` is configured), preserving explicit `disable`/`require`/`verify-ca`/`verify-full`.
+- **Actionable connectivity probe errors**: Guaranteed non-empty `PingResult.Error`, included per-target driver errors directly in `db test --json` `error.message` (with `db show <ref>` recovery hints), added next steps on failed `db add --test` probes, and surfaced unreachable reasons inline in the Web Console Databases table.
+- **`env delete` symmetry & orphan cleanup hints on `db delete`**: Added `agent-dbctl env delete <code>` (`DELETE /rpc/v1/environments/{code...}` and `DELETE /api/v1/environments/{code...}`, supporting slash-containing codes and Web UI deletion with target-reference guards), and updated `db delete` to report newly orphaned instances, credentials, and unused custom environments with ready-to-run cleanup commands.
+
+### 简体中文
+
+- **修复人大金仓 KingbaseES 默认 TLS 模式兼容性（`gokb`）**：当 `kingbase` 未指定 `tls-mode` 或为 `prefer` 时，不再传入驱动拒绝的 `sslmode=prefer`，改为默认 `sslmode=disable`（若未配自定义证书且服务端强制要求 SSL 则自动回退重连 `sslmode=require`），同时保留显式 `disable`/`require`/`verify-ca`/`verify-full`。
+- **连通性探测错误直接透出**：确保探测失败时 `PingResult.Error` 永不为空；`db test --json` 在全部不可达时直接在 `error.message` 透出各目标的真实驱动报错（并附 `db show <ref>` 恢复命令）；`db add --test` 失败时补充排查建议命令；Web 控制台列表直接内联显示不可达原因摘要。
+- **补齐 `env delete` 与 `db delete` 孤儿资源提示**：新增 `agent-dbctl env delete <code>`（以及支持斜杠环境名的 `DELETE /rpc/v1/environments/{code...}` / `/api/v1/environments/{code...}` 与 Web 控制台删除操作，受目标引用冲突保护），并在 `db delete` 删除后自动识别新产生的孤儿实例、凭据与自定义环境，直接返回清理命令列表。
+
 ## v0.4.0
 
 ### English

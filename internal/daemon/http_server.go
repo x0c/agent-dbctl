@@ -157,6 +157,13 @@ func NewWebHandler(svc *Service) http.Handler {
 		}
 		writeJSONResp(w, http.StatusOK, saved)
 	})
+	mux.HandleFunc("DELETE /api/v1/environments/{code...}", func(w http.ResponseWriter, r *http.Request) {
+		if err := svc.AdminDeleteEnvironment(r.Context(), "web-admin", r.PathValue("code")); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
+	})
 
 	// Network Profiles
 	mux.HandleFunc("GET /api/v1/network-profiles", func(w http.ResponseWriter, r *http.Request) {

@@ -752,4 +752,47 @@ INSERT INTO systems(id, slug, name, created_at_utc, updated_at_utc) VALUES ('sys
 	if planRes.Summary.Policies.Unchanged == 0 {
 		t.Fatalf("expected exported scan_read_mode policy to match unchanged in PlanTopologyImport, got %+v", planRes.Summary.Policies)
 	}
+
+	// DeleteEnvironment rejects in-use environments and cleans up unused custom environments (including slash codes).
+	customEnv, err := st.UpsertEnvironment(ctx, "admin", types.Environment{Code: "shared/base-legacy", SafetyTier: types.SafetyTierGuarded})
+	if err != nil {
+		t.Fatalf("UpsertEnvironment shared/base-legacy: %v", err)
+	}
+	if _, err := st.UpsertTarget(ctx, "admin", types.Target{
+		Ref:             "legacy/shared/app",
+		OwnerSystemID:   "sys_legacy",
+		EnvironmentCode: customEnv.Code,
+		InstanceID:      instIDForTest(t, ctx, st),
+		DatabaseName:    "app",
+		Status:          types.TargetActive,
+	}); err != nil {
+		t.Fatalf("UpsertTarget on custom env: %v", err)
+	}
+	if err := st.DeleteEnvironment(ctx, "admin", customEnv.Code); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("expected ErrConflict deleting in-use env, got %v", err)
+	}
+	tgtToDel, err := st.ResolveTargetRecord(ctx, "legacy/shared/app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteTarget(ctx, "admin", tgtToDel.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteEnvironment(ctx, "admin", customEnv.Code); err != nil {
+		t.Fatalf("DeleteEnvironment after target removal failed: %v", err)
+	}
+}
+
+func instIDForTest(t *testing.T, ctx context.Context, st *store.Store) string {
+	t.Helper()
+	inst, err := st.UpsertInstance(ctx, "admin", types.Instance{
+		Name:   "test-legacy-sqlite",
+		Engine: "sqlite",
+		Host:   filepath.Join(t.TempDir(), "legacy-env.db"),
+		Role:   types.RoleStandalone,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return inst.ID
 }

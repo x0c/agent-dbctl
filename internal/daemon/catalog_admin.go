@@ -89,6 +89,23 @@ type DBAddResponse struct {
 	NextCommands   []string                  `json:"next_commands,omitempty"`
 }
 
+// OrphanResource identifies an unreferenced instance, credential, or custom environment left after deletion.
+type OrphanResource struct {
+	Kind    string `json:"kind"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Command string `json:"command"`
+}
+
+// TargetDeleteResult summarizes a deleted target and any newly orphaned catalog assets.
+type TargetDeleteResult struct {
+	Deleted      bool             `json:"deleted"`
+	Target       string           `json:"target"`
+	Orphans      []OrphanResource `json:"orphans,omitempty"`
+	Hint         string           `json:"hint,omitempty"`
+	NextCommands []string         `json:"next_commands,omitempty"`
+}
+
 func defaultActor(actor string) string {
 	if strings.TrimSpace(actor) == "" {
 		return "agent-cli"
@@ -315,6 +332,19 @@ func (s *Service) AdminUpsertEnvironment(ctx context.Context, actor string, env 
 		Action: action,
 		Item:   saved,
 	}, nil
+}
+
+// AdminDeleteEnvironment removes an unreferenced Environment tier by code.
+func (s *Service) AdminDeleteEnvironment(ctx context.Context, actor, code string) error {
+	cur, err := s.store.ResolveEnvironment(ctx, code)
+	if err != nil {
+		return err
+	}
+	if err := s.store.DeleteEnvironment(ctx, defaultActor(actor), cur.Code); err != nil {
+		return err
+	}
+	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "environment", "code": cur.Code}})
+	return nil
 }
 
 // AdminUpsertNetworkProfile creates or updates a NetworkProfile idempotently with optional dry-run.
@@ -847,17 +877,126 @@ func (s *Service) AdminUpsertTarget(ctx context.Context, actor string, tgt types
 	}, nil
 }
 
-// AdminDeleteTarget removes a Target by ID, ref, or alias.
-func (s *Service) AdminDeleteTarget(ctx context.Context, actor, idOrRefOrAlias string) error {
+// AdminDeleteTarget removes a Target by ID, ref, or alias and reports any newly orphaned instances, credentials, or custom environments.
+func (s *Service) AdminDeleteTarget(ctx context.Context, actor, idOrRefOrAlias string) (TargetDeleteResult, error) {
 	cur, err := s.store.ResolveTargetRecord(ctx, idOrRefOrAlias)
 	if err != nil {
-		return err
+		return TargetDeleteResult{}, err
 	}
 	if err := s.store.DeleteTarget(ctx, defaultActor(actor), cur.ID); err != nil {
-		return err
+		return TargetDeleteResult{}, err
 	}
 	s.broadcast(Event{Type: "catalog_updated", Data: map[string]string{"kind": "target", "id": cur.ID}})
-	return nil
+
+	orphans := s.findOrphansAfterTargetDelete(ctx, cur)
+	res := TargetDeleteResult{
+		Deleted: true,
+		Target:  firstNonEmpty(cur.Ref, cur.ID),
+		Orphans: orphans,
+	}
+	if len(orphans) > 0 {
+		res.Hint = "Target deleted; unreferenced instance, credential, or custom environment assets remain. Run the suggested commands if you want to clean them up."
+		for _, o := range orphans {
+			res.NextCommands = append(res.NextCommands, o.Command)
+		}
+	}
+	return res, nil
+}
+
+func (s *Service) findOrphansAfterTargetDelete(ctx context.Context, deleted types.Target) []OrphanResource {
+	targets, err := s.store.ListTargets(ctx)
+	if err != nil {
+		return nil
+	}
+	instances, _ := s.store.ListInstances(ctx)
+	nets, _ := s.store.ListNetworkProfiles(ctx)
+
+	var orphans []OrphanResource
+	if deleted.InstanceID != "" {
+		inUse := false
+		for _, t := range targets {
+			if t.InstanceID == deleted.InstanceID {
+				inUse = true
+				break
+			}
+		}
+		if !inUse {
+			for _, inst := range instances {
+				if inst.PrimaryInstanceID == deleted.InstanceID {
+					inUse = true
+					break
+				}
+			}
+		}
+		if !inUse {
+			for _, inst := range instances {
+				if inst.ID == deleted.InstanceID {
+					orphans = append(orphans, OrphanResource{
+						Kind:    "instance",
+						ID:      inst.ID,
+						Name:    inst.Name,
+						Command: fmt.Sprintf("agent-dbctl instance delete %s --yes --json", inst.Name),
+					})
+					break
+				}
+			}
+		}
+	}
+
+	seenCred := map[string]bool{}
+	for _, cid := range []string{deleted.ROCredentialID, deleted.RWCredentialID} {
+		if cid == "" || seenCred[cid] {
+			continue
+		}
+		seenCred[cid] = true
+		inUse := false
+		for _, t := range targets {
+			if t.ROCredentialID == cid || t.RWCredentialID == cid {
+				inUse = true
+				break
+			}
+		}
+		if !inUse {
+			for _, np := range nets {
+				if np.BastionCredentialID == cid {
+					inUse = true
+					break
+				}
+			}
+		}
+		if !inUse {
+			if cp, cErr := s.store.ResolveCredentialProfile(ctx, cid); cErr == nil {
+				orphans = append(orphans, OrphanResource{
+					Kind:    "credential",
+					ID:      cp.ID,
+					Name:    cp.Name,
+					Command: fmt.Sprintf("agent-dbctl cred delete %s --yes --json", cp.Name),
+				})
+			}
+		}
+	}
+
+	envCode := strings.TrimSpace(deleted.EnvironmentCode)
+	if envCode != "" && envCode != "dev" && envCode != "staging" && envCode != "prod" {
+		inUse := false
+		for _, t := range targets {
+			if strings.EqualFold(t.EnvironmentCode, envCode) {
+				inUse = true
+				break
+			}
+		}
+		if !inUse {
+			if envObj, eErr := s.store.ResolveEnvironment(ctx, envCode); eErr == nil {
+				orphans = append(orphans, OrphanResource{
+					Kind:    "environment",
+					ID:      envObj.Code,
+					Name:    envObj.Code,
+					Command: fmt.Sprintf("agent-dbctl env delete %s --yes --json", envObj.Code),
+				})
+			}
+		}
+	}
+	return orphans
 }
 
 // AdminAddDatabase performs declarative one-shot onboarding (System + Credential + Instance + Target).
@@ -1410,6 +1549,10 @@ func (s *Service) AdminAddDatabase(ctx context.Context, actor string, req DBAddR
 		resp.Ping = &ping
 		if !ping.Reachable {
 			resp.Warnings = append(resp.Warnings, fmt.Sprintf("Target saved, but connectivity probe failed: %s", ping.Error))
+			resp.NextCommands = append(resp.NextCommands,
+				fmt.Sprintf("agent-dbctl db show %s --json", resp.Target.Ref),
+				fmt.Sprintf("agent-dbctl db test %s --json", resp.Target.Ref),
+			)
 		}
 	}
 

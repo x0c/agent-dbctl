@@ -347,6 +347,13 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		}
 		writeJSONResp(w, http.StatusOK, res)
 	})
+	mux.HandleFunc("DELETE /rpc/v1/environments/{code...}", func(w http.ResponseWriter, r *http.Request) {
+		if err := svc.AdminDeleteEnvironment(r.Context(), "agent-cli", r.PathValue("code")); err != nil {
+			writeRPCStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
+	})
 
 	// Network Profiles
 	mux.HandleFunc("GET /rpc/v1/network-profiles", func(w http.ResponseWriter, r *http.Request) {
@@ -530,11 +537,12 @@ func NewRPCHandler(svc *Service, shutdownFn func()) http.Handler {
 		writeJSONResp(w, http.StatusOK, res)
 	})
 	mux.HandleFunc("DELETE /rpc/v1/targets/{id...}", func(w http.ResponseWriter, r *http.Request) {
-		if err := svc.AdminDeleteTarget(r.Context(), "agent-cli", r.PathValue("id")); err != nil {
+		res, err := svc.AdminDeleteTarget(r.Context(), "agent-cli", r.PathValue("id"))
+		if err != nil {
 			writeRPCStoreErr(w, err)
 			return
 		}
-		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
+		writeJSONResp(w, http.StatusOK, res)
 	})
 
 	// Topology Export / Apply

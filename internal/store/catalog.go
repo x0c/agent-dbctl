@@ -238,6 +238,32 @@ func (s *Store) upsertEnvironmentTx(ctx context.Context, tx *sql.Tx, actor strin
 	return env, nil
 }
 
+// DeleteEnvironment removes an unused environment tier, cleans up unreferenced env-scoped rules, and writes an audit entry.
+func (s *Store) DeleteEnvironment(ctx context.Context, actor, code string) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var tgtCount int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM targets WHERE environment_code = ?`, code).Scan(&tgtCount); err != nil {
+			return err
+		}
+		if tgtCount > 0 {
+			return fmt.Errorf("%w: cannot delete environment %q in use (targets=%d)", ErrConflict, code, tgtCount)
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM environments WHERE code = ?`, code)
+		if err != nil {
+			return fmt.Errorf("%w: cannot delete environment %q in use: %v", ErrConflict, code, err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return ErrNotFound
+		}
+		now := nowUTC()
+		if err := s.cleanupScopedPoliciesAndRulesTx(ctx, tx, actor, "env", code, code, now); err != nil {
+			return err
+		}
+		return s.appendAuditTx(ctx, tx, actor, "environment.delete", code, "", map[string]any{"code": code}, now)
+	})
+}
+
 // ListNetworkProfiles returns all reusable network profiles.
 func (s *Store) ListNetworkProfiles(ctx context.Context) ([]types.NetworkProfile, error) {
 	rows, err := s.db.QueryContext(ctx, `
