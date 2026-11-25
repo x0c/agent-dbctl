@@ -190,3 +190,68 @@ func TestStrictBooleanMonotonicityAcrossScopes(t *testing.T) {
 		t.Fatalf("expected tightened source target:orders/dev/main, got %q", effDev.Sources["require_approval_on_write"])
 	}
 }
+
+func TestLinkedSystemsMonotonicityAndReadOnlyTarget(t *testing.T) {
+	global := types.GlobalSecurityConfig{
+		ExecTimeoutSec:          15,
+		ApprovalTimeoutSec:      120,
+		MaxRows:                 200,
+		MaxBytes:                262144,
+		ExplainMaxRows:          1000,
+		DefaultApprovalProvider: "local-web",
+	}
+	devEnv := &types.Environment{Code: "dev", SafetyTier: types.SafetyTierYOLO}
+	ownerSys := &types.System{ID: "sys_owner", Slug: "analytics"}
+	linkedStrict := types.System{ID: "sys_linked", Slug: "payments"}
+	tgt := types.Target{
+		ID:              "tgt_shared",
+		Ref:             "analytics/dev/shared",
+		OwnerSystemID:   ownerSys.ID,
+		LinkedSystemIDs: []string{linkedStrict.ID},
+		EnvironmentCode: "dev",
+		ROCredentialID:  "cred_ro",
+		Status:          types.TargetActive,
+	}
+
+	policies := []types.PolicyRuleSet{
+		{
+			ID:                     "pol_linked",
+			Name:                   "payments-tight",
+			ScopeType:              "system",
+			ScopeID:                "payments", // slug matching
+			MaxRows:                intPtr(25),
+			RequireApprovalOnWrite: boolPtr(true),
+		},
+	}
+	eff := policy.ResolveEffectivePolicyWithSystems(global, devEnv, ownerSys, []types.System{linkedStrict}, tgt, policies)
+	if eff.MaxRows != 25 || !eff.RequireApprovalOnWrite || eff.Sources["max_rows"] != "system:payments" {
+		t.Fatalf("expected linked system to tighten policy monotonically, got %+v", eff)
+	}
+
+	rules := []types.RiskPatternRule{
+		{
+			ID:        "pat_linked",
+			Name:      "payments-audit-tbl",
+			ScopeType: "system",
+			ScopeID:   linkedStrict.ID,
+			Enabled:   true,
+			Action:    types.PatternActionRequireApproval,
+			Condition: types.PatternCondition{Type: types.MatcherTableRef, Values: []string{"ledger"}},
+		},
+	}
+	eff.PatternRules = policy.ResolveEffectivePatternRulesWithSystems(devEnv, ownerSys, []types.System{linkedStrict}, tgt, "sqlite", types.FamilySQL, rules)
+	if len(eff.PatternRules) != 1 || eff.PatternRules[0].ScopeLabel != "system:payments" {
+		t.Fatalf("expected linked system pattern rule included, got %+v", eff.PatternRules)
+	}
+
+	// Read-only target (ROCredentialID set, RWCredentialID empty) must deny mutating operations.
+	evWrite := policy.EvaluateQuery(tgt, eff, types.Classification{RiskLevel: types.RiskWrite, IsReadOnly: false, StatementCount: 1}, nil, "DELETE FROM ledger")
+	if evWrite.Decision != types.DecisionDeny || evWrite.DenyCode != types.ErrCodePolicyDenied {
+		t.Fatalf("expected read-only target write denial, got %+v", evWrite)
+	}
+	// Safe read matching linked system pattern rule escalates to require_approval even in dev YOLO.
+	evRead := policy.EvaluateQuery(tgt, eff, types.Classification{RiskLevel: types.RiskSafeRead, IsReadOnly: true, StatementCount: 1}, nil, "SELECT * FROM ledger LIMIT 5")
+	if evRead.Decision != types.DecisionRequireApproval || len(evRead.MatchedRules) != 1 {
+		t.Fatalf("expected linked system pattern escalation, got %+v", evRead)
+	}
+}

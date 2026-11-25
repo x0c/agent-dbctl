@@ -112,18 +112,20 @@ type CredentialProfile struct {
 
 // Instance represents a physical or clustered database endpoint.
 type Instance struct {
-	ID                string            `json:"id" yaml:"id"`
-	Name              string            `json:"name" yaml:"name"`
-	Engine            string            `json:"engine" yaml:"engine"`
-	Host              string            `json:"host" yaml:"host"`
-	Port              int               `json:"port" yaml:"port"`
-	Role              InstanceRole      `json:"role" yaml:"role"`
-	PrimaryInstanceID string            `json:"primary_instance_id,omitempty" yaml:"primary_instance_id,omitempty"`
-	NetworkProfileID  string            `json:"network_profile_id,omitempty" yaml:"network_profile_id,omitempty"`
-	TLSMode           string            `json:"tls_mode,omitempty" yaml:"tls_mode,omitempty"`
-	Params            map[string]string `json:"params,omitempty" yaml:"params,omitempty"`
-	CreatedAtUTC      string            `json:"created_at_utc" yaml:"created_at_utc,omitempty"`
-	UpdatedAtUTC      string            `json:"updated_at_utc" yaml:"updated_at_utc,omitempty"`
+	ID                     string              `json:"id" yaml:"id"`
+	Name                   string              `json:"name" yaml:"name"`
+	Engine                 string              `json:"engine" yaml:"engine"`
+	Host                   string              `json:"host" yaml:"host"`
+	Port                   int                 `json:"port" yaml:"port"`
+	Role                   InstanceRole        `json:"role" yaml:"role"`
+	PrimaryInstanceID      string              `json:"primary_instance_id,omitempty" yaml:"primary_instance_id,omitempty"`
+	NetworkProfileID       string              `json:"network_profile_id,omitempty" yaml:"network_profile_id,omitempty"`
+	TLSMode                string              `json:"tls_mode,omitempty" yaml:"tls_mode,omitempty"`
+	Params                 map[string]string   `json:"params,omitempty" yaml:"params,omitempty"`
+	Capabilities           *ServerCapabilities `json:"capabilities,omitempty" yaml:"-"`
+	CapabilitiesDetectedAt string              `json:"capabilities_detected_at_utc,omitempty" yaml:"-"`
+	CreatedAtUTC           string              `json:"created_at_utc" yaml:"created_at_utc,omitempty"`
+	UpdatedAtUTC           string              `json:"updated_at_utc" yaml:"updated_at_utc,omitempty"`
 }
 
 // Target represents a logical addressable database/keyspace bound to a system and environment.
@@ -161,9 +163,10 @@ type TargetDetail struct {
 
 // TopologyBundle is a secret-free export/import representation of enterprise catalog topology.
 type TopologyBundle struct {
-	SchemaVersion      int                 `json:"schema_version" yaml:"schema_version"`
-	ExportedAtUTC      string              `json:"exported_at_utc" yaml:"exported_at_utc"`
-	Environments       []Environment       `json:"environments" yaml:"environments"`
+	SchemaVersion      int                   `json:"schema_version" yaml:"schema_version"`
+	ExportedAtUTC      string                `json:"exported_at_utc" yaml:"exported_at_utc"`
+	GlobalSecurity     *GlobalSecurityConfig `json:"global_security,omitempty" yaml:"global_security,omitempty"`
+	Environments       []Environment         `json:"environments" yaml:"environments"`
 	Systems            []System            `json:"systems" yaml:"systems"`
 	NetworkProfiles    []NetworkProfile    `json:"network_profiles" yaml:"network_profiles"`
 	CredentialProfiles []CredentialProfile `json:"credential_profiles" yaml:"credential_profiles"`

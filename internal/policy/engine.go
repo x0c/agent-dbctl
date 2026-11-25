@@ -16,6 +16,18 @@ func ResolveEffectivePolicy(
 	tgt types.Target,
 	policies []types.PolicyRuleSet,
 ) types.EffectivePolicy {
+	return ResolveEffectivePolicyWithSystems(global, env, sys, nil, tgt, policies)
+}
+
+// ResolveEffectivePolicyWithSystems computes the 4-level monotonic policy including linked systems.
+func ResolveEffectivePolicyWithSystems(
+	global types.GlobalSecurityConfig,
+	env *types.Environment,
+	ownerSys *types.System,
+	linkedSystems []types.System,
+	tgt types.Target,
+	policies []types.PolicyRuleSet,
+) types.EffectivePolicy {
 	tier := types.SafetyTierGuarded
 	envLabel := "default"
 	if env != nil {
@@ -138,38 +150,65 @@ func ResolveEffectivePolicy(
 		}
 	}
 
+	appliedIDs := make(map[string]bool, len(policies))
+	applyOnce := func(p types.PolicyRuleSet, src string) {
+		if p.ID != "" && appliedIDs[p.ID] {
+			return
+		}
+		if p.ID != "" {
+			appliedIDs[p.ID] = true
+		}
+		apply(p, src)
+	}
+
 	if env != nil {
 		if env.DefaultPolicyID != "" {
 			if p, ok := byID[env.DefaultPolicyID]; ok {
-				apply(p, "env:"+env.Code)
+				applyOnce(p, "env:"+env.Code)
 			}
 		}
 		for _, p := range policies {
-			if p.ScopeType == "env" && p.ScopeID == env.Code && p.ID != env.DefaultPolicyID {
-				apply(p, "env:"+env.Code)
+			if p.ScopeType == "env" && strings.EqualFold(p.ScopeID, env.Code) {
+				applyOnce(p, "env:"+env.Code)
 			}
 		}
 	}
-	if sys != nil {
-		if sys.DefaultPolicyID != "" {
-			if p, ok := byID[sys.DefaultPolicyID]; ok {
-				apply(p, "system:"+sys.Slug)
+
+	applySystem := func(s types.System) {
+		src := "system:" + s.Slug
+		if s.Slug == "" {
+			src = "system:" + s.ID
+		}
+		if s.DefaultPolicyID != "" {
+			if p, ok := byID[s.DefaultPolicyID]; ok {
+				applyOnce(p, src)
 			}
 		}
 		for _, p := range policies {
-			if p.ScopeType == "system" && p.ScopeID == sys.ID && p.ID != sys.DefaultPolicyID {
-				apply(p, "system:"+sys.Slug)
+			if p.ScopeType == "system" && (p.ScopeID == s.ID || (s.Slug != "" && strings.EqualFold(p.ScopeID, s.Slug))) {
+				applyOnce(p, src)
 			}
 		}
+	}
+	if ownerSys != nil {
+		applySystem(*ownerSys)
+	}
+	for _, ls := range linkedSystems {
+		applySystem(ls)
+	}
+
+	tgtSrc := "target:" + tgt.Ref
+	if tgt.Ref == "" {
+		tgtSrc = "target:" + tgt.ID
 	}
 	if tgt.PolicyOverrideID != "" {
 		if p, ok := byID[tgt.PolicyOverrideID]; ok {
-			apply(p, "target:"+tgt.Ref)
+			applyOnce(p, tgtSrc)
 		}
 	}
 	for _, p := range policies {
-		if p.ScopeType == "target" && p.ScopeID == tgt.ID && p.ID != tgt.PolicyOverrideID {
-			apply(p, "target:"+tgt.Ref)
+		if p.ScopeType == "target" && (p.ScopeID == tgt.ID || (tgt.Ref != "" && strings.EqualFold(p.ScopeID, tgt.Ref))) {
+			applyOnce(p, tgtSrc)
 		}
 	}
 
@@ -227,6 +266,14 @@ func EvaluateQuery(
 		eval.DenyCode = types.ErrCodeProdFrozen
 		eval.DenyMessage = "Global production read-only freeze is enabled; mutating or unknown production operations are blocked."
 		eval.TriggerReasons = append(eval.TriggerReasons, "prod_read_only_freeze")
+		return eval
+	}
+
+	if !cls.IsReadOnly && tgt.RWCredentialID == "" && tgt.ROCredentialID != "" {
+		eval.Decision = types.DecisionDeny
+		eval.DenyCode = types.ErrCodePolicyDenied
+		eval.DenyMessage = fmt.Sprintf("Target %q is configured as read-only (only ro_credential_id is set); mutating or unknown operations require a read-write credential.", tgt.Ref)
+		eval.TriggerReasons = append(eval.TriggerReasons, "read_only_target")
 		return eval
 	}
 

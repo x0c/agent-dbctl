@@ -201,8 +201,32 @@ func ResolveEffectivePatternRules(
 	family types.EngineFamily,
 	allRules []types.RiskPatternRule,
 ) []types.RiskPatternRule {
+	return ResolveEffectivePatternRulesWithSystems(env, sys, nil, tgt, engine, family, allRules)
+}
+
+// ResolveEffectivePatternRulesWithSystems resolves pattern rules across global -> env -> owner/linked systems -> target.
+func ResolveEffectivePatternRulesWithSystems(
+	env *types.Environment,
+	sys *types.System,
+	linkedSystems []types.System,
+	tgt types.Target,
+	engine string,
+	family types.EngineFamily,
+	allRules []types.RiskPatternRule,
+) []types.RiskPatternRule {
 	if len(allRules) == 0 {
 		return nil
+	}
+	matchSystem := func(scopeID string) (types.System, bool) {
+		if sys != nil && (scopeID == sys.ID || (sys.Slug != "" && strings.EqualFold(scopeID, sys.Slug))) {
+			return *sys, true
+		}
+		for _, ls := range linkedSystems {
+			if scopeID == ls.ID || (ls.Slug != "" && strings.EqualFold(scopeID, ls.Slug)) {
+				return ls, true
+			}
+		}
+		return types.System{}, false
 	}
 	scopeRank := func(r types.RiskPatternRule) int {
 		switch r.ScopeType {
@@ -213,11 +237,11 @@ func ResolveEffectivePatternRules(
 				return 2
 			}
 		case "system":
-			if sys != nil && (r.ScopeID == sys.ID || strings.EqualFold(r.ScopeID, sys.Slug)) {
+			if _, ok := matchSystem(r.ScopeID); ok {
 				return 3
 			}
 		case "target":
-			if r.ScopeID == tgt.ID || strings.EqualFold(r.ScopeID, tgt.Ref) {
+			if r.ScopeID == tgt.ID || (tgt.Ref != "" && strings.EqualFold(r.ScopeID, tgt.Ref)) {
 				return 4
 			}
 		}
@@ -234,8 +258,8 @@ func ResolveEffectivePatternRules(
 			}
 			return "env:" + r.ScopeID
 		case "system":
-			if sys != nil && sys.Slug != "" {
-				return "system:" + sys.Slug
+			if matchedSys, ok := matchSystem(r.ScopeID); ok && matchedSys.Slug != "" {
+				return "system:" + matchedSys.Slug
 			}
 			return "system:" + r.ScopeID
 		case "target":

@@ -144,14 +144,14 @@ func (s *Service) BuildTargetDetails(ctx context.Context, workspaceCWD string) (
 				d.RWCredential = &cpCopy
 			}
 		}
-		d.EffectivePolicy = policy.ResolveEffectivePolicy(global, envPtr, ownerPtr, t, policies)
+		d.EffectivePolicy = policy.ResolveEffectivePolicyWithSystems(global, envPtr, ownerPtr, d.LinkedSystems, t, policies)
 		if d.Instance != nil {
 			eng := d.Instance.Engine
 			fam := classify.EngineFamily(eng)
 			if drv, ok := s.drivers.Get(eng); ok {
 				fam = drv.Metadata().Family
 			}
-			d.EffectivePolicy.PatternRules = policy.ResolveEffectivePatternRules(envPtr, ownerPtr, t, eng, fam, patternRules)
+			d.EffectivePolicy.PatternRules = policy.ResolveEffectivePatternRulesWithSystems(envPtr, ownerPtr, d.LinkedSystems, t, eng, fam, patternRules)
 		}
 		out = append(out, d)
 	}

@@ -61,7 +61,7 @@ export function PoliciesTab({
     name: '',
     scope_type: 'env',
     scope_id: 'prod',
-    approval_provider: 'local-web',
+    approval_provider: '',
   })
 
   const load = async () => {
@@ -196,7 +196,7 @@ export function PoliciesTab({
                   name: '',
                   scope_type: 'env',
                   scope_id: envs[0]?.code ?? 'prod',
-                  approval_provider: 'local-web',
+                  approval_provider: '',
                 })
                 setDialogOpen(true)
               }}
@@ -381,6 +381,20 @@ export function PoliciesTab({
             />
           </label>
         </div>
+        <FormField label="Approval Provider Override">
+          <Select
+            value={polForm.approval_provider || '__inherit'}
+            onValueChange={(v) => setPolForm((p) => ({ ...p, approval_provider: v === '__inherit' ? '' : v }))}
+          >
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__inherit">Inherit parent / global</SelectItem>
+              {catalog.approval_providers.map((ap) => (
+                <SelectItem key={ap.code} value={ap.code}>{ap.code}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </FormField>
       </FormDialog>
     </div>
   )

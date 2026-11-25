@@ -92,6 +92,24 @@ export interface CredentialProfileRecord {
   secret_value?: string
 }
 
+export interface ServerCapabilities {
+  engine: string
+  dialect: string
+  server_version?: string
+  major_version?: number
+  minor_version?: number
+  explain_format?: string
+  supports_explain: boolean
+  supports_explain_json: boolean
+  supports_read_only_session: boolean
+  supports_cancel_query: boolean
+  supports_returning: boolean
+  supports_resp3?: boolean
+  cluster_mode?: boolean
+  supports_authorized_db_list?: boolean
+  detected_at_utc?: string
+}
+
 export interface InstanceRecord {
   id: string
   name: string
@@ -103,6 +121,8 @@ export interface InstanceRecord {
   network_profile_id?: string
   tls_mode?: string
   params?: Record<string, string>
+  capabilities?: ServerCapabilities
+  capabilities_detected_at_utc?: string
 }
 
 export interface EffectivePolicy {
@@ -411,9 +431,11 @@ export interface PingResult {
   target_ref: string
   instance_id: string
   engine: string
+  dialect?: string
   role: string
   reachable: boolean
   server_version?: string
+  capabilities?: ServerCapabilities
   latency_ms: number
   error?: string
 }

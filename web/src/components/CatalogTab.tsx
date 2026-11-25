@@ -826,7 +826,16 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
             </Select>
           </FormField>
           <FormField label="Role">
-            <Select value={instForm.role ?? 'standalone'} onValueChange={(v) => setInstForm((p) => ({ ...p, role: v as InstanceRecord['role'] }))}>
+            <Select
+              value={instForm.role ?? 'standalone'}
+              onValueChange={(v) =>
+                setInstForm((p) => ({
+                  ...p,
+                  role: v as InstanceRecord['role'],
+                  primary_instance_id: v === 'replica' ? (p.primary_instance_id ?? '') : '',
+                }))
+              }
+            >
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="standalone">standalone</SelectItem>
@@ -836,6 +845,26 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
             </Select>
           </FormField>
         </div>
+        {instForm.role === 'replica' && (
+          <FormField label="Primary Instance">
+            <Select
+              value={instForm.primary_instance_id || '__none'}
+              onValueChange={(v) => setInstForm((p) => ({ ...p, primary_instance_id: v === '__none' ? '' : v }))}
+            >
+              <SelectTrigger><SelectValue placeholder="Select primary instance" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__none">None</SelectItem>
+                {instances
+                  .filter((candidate) => candidate.id !== instForm.id && candidate.role === 'primary')
+                  .map((candidate) => (
+                    <SelectItem key={candidate.id} value={candidate.id}>
+                      {candidate.name} ({candidate.engine})
+                    </SelectItem>
+                  ))}
+              </SelectContent>
+            </Select>
+          </FormField>
+        )}
         {instForm.engine === 'sqlite' ? (
           <FormField label="SQLite File Path">
             <Input
@@ -901,7 +930,16 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
         </div>
         <div className="grid grid-cols-2 gap-3">
           <FormField label="Owner System">
-            <Select value={targetForm.owner_system_id ?? ''} onValueChange={(v) => setTargetForm((p) => ({ ...p, owner_system_id: v }))}>
+            <Select
+              value={targetForm.owner_system_id ?? ''}
+              onValueChange={(v) =>
+                setTargetForm((p) => ({
+                  ...p,
+                  owner_system_id: v,
+                  linked_system_ids: (p.linked_system_ids ?? []).filter((id) => id !== v),
+                }))
+              }
+            >
               <SelectTrigger><SelectValue placeholder="Select system" /></SelectTrigger>
               <SelectContent>
                 {systems.map((s) => (
@@ -921,6 +959,35 @@ export function CatalogTab({ catalog, onRefreshBootstrap }: { catalog: DisplayCa
             </Select>
           </FormField>
         </div>
+        {systems.some((s) => s.id !== targetForm.owner_system_id) && (
+          <FormField label="Linked Systems (inherits strictest policy & workspace priority)">
+            <div className="flex flex-wrap gap-1.5">
+              {systems
+                .filter((s) => s.id !== targetForm.owner_system_id)
+                .map((s) => {
+                  const active = (targetForm.linked_system_ids ?? []).includes(s.id)
+                  return (
+                    <Button
+                      key={s.id}
+                      type="button"
+                      size="sm"
+                      variant={active ? 'default' : 'outline'}
+                      className="h-7 px-2 font-mono text-xs"
+                      onClick={() =>
+                        setTargetForm((p) => {
+                          const cur = p.linked_system_ids ?? []
+                          const next = cur.includes(s.id) ? cur.filter((id) => id !== s.id) : [...cur, s.id]
+                          return { ...p, linked_system_ids: next }
+                        })
+                      }
+                    >
+                      {s.slug}
+                    </Button>
+                  )
+                })}
+            </div>
+          </FormField>
+        )}
         <div className="grid grid-cols-2 gap-3">
           <FormField label="Instance">
             <Select value={targetForm.instance_id ?? ''} onValueChange={(v) => setTargetForm((p) => ({ ...p, instance_id: v }))}>

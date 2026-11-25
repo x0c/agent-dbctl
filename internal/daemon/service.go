@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -230,6 +231,47 @@ func (s *Service) BuildDisplayCatalog(ctx context.Context) (types.DisplayCatalog
 		})
 	}
 
+	providerNames := s.approvals.ProviderNames()
+	if len(providerNames) == 0 {
+		providerNames = []string{"local-web"}
+	}
+	sort.Slice(providerNames, func(i, j int) bool {
+		rank := func(name string) int {
+			switch name {
+			case "local-web":
+				return 0
+			case "webhook":
+				return 1
+			default:
+				return 2
+			}
+		}
+		ri, rj := rank(providerNames[i]), rank(providerNames[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return providerNames[i] < providerNames[j]
+	})
+	approvalItems := make([]types.DisplayMetaItem, 0, len(providerNames))
+	for i, name := range providerNames {
+		item := types.DisplayMetaItem{
+			Code:  name,
+			Color: "#4B5563",
+			Order: (i + 1) * 10,
+		}
+		switch name {
+		case "local-web":
+			item.Labels = map[string]string{"en": "Local Web Popup", "zh": "本机 Web 弹窗确认"}
+			item.Color = "#2563EB"
+		case "webhook":
+			item.Labels = map[string]string{"en": "Webhook Notification", "zh": "Webhook 外部审批"}
+			item.Color = "#7C3AED"
+		default:
+			item.Labels = map[string]string{"en": name, "zh": name}
+		}
+		approvalItems = append(approvalItems, item)
+	}
+
 	return types.DisplayCatalog{
 		CatalogVersion: 1,
 		Environments:   envItems,
@@ -253,11 +295,43 @@ func (s *Service) BuildDisplayCatalog(ctx context.Context) (types.DisplayCatalog
 			{Code: string(types.RiskAdmin), Labels: map[string]string{"en": "Admin", "zh": "管理指令"}, Color: "#991B1B", Order: 50},
 			{Code: string(types.RiskUnknown), Labels: map[string]string{"en": "Unknown (Fail-Closed)", "zh": "未知高危"}, Color: "#7C3AED", Order: 60},
 		},
-		Engines: engineItems,
-		ApprovalProviders: []types.DisplayMetaItem{
-			{Code: "local-web", Labels: map[string]string{"en": "Local Web Popup", "zh": "本机 Web 弹窗确认"}, Color: "#2563EB", Order: 10},
-		},
+		Engines:           engineItems,
+		ApprovalProviders: approvalItems,
 	}, nil
+}
+
+func (s *Service) resolveNetworkProfile(ctx context.Context, npID string) *types.NetworkProfile {
+	if npID == "" {
+		return nil
+	}
+	nets, err := s.store.ListNetworkProfiles(ctx)
+	if err != nil {
+		return nil
+	}
+	for _, np := range nets {
+		if np.ID == npID {
+			npCopy := np
+			return &npCopy
+		}
+	}
+	return nil
+}
+
+func (s *Service) resolveCredentialProfile(ctx context.Context, credID string) *types.CredentialProfile {
+	if credID == "" {
+		return nil
+	}
+	creds, err := s.store.ListCredentialProfiles(ctx)
+	if err != nil {
+		return nil
+	}
+	for _, cp := range creds {
+		if cp.ID == credID {
+			cpCopy := cp
+			return &cpCopy
+		}
+	}
+	return nil
 }
 
 func (s *Service) openDriverConn(ctx context.Context, detail types.TargetDetail, credMode types.AccessLevel, preferReplica bool) (driver.Conn, error) {
@@ -265,15 +339,29 @@ func (s *Service) openDriverConn(ctx context.Context, detail types.TargetDetail,
 		return nil, fmt.Errorf("target %q references missing instance", detail.Target.Ref)
 	}
 	inst := *detail.Instance
-	// Route read-only queries to replica instance if configured.
+	effectiveNet := detail.NetworkProfile
+	// Route read-only queries to replica instance if configured, resolving the replica's own NetworkProfile.
 	if preferReplica && inst.Role == types.RolePrimary {
 		allInsts, err := s.store.ListInstances(ctx)
 		if err == nil {
+			var replicas []types.Instance
 			for _, candidate := range allInsts {
-				if candidate.PrimaryInstanceID == inst.ID && candidate.Role == types.RoleReplica {
-					inst = candidate
-					break
+				if candidate.PrimaryInstanceID == inst.ID && candidate.Role == types.RoleReplica && strings.EqualFold(candidate.Engine, inst.Engine) {
+					replicas = append(replicas, candidate)
 				}
+			}
+			if len(replicas) > 0 {
+				sort.Slice(replicas, func(i, j int) bool {
+					if replicas[i].Name != replicas[j].Name {
+						return replicas[i].Name < replicas[j].Name
+					}
+					return replicas[i].ID < replicas[j].ID
+				})
+				chosen := replicas[0]
+				if chosen.NetworkProfileID != inst.NetworkProfileID {
+					effectiveNet = s.resolveNetworkProfile(ctx, chosen.NetworkProfileID)
+				}
+				inst = chosen
 			}
 		}
 	}
@@ -306,29 +394,24 @@ func (s *Service) openDriverConn(ctx context.Context, detail types.TargetDetail,
 	}
 
 	var bastionCred secrets.ResolvedSecret
-	if detail.NetworkProfile != nil && detail.NetworkProfile.BastionCredentialID != "" {
-		creds, err := s.store.ListCredentialProfiles(ctx)
-		if err == nil {
-			for _, cp := range creds {
-				if cp.ID == detail.NetworkProfile.BastionCredentialID {
-					bastionCred, err = secrets.ResolveCredential(ctx, s.secrets, &cp)
-					if err != nil {
-						return nil, fmt.Errorf("resolve bastion credential: %w", err)
-					}
-					break
-				}
+	if effectiveNet != nil && effectiveNet.BastionCredentialID != "" {
+		if cp := s.resolveCredentialProfile(ctx, effectiveNet.BastionCredentialID); cp != nil {
+			var err error
+			bastionCred, err = secrets.ResolveCredential(ctx, s.secrets, cp)
+			if err != nil {
+				return nil, fmt.Errorf("resolve bastion credential: %w", err)
 			}
 		}
 	}
 
-	dialRes, err := netdial.BuildContext(ctx, detail.NetworkProfile, bastionCred, inst.TLSMode, inst.Host)
+	dialRes, err := netdial.BuildContext(ctx, effectiveNet, bastionCred, inst.TLSMode, inst.Host)
 	if err != nil {
 		return nil, err
 	}
 
-	needsBridge := detail.NetworkProfile != nil &&
-		detail.NetworkProfile.Mode != "" &&
-		detail.NetworkProfile.Mode != types.NetworkDirect
+	needsBridge := effectiveNet != nil &&
+		effectiveNet.Mode != "" &&
+		effectiveNet.Mode != types.NetworkDirect
 
 	conn, err := drv.Open(ctx, driver.ConnectionConfig{
 		Engine:          inst.Engine,
@@ -372,6 +455,16 @@ func (s *Service) PingTarget(ctx context.Context, detail types.TargetDetail) typ
 
 	pingOut, err := conn.Ping(connCtx)
 	res.ServerVersion = pingOut.ServerVersion
+	res.Dialect = pingOut.Dialect
+	res.Capabilities = pingOut.Capabilities
+	if res.Capabilities == nil {
+		if dac, ok := conn.(driver.DialectAwareConn); ok {
+			res.Capabilities = dac.Capabilities()
+		}
+	}
+	if res.Dialect == "" && res.Capabilities != nil {
+		res.Dialect = res.Capabilities.Dialect
+	}
 	res.LatencyMs = pingOut.LatencyMs
 	if err != nil {
 		res.Reachable = false
@@ -380,6 +473,9 @@ func (s *Service) PingTarget(ctx context.Context, detail types.TargetDetail) typ
 	}
 	res.Reachable = pingOut.Reachable
 	res.Error = pingOut.Error
+	if res.Reachable && res.Capabilities != nil && detail.Instance != nil {
+		_ = s.store.UpdateInstanceCapabilities(ctx, detail.Instance.ID, res.Capabilities)
+	}
 	return res
 }
 
@@ -415,28 +511,10 @@ func (s *Service) PingInstance(ctx context.Context, instanceID, credID, dbName s
 		return types.PingResult{}, err
 	}
 	detail := types.TargetDetail{
-		Target:   types.Target{Ref: inst.Name, DatabaseName: dbName, ROCredentialID: credID},
-		Instance: &inst,
-	}
-	if inst.NetworkProfileID != "" {
-		nets, _ := s.store.ListNetworkProfiles(ctx)
-		for _, np := range nets {
-			if np.ID == inst.NetworkProfileID {
-				npCopy := np
-				detail.NetworkProfile = &npCopy
-				break
-			}
-		}
-	}
-	if credID != "" {
-		creds, _ := s.store.ListCredentialProfiles(ctx)
-		for _, cp := range creds {
-			if cp.ID == credID {
-				cpCopy := cp
-				detail.ROCredential = &cpCopy
-				break
-			}
-		}
+		Target:         types.Target{Ref: inst.Name, DatabaseName: dbName, ROCredentialID: credID},
+		Instance:       &inst,
+		NetworkProfile: s.resolveNetworkProfile(ctx, inst.NetworkProfileID),
+		ROCredential:   s.resolveCredentialProfile(ctx, credID),
 	}
 	return s.PingTarget(ctx, detail), nil
 }
@@ -448,28 +526,10 @@ func (s *Service) DiscoverInstance(ctx context.Context, instanceID, credID, dbNa
 		return nil, err
 	}
 	detail := types.TargetDetail{
-		Target:   types.Target{Ref: inst.Name, DatabaseName: dbName, ROCredentialID: credID},
-		Instance: &inst,
-	}
-	if inst.NetworkProfileID != "" {
-		nets, _ := s.store.ListNetworkProfiles(ctx)
-		for _, np := range nets {
-			if np.ID == inst.NetworkProfileID {
-				npCopy := np
-				detail.NetworkProfile = &npCopy
-				break
-			}
-		}
-	}
-	if credID != "" {
-		creds, _ := s.store.ListCredentialProfiles(ctx)
-		for _, cp := range creds {
-			if cp.ID == credID {
-				cpCopy := cp
-				detail.ROCredential = &cpCopy
-				break
-			}
-		}
+		Target:         types.Target{Ref: inst.Name, DatabaseName: dbName, ROCredentialID: credID},
+		Instance:       &inst,
+		NetworkProfile: s.resolveNetworkProfile(ctx, inst.NetworkProfileID),
+		ROCredential:   s.resolveCredentialProfile(ctx, credID),
 	}
 	connCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()

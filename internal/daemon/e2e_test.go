@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -520,5 +522,115 @@ func TestCustomRiskPatternApprovalDenyAndSandboxAPI(t *testing.T) {
 	})
 	if err != nil || denyResp.Status != types.OpDenied || denyResp.ErrorCode != types.ErrCodePolicyDenied {
 		t.Fatalf("expected custom pattern deny, got %+v err=%v", denyResp, err)
+	}
+}
+
+func TestReplicaNetworkIsolationAndCapabilitiesPersistence(t *testing.T) {
+	t.Setenv("AGENT_DBCTL_WEBHOOK_URL", "https://127.0.0.1:9443/approve")
+	srv, _ := setupIsolatedServer(t)
+	svc := srv.Service()
+	svc.RegisterWebhookProviderFromEnv()
+	ctx := context.Background()
+
+	// 1. DisplayCatalog dynamically includes registered webhook approval provider.
+	cat, err := svc.BuildDisplayCatalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundWebhook := false
+	for _, ap := range cat.ApprovalProviders {
+		if ap.Code == "webhook" {
+			foundWebhook = true
+		}
+	}
+	if !foundWebhook {
+		t.Fatalf("expected webhook in DisplayCatalog.ApprovalProviders, got %+v", cat.ApprovalProviders)
+	}
+
+	// 2. PingTarget persists Dialect and ServerCapabilities on the SQLite instance.
+	dbPath := filepath.Join(t.TempDir(), "caps.sqlite")
+	sys, err := svc.Store().UpsertSystem(ctx, "test", types.System{Slug: "caps-sys", Name: "Caps Sys"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqliteInst, err := svc.Store().UpsertInstance(ctx, "test", types.Instance{
+		Name: "sqlite-caps", Engine: "sqlite", Host: dbPath, Role: types.RoleStandalone,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqliteTgt, err := svc.Store().UpsertTarget(ctx, "test", types.Target{
+		Ref: "caps-sys/dev/sqlite", OwnerSystemID: sys.ID, EnvironmentCode: "dev", InstanceID: sqliteInst.ID, DatabaseName: dbPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: sqliteTgt.Ref, Query: "CREATE TABLE t(id INTEGER)", Wait: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	det, err := svc.ResolveTarget(ctx, sqliteTgt.Ref, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ping := svc.PingTarget(ctx, det)
+	if !ping.Reachable || ping.Dialect != "sqlite" || ping.Capabilities == nil {
+		t.Fatalf("expected reachable SQLite ping with dialect & capabilities, got %+v", ping)
+	}
+	storedInst, err := svc.Store().GetInstance(ctx, sqliteInst.ID)
+	if err != nil || storedInst.Capabilities == nil || storedInst.Capabilities.Dialect != "sqlite" {
+		t.Fatalf("expected persisted capabilities on instance, got %+v err=%v", storedInst.Capabilities, err)
+	}
+
+	// 3. Replica routing must resolve the replica's own NetworkProfile rather than primary's direct profile.
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = socksLn.Close() }()
+	var replicaProxyDialed atomic.Int32
+	go func() {
+		for {
+			c, acceptErr := socksLn.Accept()
+			if acceptErr != nil {
+				return
+			}
+			replicaProxyDialed.Add(1)
+			_ = c.Close()
+		}
+	}()
+
+	replicaNet, err := svc.Store().UpsertNetworkProfile(ctx, "test", types.NetworkProfile{
+		Name: "replica-socks", Mode: types.NetworkSOCKS5, ProxyURL: "socks5://" + socksLn.Addr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pgPrimary, err := svc.Store().UpsertInstance(ctx, "test", types.Instance{
+		Name: "pg-primary-direct", Engine: "postgres", Host: "127.0.0.1", Port: 1, Role: types.RolePrimary,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Store().UpsertInstance(ctx, "test", types.Instance{
+		Name: "pg-replica-socks", Engine: "postgres", Host: "127.0.0.1", Port: 5432, Role: types.RoleReplica,
+		PrimaryInstanceID: pgPrimary.ID, NetworkProfileID: replicaNet.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pgTgt, err := svc.Store().UpsertTarget(ctx, "test", types.Target{
+		Ref: "caps-sys/dev/pg", OwnerSystemID: sys.ID, EnvironmentCode: "dev", InstanceID: pgPrimary.ID, DatabaseName: "app",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: pgTgt.Ref,
+		Query:            "SELECT 1",
+		Preflight:        true,
+	})
+	if replicaProxyDialed.Load() == 0 {
+		t.Fatalf("expected read-only replica routing to dial replica's SOCKS5 NetworkProfile")
 	}
 }

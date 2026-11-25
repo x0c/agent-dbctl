@@ -395,3 +395,145 @@ INSERT INTO schema_migrations(version, applied_at_utc) VALUES (1, '2026-01-01T00
 		t.Fatalf("expected valid audit hash chain after pattern mutations, got %+v err=%v", verify, err)
 	}
 }
+
+func TestCrossMachineTopologyNaturalKeyMergeAndIntegrity(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "agent-dbctl.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	// Seed local machine state with local IDs and local workspace binding.
+	localCred, err := st.UpsertCredentialProfile(ctx, "admin", types.CredentialProfile{
+		ID: "cred_local", Name: "orders-ro", Kind: types.CredKeychain, AccessLevel: types.AccessReadOnly, Username: "ro",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localNet, err := st.UpsertNetworkProfile(ctx, "admin", types.NetworkProfile{
+		ID: "net_local", Name: "corp-socks", Mode: types.NetworkSOCKS5, ProxyURL: "socks5://127.0.0.1:1080",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localSys, err := st.UpsertSystem(ctx, "admin", types.System{
+		ID: "sys_local", Slug: "orders", Name: "Orders", WorkspacePaths: []string{"~/local/orders"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localPrimary, err := st.UpsertInstance(ctx, "admin", types.Instance{
+		ID: "inst_primary_local", Name: "pg-orders-primary", Engine: "postgres", Host: "192.0.2.1", Port: 5432, Role: types.RolePrimary, NetworkProfileID: localNet.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localReplica, err := st.UpsertInstance(ctx, "admin", types.Instance{
+		ID: "inst_replica_local", Name: "pg-orders-replica", Engine: "postgres", Host: "192.0.2.2", Port: 5432, Role: types.RoleReplica, PrimaryInstanceID: localPrimary.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Referential integrity: missing network_profile / primary / credential / self-primary must fail; deleting primary with replica must fail.
+	if _, err := st.UpsertInstance(ctx, "admin", types.Instance{
+		Name: "bad-net-inst", Engine: "postgres", Host: "192.0.2.3", Port: 5432, NetworkProfileID: "net_missing",
+	}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for missing network_profile_id, got %v", err)
+	}
+	if _, err := st.UpsertInstance(ctx, "admin", types.Instance{
+		ID: "inst_self", Name: "self-inst", Engine: "postgres", Host: "192.0.2.4", Port: 5432, Role: types.RoleReplica, PrimaryInstanceID: "inst_self",
+	}); err == nil {
+		t.Fatalf("expected error for self-referencing primary_instance_id")
+	}
+	if _, err := st.UpsertTarget(ctx, "admin", types.Target{
+		Ref: "orders/dev/badcred", OwnerSystemID: localSys.ID, EnvironmentCode: "dev", InstanceID: localPrimary.ID, ROCredentialID: "cred_missing",
+	}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for missing ro_credential_id, got %v", err)
+	}
+	if err := st.DeleteInstance(ctx, "admin", localPrimary.ID); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("expected ErrConflict deleting primary instance referenced by replica, got %v", err)
+	}
+	_ = localReplica
+
+	// Capabilities persistence & omission from TopologyBundle export.
+	if err := st.UpdateInstanceCapabilities(ctx, localPrimary.ID, &types.ServerCapabilities{
+		Engine: "postgres", Dialect: "postgres", ServerVersion: "16.4", SupportsExplain: true, SupportsExplainJSON: true,
+	}); err != nil {
+		t.Fatalf("update capabilities: %v", err)
+	}
+	gotPrimary, err := st.GetInstance(ctx, localPrimary.ID)
+	if err != nil || gotPrimary.Capabilities == nil || gotPrimary.Capabilities.Dialect != "postgres" {
+		t.Fatalf("expected persisted capabilities, got %+v err=%v", gotPrimary.Capabilities, err)
+	}
+
+	// Import bundle exported from another machine with different random IDs for the same natural keys.
+	remoteBundle := types.TopologyBundle{
+		SchemaVersion: 1,
+		Systems: []types.System{
+			{ID: "sys_remote", Slug: "orders", Name: "Orders Core", WorkspacePaths: nil},
+		},
+		CredentialProfiles: []types.CredentialProfile{
+			{ID: "cred_remote", Name: "orders-ro", Kind: types.CredKeychain, AccessLevel: types.AccessReadOnly, Username: "ro_new"},
+		},
+		NetworkProfiles: []types.NetworkProfile{
+			{ID: "net_remote", Name: "corp-socks", Mode: types.NetworkSOCKS5, ProxyURL: "socks5://127.0.0.1:1080"},
+		},
+		Instances: []types.Instance{
+			// Put replica before primary to verify dependency ordering in ImportTopology.
+			{ID: "inst_replica_remote", Name: "pg-orders-replica", Engine: "postgres", Host: "192.0.2.2", Port: 5432, Role: types.RoleReplica, PrimaryInstanceID: "inst_primary_remote"},
+			{ID: "inst_primary_remote", Name: "pg-orders-primary", Engine: "postgres", Host: "192.0.2.1", Port: 5432, Role: types.RolePrimary, NetworkProfileID: "net_remote"},
+		},
+		Targets: []types.Target{
+			{ID: "tgt_remote", Ref: "orders/prod/main", OwnerSystemID: "sys_remote", EnvironmentCode: "prod", InstanceID: "inst_primary_remote", DatabaseName: "orders", ROCredentialID: "cred_remote"},
+		},
+		Policies: []types.PolicyRuleSet{
+			{ID: "pol_remote", Name: "orders-tight", ScopeType: "system", ScopeID: "sys_remote"},
+		},
+		RiskPatternRules: []types.RiskPatternRule{
+			{
+				ID: "pat_remote", Name: "block-secret-tbl", ScopeType: "target", ScopeID: "tgt_remote",
+				Enabled: true, Action: types.PatternActionDeny,
+				Condition: types.PatternCondition{Type: types.MatcherTableRef, Values: []string{"secrets"}},
+			},
+		},
+	}
+	if err := st.ImportTopology(ctx, "admin", remoteBundle); err != nil {
+		t.Fatalf("cross-machine natural-key import failed: %v", err)
+	}
+
+	// Local IDs and local workspace_paths must survive!
+	syss, _ := st.ListSystems(ctx)
+	if len(syss) != 1 || syss[0].ID != localSys.ID || len(syss[0].WorkspacePaths) != 1 || syss[0].WorkspacePaths[0] != "~/local/orders" {
+		t.Fatalf("expected preserved local system ID and workspace_paths, got %+v", syss)
+	}
+	creds, _ := st.ListCredentialProfiles(ctx)
+	if len(creds) != 1 || creds[0].ID != localCred.ID || creds[0].Username != "ro_new" {
+		t.Fatalf("expected preserved local credential ID with updated username, got %+v", creds)
+	}
+	tgts, _ := st.ListTargets(ctx)
+	if len(tgts) != 1 || tgts[0].OwnerSystemID != localSys.ID || tgts[0].InstanceID != localPrimary.ID || tgts[0].ROCredentialID != localCred.ID {
+		t.Fatalf("expected remapped target references, got %+v", tgts)
+	}
+
+	// Export must omit runtime Capabilities.
+	exp, err := st.ExportTopology(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inst := range exp.Instances {
+		if inst.Capabilities != nil {
+			t.Fatalf("expected ExportTopology to omit runtime capabilities, got %+v", inst.Capabilities)
+		}
+	}
+
+	// Deleting target must clean up its target-scoped pattern rule in the same tx.
+	if err := st.DeleteTarget(ctx, "admin", tgts[0].ID); err != nil {
+		t.Fatalf("delete target: %v", err)
+	}
+	pats, _ := st.ListRiskPatternRules(ctx)
+	if len(pats) != 0 {
+		t.Fatalf("expected target-scoped pattern rule cleaned up on target delete, got %+v", pats)
+	}
+}

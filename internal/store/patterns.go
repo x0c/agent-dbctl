@@ -66,7 +66,7 @@ func (s *Store) upsertRiskPatternRuleTx(ctx context.Context, tx *sql.Tx, actor s
 	if r.ScopeType == "global" {
 		r.ScopeID = "global"
 	} else {
-		r.ScopeID = strings.TrimSpace(r.ScopeID)
+		r.ScopeID = canonicalizeScopeIDTx(ctx, tx, r.ScopeType, r.ScopeID)
 	}
 	if err := policy.ValidateRiskPatternRule(r); err != nil {
 		return r, err
@@ -168,12 +168,16 @@ func (s *Store) InstallBuiltinRulePack(ctx context.Context, actor, packID, scope
 	now := nowUTC()
 	var installed []types.RiskPatternRule
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		canonicalScopeID := scopeID
+		if scopeType != "global" {
+			canonicalScopeID = canonicalizeScopeIDTx(ctx, tx, scopeType, scopeID)
+		}
 		for _, tmpl := range pack.Rules {
 			tmpl.ScopeType = scopeType
-			tmpl.ScopeID = scopeID
+			tmpl.ScopeID = canonicalScopeID
 			var existingID string
 			err := tx.QueryRowContext(ctx, `SELECT id FROM risk_pattern_rules WHERE scope_type = ? AND scope_id = ? AND name = ?`,
-				scopeType, scopeID, tmpl.Name).Scan(&existingID)
+				scopeType, canonicalScopeID, tmpl.Name).Scan(&existingID)
 			if err == nil {
 				tmpl.ID = existingID
 			} else if !errors.Is(err, sql.ErrNoRows) {
@@ -188,7 +192,7 @@ func (s *Store) InstallBuiltinRulePack(ctx context.Context, actor, packID, scope
 		return s.appendAuditTx(ctx, tx, actor, "risk_pattern.pack_install", packID, "", map[string]any{
 			"pack_id":    packID,
 			"scope_type": scopeType,
-			"scope_id":   scopeID,
+			"scope_id":   canonicalScopeID,
 			"rule_count": len(installed),
 		}, now)
 	})
