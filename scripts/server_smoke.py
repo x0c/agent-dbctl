@@ -7,7 +7,6 @@ import argparse
 import http.cookiejar
 import json
 import os
-import pty
 import re
 import secrets
 import select
@@ -66,6 +65,30 @@ def expect(condition: bool, message: str) -> None:
         raise SmokeFailure(message)
 
 
+def compose_up_with_network_retry(compose: list[str]) -> None:
+    markers = (
+        "failed to fetch anonymous token",
+        "unexpected eof",
+        ": eof",
+        "i/o timeout",
+        "tls handshake timeout",
+        "temporary failure in name resolution",
+        "network is unreachable",
+    )
+    command = compose + ["up", "-d", "--build"]
+    for attempt in range(1, 4):
+        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=900, check=False)
+        output = (result.stdout or "") + (result.stderr or "")
+        print(output, end="", flush=True)
+        if result.returncode == 0:
+            return
+        error = subprocess.CalledProcessError(result.returncode, command, output=result.stdout, stderr=result.stderr)
+        if attempt == 3 or not any(marker in output.lower() for marker in markers):
+            raise error
+        print(f"Docker network failure; retrying build ({attempt + 1}/3)", flush=True)
+        time.sleep(5 * attempt)
+
+
 def json_body(raw: bytes):
     try:
         return json.loads(raw)
@@ -105,6 +128,8 @@ def oidc_login(browser: Browser, base: str, oidc_port: int) -> str:
 
 
 def cli_device_login(binary: Path, config_home: Path, oidc_port: int, browser: Browser) -> None:
+    import pty
+
     env = client_env(config_home)
     pid, fd = pty.fork()
     if pid == 0:
@@ -259,7 +284,7 @@ def run(args) -> None:
         env_file.chmod(0o600)
         compose += ["--env-file", str(env_file)]
         try:
-            subprocess.run(compose + ["up", "-d", "--build"], cwd=ROOT, check=True, timeout=900)
+            compose_up_with_network_retry(compose)
             wait_health(base + "/healthz")
 
             admin = Browser()
@@ -274,7 +299,7 @@ def run(args) -> None:
             expect(status == 200 and approver_user.get("id"), f"create approver failed: {status} {approver_user}")
 
             config_home = temp / "client"
-            run_cli(binary, config_home, "context", "add", "smoke", "--endpoint", base, "--auth-mode", "oidc_device", "--use")
+            run_cli(binary, config_home, "context", "add", "smoke", "--endpoint", base, "--auth", "oidc_device", "--use")
             cli_device_login(binary, config_home, args.oidc_port, admin)
             _, who = run_cli(binary, config_home, "whoami")
             expect((who.get("data") or {}).get("kind") == "human", f"CLI login did not mint a human principal: {who}")

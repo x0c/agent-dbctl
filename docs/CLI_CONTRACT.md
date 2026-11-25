@@ -127,7 +127,7 @@ agent-dbctl describe [command...]
 agent-dbctl version
 agent-dbctl capabilities
 agent-dbctl serve [--config <path>] [--listen <addr>] [--public-url <url>]
-agent-dbctl context list | show | add <name> --endpoint <url> [--ca-cert <path>] [--client-cert <path> --client-key <path>] [--auth-mode oidc_device|bearer_token] | use <name> | remove <name>
+agent-dbctl context list | show | add <name> --endpoint <url> [--ca-cert <path>] [--client-cert <path> --client-key <path>] [--auth oidc_device|bearer_token] | use <name> | remove <name>
 agent-dbctl login [--context <name>] [--token-stdin | --token-env <var>]
 agent-dbctl logout [--context <name>]
 agent-dbctl whoami
