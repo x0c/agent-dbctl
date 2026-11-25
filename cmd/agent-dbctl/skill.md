@@ -70,9 +70,9 @@ When a database is not yet registered (`db list` returns empty or `db_not_found`
    - Pass queries via `--sql`, `--file <path>`, `--stdin`, or as a single optional positional argument (`exec --db <ref> "<query>"`). Prefer `--file <path>` or `--stdin` for multi-line SQL or JSON queries to avoid shell escaping errors.
    - Pass `--format objects` on SQL queries when working with wide tables and you want `records: [{col: val}]` instead of positional `columns` + `rows` arrays.
    - Always pass `--reason "<concise reason>"` on writes, production queries, or any operation that may trigger human approval; by default (`require_reason_for_approval`), approval requests without `--reason` are rejected with exit `2` (`reason_required`).
-   - In non-TTY agent shells, `exec` defaults to `--wait=false` when `--wait` is omitted so approvals return `operation_id` immediately (`exit 7`) instead of hitting tool timeouts; follow up with `op wait` or `op status`:
+   - In non-TTY agent shells, `exec` defaults to `--wait=false` when `--wait` is omitted so approvals return `operation_id` immediately (`exit 7`) instead of hitting tool timeouts; in PTY-allocated shells (where both stdin and stdout are TTYs), pass `--wait=false` explicitly, then follow up with `op wait` or `op status`:
      ```sh
-     "$BIN" exec --db <ref> --reason "Backfill stuck order state" --sql "UPDATE ..." --json
+     "$BIN" exec --db <ref> --wait=false --reason "Backfill stuck order state" --sql "UPDATE ..." --json
      "$BIN" op wait <operation_id> --timeout 60s --json
      "$BIN" op status <operation_id> --json
      ```
