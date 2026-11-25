@@ -1,0 +1,11 @@
+/agent-dbctl
+/agent-dbctl-plugin-sqlite
+/dist/
+node_modules/
+web/node_modules/
+internal/webui/dist/*
+!internal/webui/dist/.gitkeep
+*.test
+*.out
+.DS_Store
+tmp/

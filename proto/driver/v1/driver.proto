@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package driver.v1;
+
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/x0c/agent-dbctl/proto/driver/v1;driverv1";
+
+// DriverPlugin defines the Tier-3 language-agnostic subprocess plugin contract
+// hosted via hashicorp/go-plugin over gRPC.
+service DriverPlugin {
+  rpc Metadata(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Ping(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc ListDatabases(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Classify(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Preflight(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Execute(google.protobuf.Struct) returns (stream google.protobuf.Struct);
+}

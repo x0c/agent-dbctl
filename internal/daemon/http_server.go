@@ -1,0 +1,588 @@
+package daemon
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/x0c/agent-dbctl/internal/store"
+	"github.com/x0c/agent-dbctl/internal/types"
+	"github.com/x0c/agent-dbctl/internal/webui"
+)
+
+// NewWebHandler builds the local HTTP + SSE router for the embedded Web Console.
+func NewWebHandler(svc *Service) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSONResp(w, http.StatusOK, map[string]string{"status": "running"})
+	})
+
+	// Bootstrap & server-driven display catalogs.
+	mux.HandleFunc("GET /api/v1/bootstrap", func(w http.ResponseWriter, r *http.Request) {
+		cat, err := svc.BuildDisplayCatalog(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		sec, err := svc.Store().GetGlobalSecurityConfig(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		pending, _ := svc.Store().ListApprovals(r.Context(), string(types.ApprovalPending), 200)
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"identity":              svc.Identity(),
+			"display_catalog":       cat,
+			"global_security":       sec,
+			"pending_approval_count": len(pending),
+			"secret_backend":        svc.Secrets().Name(),
+		})
+	})
+
+	// Live SSE stream for approvals and execution updates.
+	mux.HandleFunc("GET /api/v1/events", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		ch := svc.subscribeSSE()
+		defer svc.unsubscribeSSE(ch)
+
+		_, _ = fmt.Fprintf(w, "event: ready\ndata: {}\n\n")
+		flusher.Flush()
+
+		keepAlive := time.NewTicker(20 * time.Second)
+		defer keepAlive.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-keepAlive.C:
+				_, _ = fmt.Fprintf(w, ": ping\n\n")
+				flusher.Flush()
+			case ev, open := <-ch:
+				if !open {
+					return
+				}
+				payload, _ := json.Marshal(ev.Data)
+				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, payload)
+				flusher.Flush()
+			}
+		}
+	})
+
+	// Systems
+	mux.HandleFunc("GET /api/v1/systems", func(w http.ResponseWriter, r *http.Request) {
+		items, err := svc.Store().ListSystems(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
+	})
+	mux.HandleFunc("POST /api/v1/systems", func(w http.ResponseWriter, r *http.Request) {
+		var body types.System
+		if err := decodeJSONBody(r, &body); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		saved, err := svc.Store().UpsertSystem(r.Context(), "web-admin", body)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, saved)
+	})
+	mux.HandleFunc("DELETE /api/v1/systems/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := svc.Store().DeleteSystem(r.Context(), "web-admin", r.PathValue("id")); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
+	})
+
+	// Environments
+	mux.HandleFunc("GET /api/v1/environments", func(w http.ResponseWriter, r *http.Request) {
+		items, err := svc.Store().ListEnvironments(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
+	})
+	mux.HandleFunc("POST /api/v1/environments", func(w http.ResponseWriter, r *http.Request) {
+		var body types.Environment
+		if err := decodeJSONBody(r, &body); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		saved, err := svc.Store().UpsertEnvironment(r.Context(), "web-admin", body)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, saved)
+	})
+
+	// Network Profiles
+	mux.HandleFunc("GET /api/v1/network-profiles", func(w http.ResponseWriter, r *http.Request) {
+		items, err := svc.Store().ListNetworkProfiles(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
+	})
+	mux.HandleFunc("POST /api/v1/network-profiles", func(w http.ResponseWriter, r *http.Request) {
+		var body types.NetworkProfile
+		if err := decodeJSONBody(r, &body); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		saved, err := svc.Store().UpsertNetworkProfile(r.Context(), "web-admin", body)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, saved)
+	})
+	mux.HandleFunc("DELETE /api/v1/network-profiles/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := svc.Store().DeleteNetworkProfile(r.Context(), "web-admin", r.PathValue("id")); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
+	})
+
+	// Credential Profiles (write-only secret input, never returned in GET)
+	mux.HandleFunc("GET /api/v1/credentials", func(w http.ResponseWriter, r *http.Request) {
+		items, err := svc.Store().ListCredentialProfiles(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for i := range items {
+			items[i].HasSecret = svc.hasCredentialSecret(r.Context(), items[i])
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
+	})
+	mux.HandleFunc("POST /api/v1/credentials", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			types.CredentialProfile
+			SecretValue string `json:"secret_value"`
+		}
+		if err := decodeJSONBody(r, &body); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		saved, err := svc.Store().UpsertCredentialProfile(r.Context(), "web-admin", body.CredentialProfile)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		if body.Kind == types.CredKeychain && body.SecretValue != "" {
+			if err := svc.Secrets().Put(r.Context(), "cred:"+saved.ID, body.SecretValue); err != nil {
+				writeHTTPErr(w, http.StatusInternalServerError, "save secret failed: "+err.Error())
+				return
+			}
+		}
+		saved.HasSecret = svc.hasCredentialSecret(r.Context(), saved)
+		writeJSONResp(w, http.StatusOK, saved)
+	})
+	mux.HandleFunc("DELETE /api/v1/credentials/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if err := svc.Store().DeleteCredentialProfile(r.Context(), "web-admin", id); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		_ = svc.Secrets().Delete(r.Context(), "cred:"+id)
+		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
+	})
+
+	// Instances + Live Test & Discover
+	mux.HandleFunc("GET /api/v1/instances", func(w http.ResponseWriter, r *http.Request) {
+		items, err := svc.Store().ListInstances(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
+	})
+	mux.HandleFunc("POST /api/v1/instances", func(w http.ResponseWriter, r *http.Request) {
+		var body types.Instance
+		if err := decodeJSONBody(r, &body); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		saved, err := svc.Store().UpsertInstance(r.Context(), "web-admin", body)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, saved)
+	})
+	mux.HandleFunc("DELETE /api/v1/instances/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := svc.Store().DeleteInstance(r.Context(), "web-admin", r.PathValue("id")); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
+	})
+	mux.HandleFunc("POST /api/v1/instances/{id}/test", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			CredentialID string `json:"credential_id"`
+			DatabaseName string `json:"database_name"`
+		}
+		_ = decodeJSONBody(r, &body)
+		res, err := svc.PingInstance(r.Context(), r.PathValue("id"), body.CredentialID, body.DatabaseName)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, res)
+	})
+	mux.HandleFunc("POST /api/v1/instances/{id}/discover", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			CredentialID string `json:"credential_id"`
+			DatabaseName string `json:"database_name"`
+		}
+		_ = decodeJSONBody(r, &body)
+		dbs, err := svc.DiscoverInstance(r.Context(), r.PathValue("id"), body.CredentialID, body.DatabaseName)
+		if err != nil {
+			writeHTTPErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"databases": dbs})
+	})
+
+	// Targets
+	mux.HandleFunc("GET /api/v1/targets", func(w http.ResponseWriter, r *http.Request) {
+		items, err := svc.BuildTargetDetails(r.Context(), "")
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
+	})
+	mux.HandleFunc("POST /api/v1/targets", func(w http.ResponseWriter, r *http.Request) {
+		var body types.Target
+		if err := decodeJSONBody(r, &body); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		saved, err := svc.Store().UpsertTarget(r.Context(), "web-admin", body)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, saved)
+	})
+	mux.HandleFunc("DELETE /api/v1/targets/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := svc.Store().DeleteTarget(r.Context(), "web-admin", r.PathValue("id")); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
+	})
+	mux.HandleFunc("POST /api/v1/targets/{id}/test", func(w http.ResponseWriter, r *http.Request) {
+		details, err := svc.BuildTargetDetails(r.Context(), "")
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		id := r.PathValue("id")
+		for _, d := range details {
+			if d.Target.ID == id || d.Target.Ref == id {
+				writeJSONResp(w, http.StatusOK, svc.PingTarget(r.Context(), d))
+				return
+			}
+		}
+		writeHTTPErr(w, http.StatusNotFound, "target not found")
+	})
+
+	// Topology Export / Import (YAML or JSON, secret-free)
+	mux.HandleFunc("GET /api/v1/topology", func(w http.ResponseWriter, r *http.Request) {
+		b, err := svc.Store().ExportTopology(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if r.URL.Query().Get("format") == "yaml" {
+			raw, err := yaml.Marshal(b)
+			if err != nil {
+				writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(raw)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, b)
+	})
+	mux.HandleFunc("POST /api/v1/topology", func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+		if err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		var bundle types.TopologyBundle
+		if strings.HasPrefix(strings.TrimSpace(string(raw)), "{") {
+			if err := json.Unmarshal(raw, &bundle); err != nil {
+				writeHTTPErr(w, http.StatusBadRequest, "invalid topology JSON: "+err.Error())
+				return
+			}
+		} else {
+			if err := yaml.Unmarshal(raw, &bundle); err != nil {
+				writeHTTPErr(w, http.StatusBadRequest, "invalid topology YAML: "+err.Error())
+				return
+			}
+		}
+		if err := svc.Store().ImportTopology(r.Context(), "web-admin", bundle); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]bool{"imported": true})
+	})
+
+	// Policies & Global Security
+	mux.HandleFunc("GET /api/v1/policies", func(w http.ResponseWriter, r *http.Request) {
+		items, err := svc.Store().ListPolicies(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
+	})
+	mux.HandleFunc("POST /api/v1/policies", func(w http.ResponseWriter, r *http.Request) {
+		var body types.PolicyRuleSet
+		if err := decodeJSONBody(r, &body); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		saved, err := svc.Store().UpsertPolicy(r.Context(), "web-admin", body)
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, saved)
+	})
+	mux.HandleFunc("DELETE /api/v1/policies/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := svc.Store().DeletePolicy(r.Context(), "web-admin", r.PathValue("id")); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]bool{"deleted": true})
+	})
+	mux.HandleFunc("GET /api/v1/security/global", func(w http.ResponseWriter, r *http.Request) {
+		cfg, err := svc.Store().GetGlobalSecurityConfig(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, cfg)
+	})
+	mux.HandleFunc("PUT /api/v1/security/global", func(w http.ResponseWriter, r *http.Request) {
+		var body types.GlobalSecurityConfig
+		if err := decodeJSONBody(r, &body); err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		saved, err := svc.Store().UpdateGlobalSecurityConfig(r.Context(), "web-admin", body)
+		if err != nil {
+			writeHTTPErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		svc.broadcast(Event{Type: "security_updated", Data: saved})
+		writeJSONResp(w, http.StatusOK, saved)
+	})
+
+	// Approvals
+	mux.HandleFunc("GET /api/v1/approvals", func(w http.ResponseWriter, r *http.Request) {
+		status := r.URL.Query().Get("status")
+		items, err := svc.Store().ListApprovals(r.Context(), status, 200)
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
+	})
+	mux.HandleFunc("GET /api/v1/approvals/{id}", func(w http.ResponseWriter, r *http.Request) {
+		app, _, err := svc.Store().GetApproval(r.Context(), r.PathValue("id"))
+		if err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, app)
+	})
+	mux.HandleFunc("POST /api/v1/approvals/{id}/approve", func(w http.ResponseWriter, r *http.Request) {
+		handleApprovalDecision(w, r, svc, true)
+	})
+	mux.HandleFunc("POST /api/v1/approvals/{id}/reject", func(w http.ResponseWriter, r *http.Request) {
+		handleApprovalDecision(w, r, svc, false)
+	})
+
+	// Operations & Audit Logs
+	mux.HandleFunc("GET /api/v1/operations", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		items, err := svc.Store().ListOperations(r.Context(), q.Get("target"), q.Get("env"), q.Get("system"), q.Get("status"), q.Get("search"), limit)
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
+	})
+	mux.HandleFunc("GET /api/v1/audit", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		items, err := svc.Store().ListAuditEntries(r.Context(), q.Get("action"), q.Get("target"), q.Get("operation_id"), limit)
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"items": items})
+	})
+	mux.HandleFunc("POST /api/v1/audit/verify", func(w http.ResponseWriter, r *http.Request) {
+		res, err := svc.Store().VerifyAuditChain(r.Context())
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, res)
+	})
+
+	// Drivers & External Plugins
+	mux.HandleFunc("GET /api/v1/drivers", func(w http.ResponseWriter, r *http.Request) {
+		builtins := svc.Drivers().List()
+		discovered := svc.Plugins().ListDiscovered()
+		writeJSONResp(w, http.StatusOK, map[string]any{
+			"drivers": builtins,
+			"plugins": discovered,
+		})
+	})
+	mux.HandleFunc("POST /api/v1/plugins/reload", func(w http.ResponseWriter, r *http.Request) {
+		items, err := svc.Plugins().Reload()
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"plugins": items})
+	})
+
+	// Embedded TypeScript Web Console SPA fallback.
+	mux.Handle("/", webui.Handler())
+
+	return SameOriginMiddleware(mux)
+}
+
+func handleApprovalDecision(w http.ResponseWriter, r *http.Request, svc *Service, approve bool) {
+	var body struct {
+		Reviewer string `json:"reviewer"`
+		Note     string `json:"note"`
+		Token    string `json:"token"`
+	}
+	_ = decodeJSONBody(r, &body)
+	// Same-origin SPA console submissions carry X-Agent-DBCTL-UI=1 when approving from the live queue.
+	trustedUI := r.Header.Get("X-Agent-DBCTL-UI") == "1"
+	app, err := svc.ResolveApproval(r.Context(), r.PathValue("id"), approve, body.Reviewer, body.Note, body.Token, trustedUI)
+	if err != nil {
+		if strings.Contains(err.Error(), "token") {
+			writeHTTPErr(w, http.StatusForbidden, err.Error())
+			return
+		}
+		writeStoreErr(w, err)
+		return
+	}
+	writeJSONResp(w, http.StatusOK, app)
+}
+
+// SameOriginMiddleware enforces same-origin validation on mutating local HTTP endpoints:
+// - When Origin is present and != "null", verify scheme+host match r.Host.
+// - When Origin is missing or "null" (e.g. Safari same-origin POST), accept Sec-Fetch-Site: same-origin,
+//   or fallback to matching Referer origin; reject explicit external origins and cross-site null POSTs.
+func SameOriginMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !isSameOriginRequest(r) {
+			writeHTTPErr(w, http.StatusForbidden, "cross-origin mutation blocked")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isSameOriginRequest(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin != "" && origin != "null" {
+		u, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		return strings.EqualFold(u.Host, r.Host)
+	}
+
+	sfs := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))
+	if sfs != "" {
+		return strings.EqualFold(sfs, "same-origin")
+	}
+
+	ref := strings.TrimSpace(r.Header.Get("Referer"))
+	if ref != "" {
+		u, err := url.Parse(ref)
+		if err != nil {
+			return false
+		}
+		return strings.EqualFold(u.Host, r.Host)
+	}
+
+	// Non-browser local CLI / unit tests without Origin/Sec-Fetch-Site/Referer headers
+	// are rejected unless explicitly targeting loopback without cross-site headers?
+	// Wait: enforce strict browser/origin check when Origin=="null" without Sec-Fetch-Site/Referer!
+	if origin == "null" {
+		return false
+	}
+	// Allow direct non-browser programmatic loopback calls (no Origin, no Sec-Fetch-Site, no Referer).
+	return true
+}
+
+func decodeJSONBody(r *http.Request, dst any) error {
+	dec := json.NewDecoder(io.LimitReader(r.Body, 2<<20))
+	return dec.Decode(dst)
+}
+
+func writeJSONResp(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeHTTPErr(w http.ResponseWriter, status int, msg string) {
+	writeJSONResp(w, status, map[string]string{"error": msg})
+}
+
+func writeStoreErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeHTTPErr(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, store.ErrConflict):
+		writeHTTPErr(w, http.StatusConflict, err.Error())
+	default:
+		writeHTTPErr(w, http.StatusBadRequest, err.Error())
+	}
+}
