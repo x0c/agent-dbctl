@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -258,7 +259,11 @@ func TestTier3ExternalGRPCPluginAndChecksumGuard(t *testing.T) {
 	if err := os.MkdirAll(pluginDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	binPath := filepath.Join(pluginDir, "agent-dbctl-plugin-sqlite")
+	binName := "agent-dbctl-plugin-sqlite"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	binPath := filepath.Join(pluginDir, binName)
 	buildCmd := exec.Command("go", "build", "-o", binPath, "../../cmd/agent-dbctl-plugin-sqlite")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("build plugin binary: %v\n%s", err, string(out))
@@ -278,10 +283,10 @@ func TestTier3ExternalGRPCPluginAndChecksumGuard(t *testing.T) {
   "family": "sql",
   "version": "0.1.0",
   "host_api_version": 1,
-  "binary": "agent-dbctl-plugin-sqlite",
+  "binary": %q,
   "sha256": %q,
   "capabilities": ["ping", "list_databases", "preflight", "execute_stream"]
-}`, hexSum)
+}`, binName, hexSum)
 	manifestPath := filepath.Join(pluginDir, "manifest.json")
 	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
 		t.Fatal(err)

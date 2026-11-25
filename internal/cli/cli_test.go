@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/x0c/agent-dbctl/internal/cli"
@@ -15,7 +16,11 @@ import (
 
 func buildTestCLI(t *testing.T) string {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), "agent-dbctl")
+	name := "agent-dbctl"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	bin := filepath.Join(t.TempDir(), name)
 	cmd := exec.Command("go", "build", "-ldflags", "-X main.version=v0.9.9 -X main.buildCommit=deadbeef", "-o", bin, "../../cmd/agent-dbctl")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build test CLI: %v\n%s", err, string(out))
