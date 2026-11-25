@@ -85,4 +85,4 @@ type Provider interface {
 ### Enterprise Extensions
 
 - **External approval system (e.g. Feishu / Slack / Internal Ticket)**: Implement `Provider` to create an external ticket (`external_ticket_id`, `external_ticket_url`), then resolve the pending approval via callback/poller into `approval.Manager.Resolve(...)`.
-- **Air-gapped DMS/Work-Order Platform**: Implement a Tier-3 `Driver` plugin whose `Execute` submits to the enterprise DMS platform and streams approved/masked query results back through the standard `driver.v1.DriverPlugin` contract.
+- **Air-gapped DMS/Work-Order Platform**: Implement a Tier-3 `Driver` plugin whose `Execute` submits to the enterprise DMS platform and streams approved/masked query results back through the standard `driver.v1`/`v2.DriverPlugin` contract.
