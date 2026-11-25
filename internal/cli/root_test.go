@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/types"
@@ -169,6 +170,23 @@ func TestExecPositionalQueryConflictAndFallback(t *testing.T) {
 	}
 
 	cfgHome := t.TempDir()
+	t.Cleanup(func() {
+		stop := exec.Command(bin, "daemon", "stop", "--json")
+		stop.Env = append(os.Environ(),
+			config.EnvConfigHome+"="+cfgHome,
+			config.EnvSecretBackend+"=file",
+			config.EnvNoBrowser+"=1",
+			config.EnvNoSkillSync+"=1",
+			config.EnvSession+"=cli-pos-test",
+		)
+		_ = stop.Run()
+		for range 20 {
+			if err := os.Remove(bin); err == nil || os.IsNotExist(err) {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
 	run := func(args ...string) (int, types.Envelope) {
 		t.Helper()
 		cmd := exec.Command(bin, args...)

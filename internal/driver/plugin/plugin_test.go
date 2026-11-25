@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -342,6 +343,9 @@ func TestSQLitePluginV1AndV2Subprocess(t *testing.T) {
 
 	root := t.TempDir()
 	binName := "agent-dbctl-plugin-sqlite"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
 	binPath := filepath.Join(root, binName)
 	buildCmd := exec.Command("go", "build", "-o", binPath, "../../../cmd/agent-dbctl-plugin-sqlite")
 	if out, err := buildCmd.CombinedOutput(); err != nil {

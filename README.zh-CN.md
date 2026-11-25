@@ -82,7 +82,7 @@ make install-local
 | 能力 | 行为说明 |
 |---|---|
 | **四层企业资产目录** | 按 `系统 (System)`（支持 `workspace_paths` 自动匹配当前目录）-> `环境` -> `网络/凭据模板` -> `实例/目标库`（支持读写凭据分离）管理多库资产，支持脱敏后导出/导入 YAML/JSON 拓扑。 |
-| **分环境策略护栏** | **`dev`（YOLO 放行）**免批直跑；**`staging`（守卫）**与 **`prod`（严格）**执行前做只读 `EXPLAIN` 预检，对写操作、DDL、全表扫描或 Redis/Mongo 高开销读自动拉起本地浏览器审批。 |
+| **分环境策略护栏** | **`dev`（YOLO 放行）**免批直跑；**`staging`（守卫）**与 **`prod`（严格）**执行前做只读 `EXPLAIN` 预检，对写操作、DDL、全表扫描或 Redis/Mongo 高开销读自动拉起本地浏览器审批。通过 `Policies -> High-Risk Patterns` 自定义高危规则，在 `dev` 库上命中特定模式同样可强制二次确认或拒绝。 |
 | **原生方言原样透传** | 内置纯 Go 支持 PostgreSQL、MySQL/MariaDB/TiDB、SQLite、MongoDB（JSON `RunCommand`）和 Redis，原样执行各引擎语法，不做易出错的跨库 SQL 改写。 |
 | **Agent 友好 CLI 契约** | 终端表格与 `--json` 结构化信封 `{ok, data, error, meta}` 双受众输出，`describe` 自描述、整行边界截断、`--out` 原子落盘、写超时严禁自动重放。 |
 | **可插拔审批与外部驱动** | 通过 `ApprovalProvider` 解耦审批通道（内置 `local-web`，可扩展飞书/Slack/内部工单系统）；支持 `hashicorp/go-plugin` 跨语言 gRPC 驱动子进程并校验 SHA-256 与 API 版本。 |

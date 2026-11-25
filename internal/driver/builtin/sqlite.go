@@ -139,12 +139,33 @@ func buildSQLiteDSN(cfg driver.ConnectionConfig) (string, error) {
 			return u.String(), nil
 		}
 	}
+	slashed := filepath.ToSlash(path)
 	u := url.URL{
 		Scheme:   "file",
-		Path:     filepath.ToSlash(path),
 		RawQuery: q.Encode(),
 	}
+	switch {
+	case isWindowsDrivePath(slashed):
+		// RFC 8089 / SQLite require three slashes before a Windows drive letter (file:///C:/...)
+		// so SQLite does not parse the drive letter as an invalid URI authority.
+		u.Path = "/" + strings.ReplaceAll(slashed, "\\", "/")
+	case strings.HasPrefix(slashed, "/"):
+		u.Path = slashed
+	default:
+		// OmitHost prevents url.URL.String from emitting file://rel/path (treating rel as host).
+		u.OmitHost = true
+		u.Path = slashed
+	}
 	return u.String(), nil
+}
+
+func isWindowsDrivePath(p string) bool {
+	if len(p) < 3 {
+		return false
+	}
+	c := p[0]
+	isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+	return isAlpha && p[1] == ':' && (p[2] == '/' || p[2] == '\\')
 }
 
 type sqliteConn struct {

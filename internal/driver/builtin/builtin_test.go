@@ -647,3 +647,58 @@ func TestMongoExplainPlanInspectionAndPreflightWarnings(t *testing.T) {
 		t.Fatalf("expected metadata command preflight Supported=false without warnings, got %+v", showRep)
 	}
 }
+
+func TestBuildSQLiteDSNWindowsAndRelativePaths(t *testing.T) {
+	cases := []struct {
+		name       string
+		cfg        driver.ConnectionConfig
+		wantPrefix string
+		wantQuery  string
+	}{
+		{
+			name: "windows_drive_path_uses_triple_slash",
+			cfg: driver.ConnectionConfig{
+				DatabaseName: `C:\Users\RUNNER~1\my db #1%test.sqlite`,
+				ReadOnly:     true,
+			},
+			wantPrefix: "file:///C:/Users/RUNNER~1/my%20db%20%231%25test.sqlite?",
+			wantQuery:  "mode=ro",
+		},
+		{
+			name: "unix_absolute_path_uses_triple_slash",
+			cfg: driver.ConnectionConfig{
+				DatabaseName: "/tmp/my db #1.sqlite",
+			},
+			wantPrefix: "file:///tmp/my%20db%20%231.sqlite?",
+		},
+		{
+			name: "relative_path_uses_omithost",
+			cfg: driver.ConnectionConfig{
+				DatabaseName: "data/my #1.sqlite",
+			},
+			wantPrefix: "file:data/my%20%231.sqlite?",
+		},
+		{
+			name: "in_memory_special_path",
+			cfg: driver.ConnectionConfig{
+				DatabaseName: ":memory:",
+			},
+			wantPrefix: "file::memory:?",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn, err := buildSQLiteDSN(tc.cfg)
+			if err != nil {
+				t.Fatalf("buildSQLiteDSN: %v", err)
+			}
+			if !strings.HasPrefix(dsn, tc.wantPrefix) {
+				t.Fatalf("dsn %q does not start with %q", dsn, tc.wantPrefix)
+			}
+			if tc.wantQuery != "" && !strings.Contains(dsn, tc.wantQuery) {
+				t.Fatalf("dsn %q missing expected query param %q", dsn, tc.wantQuery)
+			}
+		})
+	}
+}
