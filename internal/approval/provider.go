@@ -6,7 +6,10 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,7 +32,7 @@ type SubmissionResult struct {
 	ExternalTicketURL string
 }
 
-// Provider abstracts human approval channels (built-in local-web, Feishu, Slack, Ticket API).
+// Provider abstracts human approval channels (built-in local-web, webhook, Feishu, Slack, Ticket API).
 type Provider interface {
 	Name() string
 	SupportsInteractiveResolve() bool
@@ -43,14 +46,22 @@ type Resolution struct {
 	Err      error
 }
 
+type waitEntry struct {
+	ch   chan Resolution
+	done chan struct{}
+}
+
 // Manager coordinates ApprovalProviders, SQLite persistence, and wall-clock expiration.
 type Manager struct {
 	store     *store.Store
 	providers map[string]Provider
 
-	mu      sync.Mutex
-	waiters map[string]chan Resolution
-	wg      sync.WaitGroup
+	mu       sync.Mutex
+	waiters  map[string]*waitEntry
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	stopped  bool
+	wg       sync.WaitGroup
 }
 
 // NewManager constructs an ApprovalManager backed by store.
@@ -58,7 +69,8 @@ func NewManager(st *store.Store) *Manager {
 	return &Manager{
 		store:     st,
 		providers: make(map[string]Provider),
-		waiters:   make(map[string]chan Resolution),
+		waiters:   make(map[string]*waitEntry),
+		stopCh:    make(chan struct{}),
 	}
 }
 
@@ -80,6 +92,24 @@ func (m *Manager) ProviderNames() []string {
 	return names
 }
 
+// SanitizeTicketURL strips any one-time approval token query parameter before SQLite persistence.
+func SanitizeTicketURL(rawURL string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return ""
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	q := u.Query()
+	if q.Has("token") {
+		q.Del("token")
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
 // Submit creates a pending approval ticket, notifies the provider, and starts expiry tracking.
 func (m *Manager) Submit(ctx context.Context, providerName string, op types.Operation, detail types.TargetDetail, timeoutSec int) (types.ApprovalRequest, string, error) {
 	if timeoutSec <= 0 {
@@ -90,7 +120,11 @@ func (m *Manager) Submit(ctx context.Context, providerName string, op types.Oper
 	if !ok {
 		prov = m.providers["local-web"]
 	}
+	stopped := m.stopped
 	m.mu.Unlock()
+	if stopped {
+		return types.ApprovalRequest{}, "", fmt.Errorf("approval manager is shutting down")
+	}
 	if prov == nil {
 		return types.ApprovalRequest{}, "", fmt.Errorf("approval provider %q not registered", providerName)
 	}
@@ -137,20 +171,70 @@ func (m *Manager) Submit(ctx context.Context, providerName string, op types.Oper
 	if subRes != nil {
 		app.ExternalTicketID = subRes.ExternalTicketID
 		app.ExternalTicketURL = subRes.ExternalTicketURL
+		_ = m.store.UpdateApprovalTicket(ctx, app.ID, subRes.ExternalTicketID, SanitizeTicketURL(subRes.ExternalTicketURL))
 	}
 
+	entry := &waitEntry{
+		ch:   make(chan Resolution, 1),
+		done: make(chan struct{}),
+	}
 	m.mu.Lock()
-	m.waiters[app.ID] = make(chan Resolution, 1)
+	if m.stopped {
+		m.mu.Unlock()
+		close(entry.done)
+		close(entry.ch)
+		return app, subResURL(subRes), fmt.Errorf("approval manager is shutting down")
+	}
+	m.waiters[app.ID] = entry
+	m.wg.Add(1)
 	m.mu.Unlock()
 
 	// Schedule wall-clock expiration monitor using time.Now().Round(0) for macOS sleep safety.
-	m.wg.Add(1)
-	go func(approvalID string, deadline time.Time) {
+	go func(approvalID string, deadline time.Time, doneCh <-chan struct{}) {
 		defer m.wg.Done()
-		m.watchDeadline(approvalID, deadline)
-	}(app.ID, expiresAt)
+		m.watchDeadline(approvalID, deadline, doneCh)
+	}(app.ID, expiresAt, entry.done)
 
 	return app, subResURL(subRes), nil
+}
+
+// Rehydrate re-registers a deadline watcher and waiter channel for a still-valid pending
+// approval recovered after a daemon restart.
+func (m *Manager) Rehydrate(app types.ApprovalRequest) (<-chan Resolution, bool) {
+	if app.Status != types.ApprovalPending {
+		return nil, false
+	}
+	deadline, err := time.Parse(time.RFC3339Nano, app.ExpiresAtUTC)
+	if err != nil {
+		deadline, err = time.Parse(time.RFC3339, app.ExpiresAtUTC)
+		if err != nil {
+			return nil, false
+		}
+	}
+
+	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		return nil, false
+	}
+	if existing, ok := m.waiters[app.ID]; ok {
+		m.mu.Unlock()
+		return existing.ch, true
+	}
+	entry := &waitEntry{
+		ch:   make(chan Resolution, 1),
+		done: make(chan struct{}),
+	}
+	m.waiters[app.ID] = entry
+	m.wg.Add(1)
+	m.mu.Unlock()
+
+	go func(approvalID string, exp time.Time, doneCh <-chan struct{}) {
+		defer m.wg.Done()
+		m.watchDeadline(approvalID, exp, doneCh)
+	}(app.ID, deadline.UTC(), entry.done)
+
+	return entry.ch, true
 }
 
 func subResURL(r *SubmissionResult) string {
@@ -160,7 +244,7 @@ func subResURL(r *SubmissionResult) string {
 	return r.ExternalTicketURL
 }
 
-func (m *Manager) watchDeadline(approvalID string, deadline time.Time) {
+func (m *Manager) watchDeadline(approvalID string, deadline time.Time, done <-chan struct{}) {
 	for {
 		now := time.Now().Round(0).UTC()
 		if !now.Before(deadline) {
@@ -170,31 +254,44 @@ func (m *Manager) watchDeadline(approvalID string, deadline time.Time) {
 			}
 			return
 		}
-		m.mu.Lock()
-		_, stillWaiting := m.waiters[approvalID]
-		m.mu.Unlock()
-		if !stillWaiting {
-			return
-		}
 		sleepDur := deadline.Sub(now)
 		if sleepDur > 5*time.Second {
 			sleepDur = 5 * time.Second
 		}
-		time.Sleep(sleepDur)
+		timer := time.NewTimer(sleepDur)
+		select {
+		case <-timer.C:
+		case <-done:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-m.stopCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
 	}
 }
 
 // Wait blocks until an approval is resolved or ctx is canceled.
 func (m *Manager) Wait(ctx context.Context, approvalID string) (types.ApprovalRequest, error) {
 	m.mu.Lock()
-	ch, ok := m.waiters[approvalID]
+	entry, ok := m.waiters[approvalID]
 	m.mu.Unlock()
 	if !ok {
 		app, _, err := m.store.GetApproval(ctx, approvalID)
 		return app, err
 	}
 	select {
-	case res := <-ch:
+	case res := <-entry.ch:
 		return res.Approval, res.Err
 	case <-ctx.Done():
 		return types.ApprovalRequest{}, ctx.Err()
@@ -222,6 +319,9 @@ func (m *Manager) Resolve(ctx context.Context, approvalID string, approve bool, 
 	}
 	app, err := m.store.ResolveApproval(ctx, approvalID, next, reviewer, note)
 	if err != nil {
+		if errors.Is(err, store.ErrApprovalExpired) {
+			m.notifyWaiter(approvalID, Resolution{Approval: app})
+		}
 		return app, err
 	}
 	m.notifyWaiter(approvalID, Resolution{Approval: app})
@@ -246,28 +346,38 @@ func (m *Manager) Cancel(ctx context.Context, approvalID, actor string) (types.A
 
 func (m *Manager) notifyWaiter(approvalID string, res Resolution) {
 	m.mu.Lock()
-	ch, ok := m.waiters[approvalID]
+	entry, ok := m.waiters[approvalID]
 	if ok {
 		delete(m.waiters, approvalID)
 	}
 	m.mu.Unlock()
 	if ok {
+		close(entry.done)
 		select {
-		case ch <- res:
+		case entry.ch <- res:
 		default:
 		}
-		close(ch)
+		close(entry.ch)
 	}
 }
 
-// Shutdown waits for deadline monitor goroutines to exit cleanly.
+// Shutdown signals all deadline monitor goroutines to exit immediately and waits for cleanup.
 func (m *Manager) Shutdown() {
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
+	})
 	m.mu.Lock()
-	for id, ch := range m.waiters {
+	m.stopped = true
+	entries := make([]*waitEntry, 0, len(m.waiters))
+	for id, entry := range m.waiters {
 		delete(m.waiters, id)
-		close(ch)
+		entries = append(entries, entry)
 	}
 	m.mu.Unlock()
+	for _, entry := range entries {
+		close(entry.done)
+		close(entry.ch)
+	}
 	m.wg.Wait()
 }
 

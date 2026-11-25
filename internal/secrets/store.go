@@ -4,14 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
+
+const maxExecSecretBytes = 64 << 10 // 64 KiB
 
 // ErrNotFound indicates no secret is stored for the requested profile.
 var ErrNotFound = errors.New("secret not found")
@@ -38,6 +42,86 @@ func NewStore(paths config.Paths) Store {
 		return NewFileStore(paths.SecretFile)
 	}
 	return newPlatformStore(paths)
+}
+
+// SplitExecArgs splits a command line into executable and arguments with support for
+// single quotes, double quotes, and backslash escapes, without invoking a shell.
+func SplitExecArgs(cmdLine string) ([]string, error) {
+	trimmed := strings.TrimSpace(cmdLine)
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty exec_command")
+	}
+
+	var args []string
+	var cur strings.Builder
+	inToken := false
+	var quote rune
+
+	runes := []rune(trimmed)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if quote != 0 {
+			if quote == '\'' {
+				if r == '\'' {
+					quote = 0
+					continue
+				}
+				cur.WriteRune(r)
+				continue
+			}
+			// Double-quoted segment: supports \", \\, \$, \` escapes.
+			if r == '\\' && i+1 < len(runes) {
+				next := runes[i+1]
+				if next == '"' || next == '\\' || next == '$' || next == '`' {
+					cur.WriteRune(next)
+					i++
+					continue
+				}
+			}
+			if r == '"' {
+				quote = 0
+				continue
+			}
+			cur.WriteRune(r)
+			continue
+		}
+
+		if unicode.IsSpace(r) {
+			if inToken {
+				args = append(args, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			inToken = true
+			continue
+		}
+		if r == '\\' {
+			if i+1 >= len(runes) {
+				return nil, fmt.Errorf("dangling escape in exec_command")
+			}
+			cur.WriteRune(runes[i+1])
+			inToken = true
+			i++
+			continue
+		}
+		cur.WriteRune(r)
+		inToken = true
+	}
+
+	if quote != 0 {
+		return nil, fmt.Errorf("unclosed quote in exec_command")
+	}
+	if inToken {
+		args = append(args, cur.String())
+	}
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		return nil, fmt.Errorf("empty executable in exec_command")
+	}
+	return args, nil
 }
 
 // ResolveCredential resolves runtime credentials for a CredentialProfile without leaking secrets.
@@ -68,18 +152,32 @@ func ResolveCredential(ctx context.Context, store Store, prof *types.CredentialP
 		out.Secret = val
 		return out, nil
 	case types.CredExecProvider:
-		cmdLine := strings.TrimSpace(prof.ExecCommand)
-		if cmdLine == "" {
-			return out, fmt.Errorf("credential %q has empty exec_command", prof.ID)
+		parts, err := SplitExecArgs(prof.ExecCommand)
+		if err != nil {
+			return out, fmt.Errorf("credential %q invalid exec_command: %w", prof.Name, err)
 		}
-		parts := strings.Fields(cmdLine)
 		execCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		// Execute directly without shell interpolation to block command injection.
 		cmd := exec.CommandContext(execCtx, parts[0], parts[1:]...) //nolint:gosec // Explicit user-configured credential command without shell.
-		raw, err := cmd.Output()
+		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			return out, fmt.Errorf("credential %q exec_provider failed: %w", prof.Name, err)
+			return out, fmt.Errorf("credential %q exec_provider pipe failed: %w", prof.Name, err)
+		}
+		if err := cmd.Start(); err != nil {
+			return out, fmt.Errorf("credential %q exec_provider start failed: %w", prof.Name, err)
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(stdout, maxExecSecretBytes+1))
+		waitErr := cmd.Wait()
+		if readErr != nil {
+			return out, fmt.Errorf("credential %q exec_provider read failed: %w", prof.Name, readErr)
+		}
+		if len(raw) > maxExecSecretBytes {
+			return out, fmt.Errorf("credential %q exec_provider output exceeded %d bytes", prof.Name, maxExecSecretBytes)
+		}
+		if waitErr != nil {
+			// Never include stdout bytes in error messages.
+			return out, fmt.Errorf("credential %q exec_provider failed: %w", prof.Name, waitErr)
 		}
 		out.Secret = strings.TrimRight(string(raw), "\r\n")
 		return out, nil

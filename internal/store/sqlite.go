@@ -308,7 +308,9 @@ END;
 CREATE INDEX IF NOT EXISTS idx_operations_created ON operations(created_at_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, created_at_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_approvals_operation ON approvals(operation_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(seq DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action, seq DESC);
 `
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

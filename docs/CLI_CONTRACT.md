@@ -55,7 +55,7 @@ Operating system exit codes are constrained to integers `0..125` (codes `>= 126`
 | Exit Code | Category | Representative `error.code` values |
 |---|---|---|
 | `0` | Success | — (also returned for `--dry-run` / `--preflight` when analysis succeeds) |
-| `1` | Execution / Internal Error | `driver_error`, `daemon_unavailable`, `internal_error`, `plugin_invalid`, `audit_tampered` |
+| `1` | Execution / Internal Error | `driver_error`, `daemon_unavailable`, `daemon_restarted`, `internal_error`, `plugin_invalid`, `audit_tampered` |
 | `2` | Usage / Validation Error | `invalid_usage`, `invalid_input`, `unknown_flag`, `multi_target_write_forbidden` |
 | `3` | Resource Not Found | `db_not_found`, `operation_not_found`, `system_not_found` |
 | `4` | Policy / Approval Rejection | `policy_denied`, `approval_rejected`, `prod_frozen` |
@@ -124,3 +124,6 @@ agent-dbctl skill print
 | `AGENT_DBCTL_NO_SKILL_SYNC` | Set `1`/`true` to disable silent companion `SKILL.md` installation on CLI startup |
 | `AGENT_DBCTL_SKILLS_AUTO` | Set `0`/`false` (equivalent to `AGENT_DBCTL_NO_SKILL_SYNC=1`) |
 | `AGENT_DBCTL_SKILL_HOME` | Override target skill root directory cleanly (useful for isolated tests) |
+| `AGENT_DBCTL_WEBHOOK_URL` | Enable built-in `webhook` approval provider pointing at an external approval endpoint (`https://`, or `http://` on loopback only) |
+| `AGENT_DBCTL_WEBHOOK_SECRET` | Optional HMAC-SHA256 signing secret for `X-Agent-DBCTL-Signature` headers on webhook approval notifications |
+| `AGENT_DBCTL_WEBHOOK_TIMEOUT` | Optional webhook HTTP timeout duration (e.g. `10s`; default `5s`, capped at `30s`) |

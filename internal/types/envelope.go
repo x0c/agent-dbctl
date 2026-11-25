@@ -31,6 +31,7 @@ const (
 	ErrCodeHighCostReadBlocked    = "high_cost_read_blocked"
 	ErrCodeDriverError            = "driver_error"
 	ErrCodeDaemonUnavailable      = "daemon_unavailable"
+	ErrCodeDaemonRestarted        = "daemon_restarted"
 	ErrCodeDaemonVersionMismatch  = "daemon_version_mismatch"
 	ErrCodePluginInvalid          = "plugin_invalid"
 	ErrCodeAuditTampered          = "audit_tampered"

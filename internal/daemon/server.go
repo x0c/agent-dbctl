@@ -48,6 +48,12 @@ func StartServer(ctx context.Context, paths config.Paths, version, commit, webPo
 	}
 	webURL := "http://" + webLn.Addr().String()
 	svc.SetWebURL(webURL)
+	_ = svc.RegisterWebhookProviderFromEnv()
+	if _, recErr := svc.RecoverOnStartup(ctx); recErr != nil {
+		_ = webLn.Close()
+		svc.Shutdown()
+		return nil, fmt.Errorf("recover startup state: %w", recErr)
+	}
 
 	rpcLn, rpcAddr, rpcToken, err := ListenRPC(paths)
 	if err != nil {

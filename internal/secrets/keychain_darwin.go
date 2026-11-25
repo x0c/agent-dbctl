@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/x0c/agent-dbctl/internal/config"
 )
@@ -30,16 +31,38 @@ func (k *KeychainStore) Name() string {
 	return "keychain"
 }
 
-func (k *KeychainStore) accountName(key string) string {
-	return k.session + ":" + key
+func validateKeychainToken(label, val string) error {
+	if val == "" {
+		return fmt.Errorf("empty %s", label)
+	}
+	for _, r := range val {
+		if r == '\r' || r == '\n' || r == '\x00' || r == '"' || unicode.IsSpace(r) {
+			return fmt.Errorf("invalid character in keychain %s", label)
+		}
+	}
+	return nil
+}
+
+func (k *KeychainStore) accountName(key string) (string, error) {
+	if err := validateKeychainToken("session", k.session); err != nil {
+		return "", err
+	}
+	if err := validateKeychainToken("key", key); err != nil {
+		return "", err
+	}
+	return k.session + ":" + key, nil
 }
 
 func (k *KeychainStore) Get(ctx context.Context, key string) (string, error) {
+	acct, err := k.accountName(key)
+	if err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "security", "-i")
 	// Account/service are non-secret identifiers; password is read from stdout.
-	line := fmt.Sprintf("find-generic-password -s %s -a %s -w\n", keychainService, k.accountName(key))
+	line := fmt.Sprintf("find-generic-password -s %s -a %s -w\n", keychainService, acct)
 	cmd.Stdin = strings.NewReader(line)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -63,12 +86,16 @@ func (k *KeychainStore) Get(ctx context.Context, key string) (string, error) {
 }
 
 func (k *KeychainStore) Put(ctx context.Context, key, value string) error {
+	acct, err := k.accountName(key)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	// Encode as base64 so multiline keys or quotes never break `security -i` line parsing or touch argv.
 	encoded := "b64:" + base64.StdEncoding.EncodeToString([]byte(value))
 	cmd := exec.CommandContext(ctx, "security", "-i")
-	line := fmt.Sprintf("add-generic-password -U -s %s -a %s -w %s\n", keychainService, k.accountName(key), encoded)
+	line := fmt.Sprintf("add-generic-password -U -s %s -a %s -w %s\n", keychainService, acct, encoded)
 	cmd.Stdin = strings.NewReader(line)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -79,10 +106,14 @@ func (k *KeychainStore) Put(ctx context.Context, key, value string) error {
 }
 
 func (k *KeychainStore) Delete(ctx context.Context, key string) error {
+	acct, err := k.accountName(key)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "security", "-i")
-	line := fmt.Sprintf("delete-generic-password -s %s -a %s\n", keychainService, k.accountName(key))
+	line := fmt.Sprintf("delete-generic-password -s %s -a %s\n", keychainService, acct)
 	cmd.Stdin = strings.NewReader(line)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

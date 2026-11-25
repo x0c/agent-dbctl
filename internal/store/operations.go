@@ -7,10 +7,34 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/x0c/agent-dbctl/internal/audit"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
+
+// ErrApprovalExpired indicates an approval ticket already passed its expiration timestamp.
+var ErrApprovalExpired = fmt.Errorf("%w: approval expired", ErrConflict)
+
+// RecoveryReport summarizes interrupted operations and pending approvals reconciled on daemon startup.
+type RecoveryReport struct {
+	InterruptedOps         int                     `json:"interrupted_ops"`
+	ExpiredApprovals       int                     `json:"expired_approvals"`
+	ReconciledOps          int                     `json:"reconciled_ops"`
+	ActivePendingApprovals []types.ApprovalRequest `json:"active_pending_approvals,omitempty"`
+}
+
+// AuditFilter narrows audit_logs queries with optional pagination.
+type AuditFilter struct {
+	Action      string
+	TargetID    string
+	OperationID string
+	Actor       string
+	SinceUTC    string
+	UntilUTC    string
+	Limit       int
+	Offset      int
+}
 
 // CreateOperation writes the initial WAL operation and audit record in a single transaction.
 func (s *Store) CreateOperation(ctx context.Context, op types.Operation) (types.Operation, error) {
@@ -50,14 +74,14 @@ func (s *Store) CreateOperation(ctx context.Context, op types.Operation) (types.
 			return err
 		}
 		return s.appendAuditTx(ctx, tx, op.Actor, "operation.submit", op.TargetID, op.ID, map[string]any{
-			"target_ref":  op.TargetRef,
-			"env":         op.EnvironmentCode,
-			"engine":      op.Engine,
-			"risk_level":  op.RiskLevel,
-			"decision":    op.Decision,
-			"status":      op.Status,
-			"reason":      op.Reason,
-			"query":       op.QueryRedacted,
+			"target_ref": op.TargetRef,
+			"env":        op.EnvironmentCode,
+			"engine":     op.Engine,
+			"risk_level": op.RiskLevel,
+			"decision":   op.Decision,
+			"status":     op.Status,
+			"reason":     op.Reason,
+			"query":      op.QueryRedacted,
 		}, now)
 	})
 	return op, err
@@ -75,31 +99,36 @@ func (s *Store) UpdateOperation(ctx context.Context, actor, auditAction string, 
 	}
 
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
-			UPDATE operations SET
-				decision = ?, trigger_reasons_json = ?, preflight_json = ?, status = ?,
-				credential_mode = ?, approval_id = ?, fetched_rows = ?, returned_rows = ?,
-				affected_rows = ?, truncated = ?, cutoff_reason = ?, latency_ms = ?,
-				error_code = ?, error_message = ?, retryable = ?, updated_at_utc = ?, completed_at_utc = ?
-			WHERE id = ?`,
-			string(op.Decision), string(trigJSON), preflightJSON, string(op.Status),
-			string(op.CredentialMode), op.ApprovalID, op.FetchedRows, op.ReturnedRows,
-			nullableInt64(op.AffectedRows), boolToInt(op.Truncated), op.CutoffReason, op.LatencyMs,
-			op.ErrorCode, op.ErrorMessage, boolToInt(op.Retryable), op.UpdatedAtUTC, op.CompletedAtUTC, op.ID)
-		if err != nil {
-			return err
-		}
-		return s.appendAuditTx(ctx, tx, actor, auditAction, op.TargetID, op.ID, map[string]any{
-			"status":        op.Status,
-			"fetched_rows":  op.FetchedRows,
-			"returned_rows": op.ReturnedRows,
-			"affected_rows": op.AffectedRows,
-			"truncated":     op.Truncated,
-			"latency_ms":    op.LatencyMs,
-			"error_code":    op.ErrorCode,
-		}, now)
+		return s.updateOperationTx(ctx, tx, actor, auditAction, &op, trigJSON, preflightJSON, now)
 	})
 	return op, err
+}
+
+func (s *Store) updateOperationTx(ctx context.Context, tx *sql.Tx, actor, auditAction string, op *types.Operation, trigJSON []byte, preflightJSON, ts string) error {
+	op.UpdatedAtUTC = ts
+	_, err := tx.ExecContext(ctx, `
+		UPDATE operations SET
+			decision = ?, trigger_reasons_json = ?, preflight_json = ?, status = ?,
+			credential_mode = ?, approval_id = ?, fetched_rows = ?, returned_rows = ?,
+			affected_rows = ?, truncated = ?, cutoff_reason = ?, latency_ms = ?,
+			error_code = ?, error_message = ?, retryable = ?, updated_at_utc = ?, completed_at_utc = ?
+		WHERE id = ?`,
+		string(op.Decision), string(trigJSON), preflightJSON, string(op.Status),
+		string(op.CredentialMode), op.ApprovalID, op.FetchedRows, op.ReturnedRows,
+		nullableInt64(op.AffectedRows), boolToInt(op.Truncated), op.CutoffReason, op.LatencyMs,
+		op.ErrorCode, op.ErrorMessage, boolToInt(op.Retryable), op.UpdatedAtUTC, op.CompletedAtUTC, op.ID)
+	if err != nil {
+		return err
+	}
+	return s.appendAuditTx(ctx, tx, actor, auditAction, op.TargetID, op.ID, map[string]any{
+		"status":        op.Status,
+		"fetched_rows":  op.FetchedRows,
+		"returned_rows": op.ReturnedRows,
+		"affected_rows": op.AffectedRows,
+		"truncated":     op.Truncated,
+		"latency_ms":    op.LatencyMs,
+		"error_code":    op.ErrorCode,
+	}, ts)
 }
 
 // GetOperation returns an operation by ID.
@@ -213,6 +242,23 @@ func (s *Store) CreateApproval(ctx context.Context, actor string, app types.Appr
 	return app, err
 }
 
+// UpdateApprovalTicket persists sanitized external ticket metadata after ApprovalProvider.Submit succeeds.
+func (s *Store) UpdateApprovalTicket(ctx context.Context, id, externalTicketID, externalTicketURL string) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE approvals SET external_ticket_id = ?, external_ticket_url = ? WHERE id = ?`,
+			externalTicketID, externalTicketURL, id)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
 // GetApproval returns an approval ticket and its stored token hash.
 func (s *Store) GetApproval(ctx context.Context, id string) (types.ApprovalRequest, string, error) {
 	row := s.db.QueryRowContext(ctx, `
@@ -260,9 +306,13 @@ func (s *Store) ListApprovals(ctx context.Context, status string, limit int) ([]
 }
 
 // ResolveApproval atomically transitions a pending approval to approved/rejected/expired/cancelled and writes an audit entry.
+// When approving an already-expired ticket, it commits the expired transition and returns ErrApprovalExpired.
 func (s *Store) ResolveApproval(ctx context.Context, id string, nextStatus types.ApprovalStatus, reviewer, note string) (types.ApprovalRequest, error) {
 	var updated types.ApprovalRequest
-	now := nowUTC()
+	var expiredErr error
+	nowTime := time.Now().Round(0).UTC()
+	now := nowTime.Format(time.RFC3339Nano)
+
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
 		row := tx.QueryRowContext(ctx, `
 			SELECT id, operation_id, provider, external_ticket_id, external_ticket_url, token_hash,
@@ -277,6 +327,32 @@ func (s *Store) ResolveApproval(ctx context.Context, id string, nextStatus types
 		if cur.Status != types.ApprovalPending {
 			return fmt.Errorf("%w: approval %s already %s", ErrConflict, id, cur.Status)
 		}
+
+		if nextStatus == types.ApprovalApproved {
+			if exp, ok := parseUTCTime(cur.ExpiresAtUTC); ok && !nowTime.Before(exp) {
+				cur.Status = types.ApprovalExpired
+				cur.Reviewer = "system"
+				cur.ReviewerNote = "approval expired before resolution"
+				cur.ResolvedAtUTC = now
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE approvals SET status = ?, reviewer = ?, reviewer_note = ?, resolved_at_utc = ? WHERE id = ?`,
+					string(cur.Status), cur.Reviewer, cur.ReviewerNote, now, id); err != nil {
+					return err
+				}
+				if err := s.appendAuditTx(ctx, tx, "system", "approval.expired", cur.TargetRef, cur.OperationID, map[string]any{
+					"approval_id":   id,
+					"status":        cur.Status,
+					"reviewer_note": cur.ReviewerNote,
+				}, now); err != nil {
+					return err
+				}
+				updated = cur
+				expiredErr = ErrApprovalExpired
+				// Return nil so the expired state and audit row commit cleanly.
+				return nil
+			}
+		}
+
 		cur.Status = nextStatus
 		cur.Reviewer = reviewer
 		cur.ReviewerNote = note
@@ -295,38 +371,293 @@ func (s *Store) ResolveApproval(ctx context.Context, id string, nextStatus types
 			"reviewer_note": note,
 		}, now)
 	})
-	return updated, err
+	if err != nil {
+		return updated, err
+	}
+	if expiredErr != nil {
+		return updated, expiredErr
+	}
+	return updated, nil
+}
+
+// RecoverOnStartup reconciles interrupted operations, expires overdue pending approvals,
+// and collects still-valid pending approvals inside one atomic transaction.
+func (s *Store) RecoverOnStartup(ctx context.Context, actor string) (RecoveryReport, error) {
+	if actor == "" {
+		actor = "system"
+	}
+	nowTime := time.Now().Round(0).UTC()
+	now := nowTime.Format(time.RFC3339Nano)
+	var report RecoveryReport
+
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		// 1. Mark any interrupted running/pending operations as failed with daemon_restarted.
+		runningOps, err := queryOperationsTx(ctx, tx, `
+			SELECT id, target_id, target_ref, system_id, system_slug, environment_code, engine,
+				actor, reason, workspace_cwd, query_text, query_redacted,
+				risk_level, decision, trigger_reasons_json, classification_json, preflight_json,
+				status, credential_mode, approval_id, fetched_rows, returned_rows, affected_rows,
+				truncated, cutoff_reason, latency_ms, error_code, error_message, retryable,
+				created_at_utc, updated_at_utc, completed_at_utc
+			FROM operations WHERE status IN ('running', 'pending')`)
+		if err != nil {
+			return err
+		}
+		for i := range runningOps {
+			op := runningOps[i]
+			op.Status = types.OpFailed
+			op.ErrorCode = types.ErrCodeDaemonRestarted
+			op.ErrorMessage = "Daemon restarted while operation was in progress; verify database state before retrying."
+			op.Retryable = op.Classification.IsReadOnly
+			op.CompletedAtUTC = now
+			trigJSON, _ := json.Marshal(op.TriggerReasons)
+			var preflightJSON string
+			if op.Preflight != nil {
+				b, _ := json.Marshal(op.Preflight)
+				preflightJSON = string(b)
+			}
+			if err := s.updateOperationTx(ctx, tx, actor, "operation.interrupted", &op, trigJSON, preflightJSON, now); err != nil {
+				return err
+			}
+			report.InterruptedOps++
+		}
+
+		// 2. Scan pending approvals: expire overdue ones and return active ones for waiter rehydration.
+		pendingApps, err := queryApprovalsTx(ctx, tx, `
+			SELECT id, operation_id, provider, external_ticket_id, external_ticket_url, token_hash,
+				status, target_ref, system_slug, environment_code, engine, actor, reason, workspace_cwd,
+				query_text, risk_level, trigger_reasons_json, preflight_json,
+				reviewer, reviewer_note, created_at_utc, expires_at_utc, resolved_at_utc
+			FROM approvals WHERE status = 'pending' ORDER BY created_at_utc ASC`)
+		if err != nil {
+			return err
+		}
+
+		for _, app := range pendingApps {
+			if exp, ok := parseUTCTime(app.ExpiresAtUTC); ok && !nowTime.Before(exp) {
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE approvals SET status = ?, reviewer = ?, reviewer_note = ?, resolved_at_utc = ? WHERE id = ?`,
+					string(types.ApprovalExpired), "system", "approval expired during daemon downtime", now, app.ID); err != nil {
+					return err
+				}
+				if err := s.appendAuditTx(ctx, tx, actor, "approval.expired", app.TargetRef, app.OperationID, map[string]any{
+					"approval_id":   app.ID,
+					"status":        types.ApprovalExpired,
+					"reviewer_note": "approval expired during daemon downtime",
+				}, now); err != nil {
+					return err
+				}
+				report.ExpiredApprovals++
+
+				// Transition linked waiting_approval operation if still waiting.
+				opRow := tx.QueryRowContext(ctx, opSelectByIDQuery, app.OperationID)
+				if op, opErr := scanOperation(opRow); opErr == nil && op.Status == types.OpWaitingApproval {
+					op.Status = types.OpExpired
+					op.ErrorCode = types.ErrCodeApprovalTimeout
+					op.ErrorMessage = "Approval timed out while daemon was offline."
+					op.Retryable = true
+					op.CompletedAtUTC = now
+					trigJSON, _ := json.Marshal(op.TriggerReasons)
+					var preflightJSON string
+					if op.Preflight != nil {
+						b, _ := json.Marshal(op.Preflight)
+						preflightJSON = string(b)
+					}
+					if err := s.updateOperationTx(ctx, tx, actor, "operation.expired", &op, trigJSON, preflightJSON, now); err != nil {
+						return err
+					}
+					report.ReconciledOps++
+				}
+			} else {
+				report.ActivePendingApprovals = append(report.ActivePendingApprovals, app)
+			}
+		}
+
+		// 3. Reconcile any remaining waiting_approval operations whose approval is terminal or missing.
+		waitingOps, err := queryOperationsTx(ctx, tx, `
+			SELECT id, target_id, target_ref, system_id, system_slug, environment_code, engine,
+				actor, reason, workspace_cwd, query_text, query_redacted,
+				risk_level, decision, trigger_reasons_json, classification_json, preflight_json,
+				status, credential_mode, approval_id, fetched_rows, returned_rows, affected_rows,
+				truncated, cutoff_reason, latency_ms, error_code, error_message, retryable,
+				created_at_utc, updated_at_utc, completed_at_utc
+			FROM operations WHERE status = 'waiting_approval'`)
+		if err != nil {
+			return err
+		}
+		for i := range waitingOps {
+			op := waitingOps[i]
+			var appStatus types.ApprovalStatus
+			var appFound bool
+			if op.ApprovalID != "" {
+				appRow := tx.QueryRowContext(ctx, `
+					SELECT id, operation_id, provider, external_ticket_id, external_ticket_url, token_hash,
+						status, target_ref, system_slug, environment_code, engine, actor, reason, workspace_cwd,
+						query_text, risk_level, trigger_reasons_json, preflight_json,
+						reviewer, reviewer_note, created_at_utc, expires_at_utc, resolved_at_utc
+					FROM approvals WHERE id = ?`, op.ApprovalID)
+				if app, _, appErr := scanApproval(appRow); appErr == nil {
+					appStatus = app.Status
+					appFound = true
+				} else if !errors.Is(appErr, ErrNotFound) {
+					return appErr
+				}
+			}
+			if appFound && appStatus == types.ApprovalPending {
+				continue
+			}
+
+			switch {
+			case appFound && appStatus == types.ApprovalRejected:
+				op.Status = types.OpRejected
+				op.ErrorCode = types.ErrCodeApprovalRejected
+				op.ErrorMessage = "Execution was rejected by human reviewer."
+				op.Retryable = false
+			case appFound && appStatus == types.ApprovalExpired:
+				op.Status = types.OpExpired
+				op.ErrorCode = types.ErrCodeApprovalTimeout
+				op.ErrorMessage = "Approval timed out before a human responded."
+				op.Retryable = true
+			case appFound && appStatus == types.ApprovalCancelled:
+				op.Status = types.OpCancelled
+				op.ErrorCode = types.ErrCodePolicyDenied
+				op.ErrorMessage = "Operation was cancelled."
+				op.Retryable = false
+			default:
+				op.Status = types.OpFailed
+				op.ErrorCode = types.ErrCodeDaemonRestarted
+				op.ErrorMessage = "Daemon restarted while approved or unlinked operation was pending execution; verify database state before retrying."
+				op.Retryable = op.Classification.IsReadOnly
+			}
+			op.CompletedAtUTC = now
+			trigJSON, _ := json.Marshal(op.TriggerReasons)
+			var preflightJSON string
+			if op.Preflight != nil {
+				b, _ := json.Marshal(op.Preflight)
+				preflightJSON = string(b)
+			}
+			if err := s.updateOperationTx(ctx, tx, actor, "operation.reconciled", &op, trigJSON, preflightJSON, now); err != nil {
+				return err
+			}
+			report.ReconciledOps++
+		}
+		return nil
+	})
+	return report, err
+}
+
+const opSelectByIDQuery = `
+	SELECT id, target_id, target_ref, system_id, system_slug, environment_code, engine,
+		actor, reason, workspace_cwd, query_text, query_redacted,
+		risk_level, decision, trigger_reasons_json, classification_json, preflight_json,
+		status, credential_mode, approval_id, fetched_rows, returned_rows, affected_rows,
+		truncated, cutoff_reason, latency_ms, error_code, error_message, retryable,
+		created_at_utc, updated_at_utc, completed_at_utc
+	FROM operations WHERE id = ?`
+
+func queryOperationsTx(ctx context.Context, tx *sql.Tx, q string, args ...any) ([]types.Operation, error) {
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []types.Operation
+	for rows.Next() {
+		op, err := scanOperation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, op)
+	}
+	return out, rows.Err()
+}
+
+func queryApprovalsTx(ctx context.Context, tx *sql.Tx, q string, args ...any) ([]types.ApprovalRequest, error) {
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []types.ApprovalRequest
+	for rows.Next() {
+		app, _, err := scanApproval(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, app)
+	}
+	return out, rows.Err()
 }
 
 // ListAuditEntries returns audit logs ordered newest first.
 func (s *Store) ListAuditEntries(ctx context.Context, action, targetID, opID string, limit int) ([]types.AuditEntry, error) {
-	if limit <= 0 || limit > 1000 {
+	items, _, err := s.ListAuditEntriesFiltered(ctx, AuditFilter{
+		Action:      action,
+		TargetID:    targetID,
+		OperationID: opID,
+		Limit:       limit,
+	})
+	return items, err
+}
+
+// ListAuditEntriesFiltered returns filtered audit entries along with the total matching row count.
+func (s *Store) ListAuditEntriesFiltered(ctx context.Context, f AuditFilter) ([]types.AuditEntry, int, error) {
+	limit := f.Limit
+	if limit <= 0 {
 		limit = 200
+	} else if limit > 1000 {
+		limit = 1000
 	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
 	var conds []string
 	var args []any
-	if action != "" {
+	if f.Action != "" {
 		conds = append(conds, "action LIKE ?")
-		args = append(args, "%"+action+"%")
+		args = append(args, "%"+f.Action+"%")
 	}
-	if targetID != "" {
+	if f.TargetID != "" {
 		conds = append(conds, "target_id LIKE ?")
-		args = append(args, "%"+targetID+"%")
+		args = append(args, "%"+f.TargetID+"%")
 	}
-	if opID != "" {
+	if f.OperationID != "" {
 		conds = append(conds, "operation_id = ?")
-		args = append(args, opID)
+		args = append(args, f.OperationID)
 	}
-	q := `SELECT seq, id, actor, action, target_id, operation_id, payload_json, prev_hash, entry_hash, created_at_utc FROM audit_logs`
-	if len(conds) > 0 {
-		q += " WHERE " + strings.Join(conds, " AND ")
+	if f.Actor != "" {
+		conds = append(conds, "actor = ?")
+		args = append(args, f.Actor)
 	}
-	q += " ORDER BY seq DESC LIMIT ?"
-	args = append(args, limit)
+	if f.SinceUTC != "" {
+		conds = append(conds, "created_at_utc >= ?")
+		args = append(args, f.SinceUTC)
+	}
+	if f.UntilUTC != "" {
+		conds = append(conds, "created_at_utc <= ?")
+		args = append(args, f.UntilUTC)
+	}
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	whereClause := ""
+	if len(conds) > 0 {
+		whereClause = " WHERE " + strings.Join(conds, " AND ")
+	}
+
+	var totalMatched int
+	countQ := `SELECT COUNT(1) FROM audit_logs` + whereClause
+	if err := s.db.QueryRowContext(ctx, countQ, args...).Scan(&totalMatched); err != nil {
+		return nil, 0, err
+	}
+
+	q := `SELECT seq, id, actor, action, target_id, operation_id, payload_json, prev_hash, entry_hash, created_at_utc FROM audit_logs` +
+		whereClause + ` ORDER BY seq DESC LIMIT ? OFFSET ?`
+	pageArgs := append(append([]any{}, args...), limit, offset)
+
+	rows, err := s.db.QueryContext(ctx, q, pageArgs...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -334,11 +665,11 @@ func (s *Store) ListAuditEntries(ctx context.Context, action, targetID, opID str
 	for rows.Next() {
 		var e types.AuditEntry
 		if err := rows.Scan(&e.Seq, &e.ID, &e.Actor, &e.Action, &e.TargetID, &e.OperationID, &e.PayloadJSON, &e.PrevHash, &e.EntryHash, &e.CreatedAtUTC); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	return out, totalMatched, rows.Err()
 }
 
 // VerifyAuditChain checks SHA-256 chain continuity across all audit_logs rows.
@@ -456,4 +787,17 @@ func nullableInt64(p *int64) sql.NullInt64 {
 		return sql.NullInt64{}
 	}
 	return sql.NullInt64{Int64: *p, Valid: true}
+}
+
+func parseUTCTime(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return t.UTC(), true
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t.UTC(), true
+	}
+	return time.Time{}, false
 }
