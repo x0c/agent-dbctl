@@ -3,7 +3,10 @@ package builtin
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
+	sqldriver "database/sql/driver"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -12,8 +15,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/microsoft/go-mssqldb/msdsn"
@@ -489,7 +494,17 @@ func TestDamengOpenGaussKingbaseDSNAndPlans(t *testing.T) {
 		TLSMode:      "verify-full",
 		Credential:   secrets.ResolvedSecret{Username: "gaussdb", Secret: "s3cr@t"},
 	})
-	if !strings.HasPrefix(ogDSN, "opengauss://gaussdb:s3cr%40t@og.internal:5432/finance?") || !strings.Contains(ogDSN, "sslmode=verify-full") {
+	ogU, ogParseErr := url.Parse(ogDSN)
+	if ogParseErr != nil || ogU == nil {
+		t.Fatalf("parse opengauss DSN %q: %v", ogDSN, ogParseErr)
+	}
+	ogPW, _ := ogU.User.Password()
+	if ogU.Scheme != "postgres" ||
+		ogU.User.Username() != "gaussdb" ||
+		ogPW != "s3cr@t" ||
+		ogU.Host != "og.internal:5432" ||
+		ogU.Path != "/finance" ||
+		ogU.Query().Get("sslmode") != "verify-full" {
 		t.Fatalf("unexpected opengauss DSN: %q", ogDSN)
 	}
 	kbDSN := buildKingbaseDSN(driver.ConnectionConfig{
@@ -662,5 +677,491 @@ func TestTDengineEndToEndMockServer(t *testing.T) {
 	_ = roConn.Close()
 	if hookCalls.Load() != 1 {
 		t.Fatalf("expected CloseHook called once, got %d", hookCalls.Load())
+	}
+
+	// Verify RW writes succeed, Taosd auth token header works, non-zero errors propagate, and ResetSession/Classify behave cleanly.
+	rwConn, err := drv.Open(context.Background(), driver.ConnectionConfig{
+		Engine:       "tdengine",
+		Host:         host,
+		Port:         port,
+		DatabaseName: "power",
+		ReadOnly:     false,
+		Credential:   secrets.ResolvedSecret{Secret: "tok_abc123"},
+		Params:       map[string]string{"auth_type": "taosd"},
+	})
+	if err != nil {
+		t.Fatalf("Open tdengine taosd RW: %v", err)
+	}
+	defer func() { _ = rwConn.Close() }()
+	if gotAuth, _ := seenAuth.Load().(string); gotAuth != "Taosd tok_abc123" {
+		t.Fatalf("expected Taosd auth header, got %q", gotAuth)
+	}
+	if resetter, ok := rwConn.(interface{ ResetSession(context.Context) error }); !ok {
+		t.Fatal("expected tdengine conn to implement ResetSession")
+	} else if err := resetter.ResetSession(context.Background()); err != nil {
+		t.Fatalf("tdengine ResetSession: %v", err)
+	}
+	if capRep, ok := rwConn.(interface{ Capabilities() *types.ServerCapabilities }); !ok {
+		t.Fatal("expected tdengine conn to implement Capabilities")
+	} else if caps := capRep.Capabilities(); caps == nil || caps.Dialect != "tdengine" {
+		t.Fatalf("expected Open Ping to populate tdengine capabilities, got %+v", caps)
+	}
+	if cls, cErr := drv.Classify(context.Background(), "SELECT * FROM meters"); cErr != nil || !cls.IsReadOnly {
+		t.Fatalf("tdengine Classify failed: cls=%+v err=%v", cls, cErr)
+	}
+	insRes, err := rwConn.Execute(context.Background(), "INSERT INTO d1001 VALUES (NOW, 12.3)", driver.ExecOpts{})
+	if err != nil || insRes.AffectedRows == nil || *insRes.AffectedRows != 1 || seenWriteCalls.Load() != 1 {
+		t.Fatalf("expected TDengine RW INSERT affected=1, got res=%+v err=%v writes=%d", insRes, err, seenWriteCalls.Load())
+	}
+	if _, err := rwConn.Execute(context.Background(), "SHOW INVALID_CMD", driver.ExecOpts{}); err == nil || !strings.Contains(err.Error(), "9728") {
+		t.Fatalf("expected TDengine error code 9728, got %v", err)
+	}
+}
+
+func TestEasysearchDialectPreservedOnPing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && r.URL.Path == "/" {
+			// Intentionally omit version.distribution to ensure configured engine="easysearch" keeps dialect="easysearch".
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"cluster_name": "infini-test",
+				"version":      map[string]any{"number": "1.10.2"},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	host, portStr, _ := net.SplitHostPort(u.Host)
+	port, _ := strconv.Atoi(portStr)
+
+	conn, err := (&ElasticsearchDriver{}).Open(context.Background(), driver.ConnectionConfig{
+		Engine: "easysearch",
+		Host:   host,
+		Port:   port,
+	})
+	if err != nil {
+		t.Fatalf("Open easysearch: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ping, err := conn.Ping(context.Background())
+	if err != nil || !ping.Reachable || ping.Dialect != "easysearch" || ping.Capabilities == nil || ping.Capabilities.MajorVersion != 1 {
+		t.Fatalf("unexpected easysearch Ping: %+v err=%v", ping, err)
+	}
+}
+
+type stubSQLRows struct {
+	cols []string
+	rows [][]sqldriver.Value
+	idx  int
+}
+
+func (r *stubSQLRows) Columns() []string { return r.cols }
+func (r *stubSQLRows) Close() error      { return nil }
+func (r *stubSQLRows) Next(dest []sqldriver.Value) error {
+	if r.idx >= len(r.rows) {
+		return io.EOF
+	}
+	copy(dest, r.rows[r.idx])
+	r.idx++
+	return nil
+}
+
+type stubSQLState struct {
+	mu       sync.Mutex
+	execs    []string
+	queries  []string
+	readOnly bool
+	txCount  int
+	closed   bool
+	queryFn  func(q string, args []sqldriver.NamedValue) (sqldriver.Rows, error)
+	execFn   func(q string, args []sqldriver.NamedValue) (sqldriver.Result, error)
+}
+
+type stubSQLConnector struct {
+	state *stubSQLState
+	drv   sqldriver.Driver
+}
+
+func (c *stubSQLConnector) Connect(context.Context) (sqldriver.Conn, error) {
+	return &stubSQLConn{state: c.state}, nil
+}
+func (c *stubSQLConnector) Driver() sqldriver.Driver { return c.drv }
+
+type stubSQLDriver struct{}
+
+func (d stubSQLDriver) Open(string) (sqldriver.Conn, error) { return &stubSQLConn{}, nil }
+
+type stubSQLConn struct{ state *stubSQLState }
+
+func (c *stubSQLConn) Prepare(string) (sqldriver.Stmt, error) {
+	return nil, errors.New("not implemented")
+}
+func (c *stubSQLConn) Close() error {
+	if c.state != nil {
+		c.state.mu.Lock()
+		c.state.closed = true
+		c.state.mu.Unlock()
+	}
+	return nil
+}
+func (c *stubSQLConn) Begin() (sqldriver.Tx, error) { return &stubSQLTx{}, nil }
+func (c *stubSQLConn) BeginTx(_ context.Context, opts sqldriver.TxOptions) (sqldriver.Tx, error) {
+	if c.state != nil {
+		c.state.mu.Lock()
+		c.state.readOnly = opts.ReadOnly
+		c.state.txCount++
+		c.state.mu.Unlock()
+	}
+	return &stubSQLTx{}, nil
+}
+func (c *stubSQLConn) Ping(context.Context) error { return nil }
+func (c *stubSQLConn) ExecContext(_ context.Context, query string, args []sqldriver.NamedValue) (sqldriver.Result, error) {
+	if c.state != nil {
+		c.state.mu.Lock()
+		c.state.execs = append(c.state.execs, query)
+		fn := c.state.execFn
+		c.state.mu.Unlock()
+		if fn != nil {
+			return fn(query, args)
+		}
+	}
+	return sqldriver.RowsAffected(1), nil
+}
+func (c *stubSQLConn) QueryContext(_ context.Context, query string, args []sqldriver.NamedValue) (sqldriver.Rows, error) {
+	if c.state != nil {
+		c.state.mu.Lock()
+		c.state.queries = append(c.state.queries, query)
+		fn := c.state.queryFn
+		c.state.mu.Unlock()
+		if fn != nil {
+			return fn(query, args)
+		}
+	}
+	return &stubSQLRows{}, nil
+}
+
+type stubSQLTx struct{}
+
+func (stubSQLTx) Commit() error   { return nil }
+func (stubSQLTx) Rollback() error { return nil }
+
+func TestPGWireConnRuntimeWithStubDriver(t *testing.T) {
+	state := &stubSQLState{
+		execFn: func(q string, _ []sqldriver.NamedValue) (sqldriver.Result, error) {
+			if q == "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY" {
+				return nil, errors.New("unsupported primary stmt")
+			}
+			return sqldriver.RowsAffected(2), nil
+		},
+		queryFn: func(q string, _ []sqldriver.NamedValue) (sqldriver.Rows, error) {
+			switch {
+			case strings.Contains(q, "SELECT version()"):
+				return nil, errors.New("version() disabled")
+			case strings.Contains(q, "SHOW server_version"):
+				return &stubSQLRows{
+					cols: []string{"server_version"},
+					rows: [][]sqldriver.Value{{"KingbaseES V008R006C008B0014 on x86_64"}},
+				}, nil
+			case strings.Contains(q, "sys_catalog.sys_database"):
+				return nil, errors.New("sys_catalog permission denied")
+			case strings.Contains(q, "pg_catalog.pg_database"):
+				return &stubSQLRows{
+					cols: []string{"datname"},
+					rows: [][]sqldriver.Value{{"app"}, {"orders"}},
+				}, nil
+			case strings.Contains(q, "dbe_perf"):
+				return nil, errors.New("fallback simple schema query")
+			case strings.Contains(q, "FROM information_schema.tables"):
+				return &stubSQLRows{
+					cols: []string{"table_schema", "table_name", "table_type"},
+					rows: [][]sqldriver.Value{{"public", "orders", "BASE TABLE"}, {"public", "orders_v", "VIEW"}},
+				}, nil
+			case strings.Contains(q, "SELECT current_schema()"):
+				return &stubSQLRows{cols: []string{"current_schema"}, rows: [][]sqldriver.Value{{"public"}}}, nil
+			case strings.Contains(q, "constraint_type = 'PRIMARY KEY'"):
+				return &stubSQLRows{cols: []string{"column_name"}, rows: [][]sqldriver.Value{{"id"}}}, nil
+			case strings.Contains(q, "FROM information_schema.columns"):
+				return &stubSQLRows{
+					cols: []string{"column_name", "data_type", "is_nullable", "default"},
+					rows: [][]sqldriver.Value{{"id", "bigint", "NO", ""}, {"status", "text", "YES", "'pending'"}},
+				}, nil
+			case strings.Contains(q, "constraint_type = 'FOREIGN KEY'"):
+				return &stubSQLRows{cols: []string{"col", "rtbl", "rcol"}, rows: [][]sqldriver.Value{{"user_id", "users", "id"}}}, nil
+			case strings.Contains(q, "sys_catalog.sys_indexes"):
+				return nil, errors.New("use pg_indexes")
+			case strings.Contains(q, "pg_catalog.pg_indexes"):
+				return &stubSQLRows{
+					cols: []string{"indexname", "indexdef"},
+					rows: [][]sqldriver.Value{{"orders_pkey", "CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (id)"}},
+				}, nil
+			case strings.HasPrefix(q, "EXPLAIN "):
+				return &stubSQLRows{
+					cols: []string{"QUERY PLAN"},
+					rows: [][]sqldriver.Value{{"Seq Scan on orders  (cost=0.00..45.00 rows=1200 width=16)"}},
+				}, nil
+			case strings.HasPrefix(q, "SELECT id, status FROM orders"):
+				return &stubSQLRows{
+					cols: []string{"id", "status"},
+					rows: [][]sqldriver.Value{{int64(1), "paid"}, {int64(2), "pending"}},
+				}, nil
+			default:
+				return &stubSQLRows{}, nil
+			}
+		},
+	}
+
+	roConnector := &readOnlyExecConnector{
+		inner:     &stubSQLConnector{state: state, drv: stubSQLDriver{}},
+		stmts:     []string{"SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY", "SET default_transaction_read_only = on"},
+		errPrefix: "kingbase",
+	}
+	db := sql.OpenDB(roConnector)
+	var closedHook atomic.Int32
+	conn := newPGWireConn(db, driver.ConnectionConfig{
+		Engine:       "kingbase",
+		DatabaseName: "app",
+		ReadOnly:     true,
+		CloseHook:    func() error { closedHook.Add(1); return nil },
+	}, pgWireDialectConfig{
+		Engine:               "kingbase",
+		ListDatabasesQueries: []string{"SELECT datname FROM sys_catalog.sys_database", "SELECT datname FROM pg_catalog.pg_database"},
+		IndexQueries:         []string{"SELECT indexname, indexdef FROM sys_catalog.sys_indexes WHERE schemaname = $1 AND tablename = $2", "SELECT indexname, indexdef FROM pg_catalog.pg_indexes WHERE schemaname = $1 AND tablename = $2"},
+	})
+
+	if err := conn.ResetSession(context.Background()); err != nil {
+		t.Fatalf("ResetSession: %v", err)
+	}
+	ping, err := conn.Ping(context.Background())
+	if err != nil || !ping.Reachable || ping.Dialect != "kingbase" || ping.Capabilities.MajorVersion != 8 || ping.Capabilities.MinorVersion != 6 {
+		t.Fatalf("Ping = (%+v, %v)", ping, err)
+	}
+	dbs, err := conn.ListDatabases(context.Background())
+	if err != nil || !slices.Equal(dbs, []string{"app", "orders"}) {
+		t.Fatalf("ListDatabases = (%v, %v)", dbs, err)
+	}
+	tbls, err := conn.ListTables(context.Background(), driver.SchemaListOpts{Search: "orders", Limit: 1})
+	if err != nil || tbls.TotalCount != 2 || len(tbls.Items) != 1 {
+		t.Fatalf("ListTables = (%+v, %v)", tbls, err)
+	}
+	desc, err := conn.DescribeTable(context.Background(), "orders")
+	if err != nil || len(desc.Columns) != 2 || !desc.Columns[0].PrimaryKey || len(desc.ForeignKeys) != 1 || len(desc.Indexes) != 1 || !desc.Indexes[0].Primary {
+		t.Fatalf("DescribeTable = (%+v, %v)", desc, err)
+	}
+	pf, err := conn.Preflight(context.Background(), "SELECT id, status FROM orders", driver.PreflightOpts{})
+	if err != nil || !pf.FullScan || pf.EstimatedRows != 1200 || pf.Format != "pg_text" {
+		t.Fatalf("Preflight = (%+v, %v)", pf, err)
+	}
+	ddlPF, err := conn.Preflight(context.Background(), "CREATE TABLE t(id INT)", driver.PreflightOpts{})
+	if err != nil || len(ddlPF.Warnings) == 0 {
+		t.Fatalf("expected DDL preflight warning, got %+v err=%v", ddlPF, err)
+	}
+	res, err := conn.Execute(context.Background(), "SELECT id, status FROM orders", driver.ExecOpts{MaxRows: 1})
+	if err != nil || !res.Truncated || res.ReturnedRows != 1 || res.FetchedRows != 2 {
+		t.Fatalf("Execute read = (%+v, %v)", res, err)
+	}
+	if _, err := conn.Execute(context.Background(), "DELETE FROM orders", driver.ExecOpts{}); err == nil {
+		t.Fatal("expected ReadOnly pgWireConn to block DELETE")
+	}
+
+	// Verify RW DML execution returns AffectedRows, then Close triggers CloseHook once.
+	conn.cfg.ReadOnly = false
+	wrRes, err := conn.Execute(context.Background(), "UPDATE orders SET status = 'done' WHERE id = 1", driver.ExecOpts{})
+	if err != nil || wrRes.AffectedRows == nil || *wrRes.AffectedRows != 2 {
+		t.Fatalf("Execute write = (%+v, %v)", wrRes, err)
+	}
+	_ = conn.CancelAndDiscard()
+	_ = conn.Close()
+	if closedHook.Load() != 1 {
+		t.Fatalf("expected CloseHook once, got %d", closedHook.Load())
+	}
+
+	// Verify readOnlyExecConnector surfaces error if every read-only statement fails.
+	failDB := sql.OpenDB(&readOnlyExecConnector{
+		inner:     &stubSQLConnector{state: &stubSQLState{execFn: func(string, []sqldriver.NamedValue) (sqldriver.Result, error) { return nil, errors.New("ro rejected") }}},
+		stmts:     []string{"SET TRANSACTION READ ONLY"},
+		errPrefix: "opengauss",
+	})
+	defer func() { _ = failDB.Close() }()
+	if err := failDB.PingContext(context.Background()); err == nil || !strings.Contains(err.Error(), "enforce opengauss read-only session failed") {
+		t.Fatalf("expected read-only enforcement failure, got %v", err)
+	}
+}
+
+func TestDamengConnRuntimeWithStubDriver(t *testing.T) {
+	state := &stubSQLState{
+		execFn: func(q string, _ []sqldriver.NamedValue) (sqldriver.Result, error) {
+			if strings.HasPrefix(q, "EXPLAIN FOR ") {
+				return sqldriver.RowsAffected(0), nil
+			}
+			return sqldriver.RowsAffected(3), nil
+		},
+		queryFn: func(q string, _ []sqldriver.NamedValue) (sqldriver.Rows, error) {
+			switch {
+			case strings.Contains(q, "V$VERSION WHERE ROWNUM"):
+				return nil, errors.New("rownum error")
+			case strings.Contains(q, "TOP 1 * FROM V$VERSION"):
+				return &stubSQLRows{cols: []string{"BANNER"}, rows: [][]sqldriver.Value{{"DM Database Server 64 V8.1.3.140"}}}, nil
+			case strings.Contains(q, "SYS.SYSOBJECTS"):
+				return nil, errors.New("privilege denied")
+			case strings.Contains(q, "ALL_USERS"):
+				return &stubSQLRows{cols: []string{"USERNAME"}, rows: [][]sqldriver.Value{{"SYSDBA"}, {"ORDERS"}}}, nil
+			case strings.Contains(q, "USERENV"):
+				return &stubSQLRows{cols: []string{"SCHEMA"}, rows: [][]sqldriver.Value{{"orders"}}}, nil
+			case strings.Contains(q, "FROM all_tables"):
+				return &stubSQLRows{
+					cols: []string{"OWNER", "NAME", "TTYPE"},
+					rows: [][]sqldriver.Value{{"ORDERS", "T_ORD", "table"}, {"ORDERS", "SYN_ORD", "synonym"}},
+				}, nil
+			case strings.Contains(q, "SELECT COUNT(*) FROM all_tab_columns"):
+				return &stubSQLRows{cols: []string{"CNT"}, rows: [][]sqldriver.Value{{int64(0)}}}, nil
+			case strings.Contains(q, "FROM all_synonyms"):
+				return &stubSQLRows{cols: []string{"OWNER", "TBL"}, rows: [][]sqldriver.Value{{"FIN", "ORDERS_BASE"}}}, nil
+			case strings.Contains(q, "constraint_type = 'P'"):
+				return &stubSQLRows{cols: []string{"COL"}, rows: [][]sqldriver.Value{{"ID"}}}, nil
+			case strings.Contains(q, "FROM all_tab_columns"):
+				return &stubSQLRows{
+					cols: []string{"COLUMN_NAME", "DATA_TYPE", "NULLABLE", "DATA_DEFAULT"},
+					rows: [][]sqldriver.Value{{"ID", "BIGINT", "N", nil}, {"NOTE", "VARCHAR", "Y", " 'ok' "}},
+				}, nil
+			case strings.Contains(q, "FROM all_ind_columns"):
+				return &stubSQLRows{
+					cols: []string{"INDEX_NAME", "COLUMN_NAME", "UNIQUENESS"},
+					rows: [][]sqldriver.Value{{"PK_ORD", "ID", "UNIQUE"}},
+				}, nil
+			case strings.HasPrefix(q, "EXPLAIN FOR "):
+				return &stubSQLRows{
+					cols: []string{"OPERATION", "SCAN_TYPE", "TAB_NAME", "ROW_NUMS", "COST"},
+					rows: [][]sqldriver.Value{{"CSCN2", nil, "ORDERS_BASE", "9800", "12"}},
+				}, nil
+			case strings.HasPrefix(q, "SELECT ID FROM ORDERS_BASE"):
+				return &stubSQLRows{cols: []string{"ID"}, rows: [][]sqldriver.Value{{int64(10)}}}, nil
+			default:
+				return &stubSQLRows{}, nil
+			}
+		},
+	}
+
+	roSlot := dmDialSlots.acquire(func(context.Context, string) (net.Conn, error) { return nil, nil })
+	var closedHook atomic.Int32
+	dc := &damengConn{
+		db:        sql.OpenDB(&stubSQLConnector{state: state, drv: stubSQLDriver{}}),
+		cfg:       driver.ConnectionConfig{Engine: "dameng", ReadOnly: true},
+		dialSlot:  roSlot,
+		closeHook: driver.CloseOnce(func() error { closedHook.Add(1); return nil }),
+	}
+
+	if err := dc.ResetSession(context.Background()); err != nil {
+		t.Fatalf("dameng ResetSession: %v", err)
+	}
+	ping, err := dc.Ping(context.Background())
+	if err != nil || !ping.Reachable || ping.Capabilities == nil || ping.Capabilities.MajorVersion != 8 || ping.Capabilities.MinorVersion != 1 {
+		t.Fatalf("dameng Ping = (%+v, %v)", ping, err)
+	}
+	dbs, err := dc.ListDatabases(context.Background())
+	if err != nil || !slices.Equal(dbs, []string{"SYSDBA", "ORDERS"}) {
+		t.Fatalf("dameng ListDatabases = (%v, %v)", dbs, err)
+	}
+	tbls, err := dc.ListTables(context.Background(), driver.SchemaListOpts{})
+	if err != nil || tbls.Database != "ORDERS" || len(tbls.Items) != 2 {
+		t.Fatalf("dameng ListTables = (%+v, %v)", tbls, err)
+	}
+	desc, err := dc.DescribeTable(context.Background(), "syn_ord")
+	if err != nil || desc.Schema != "FIN" || desc.Name != "ORDERS_BASE" || !desc.Columns[0].PrimaryKey || len(desc.Indexes) != 1 || !desc.Indexes[0].Unique {
+		t.Fatalf("dameng DescribeTable synonym resolution = (%+v, %v)", desc, err)
+	}
+	pf, err := dc.Preflight(context.Background(), "SELECT * FROM orders_base", driver.PreflightOpts{})
+	if err != nil || !pf.FullScan || pf.EstimatedRows != 9800 {
+		t.Fatalf("dameng Preflight ##PLAN_TABLE = (%+v, %v)", pf, err)
+	}
+	res, err := dc.Execute(context.Background(), "SELECT ID FROM ORDERS_BASE", driver.ExecOpts{MaxRows: 10})
+	if err != nil || len(res.Rows) != 1 || !state.readOnly || state.txCount == 0 {
+		t.Fatalf("dameng ReadOnly Tx Execute = (%+v, %v, ro=%v tx=%d)", res, err, state.readOnly, state.txCount)
+	}
+	if _, err := dc.Execute(context.Background(), "UPDATE ORDERS_BASE SET NOTE = 'x'", driver.ExecOpts{}); err == nil {
+		t.Fatal("expected ReadOnly damengConn to block UPDATE")
+	}
+
+	dc.cfg.ReadOnly = false
+	wrRes, err := dc.Execute(context.Background(), "UPDATE ORDERS_BASE SET NOTE = 'x' WHERE ID = 1", driver.ExecOpts{})
+	if err != nil || wrRes.AffectedRows == nil || *wrRes.AffectedRows != 3 {
+		t.Fatalf("dameng RW Execute = (%+v, %v)", wrRes, err)
+	}
+	_ = dc.CancelAndDiscard()
+	_ = dc.Close()
+	if closedHook.Load() != 1 || dc.dialSlot != "" {
+		t.Fatalf("expected dameng Close to release slot and fire hook once, hook=%d slot=%q", closedHook.Load(), dc.dialSlot)
+	}
+
+	// extractDMConnectionExplain handles nil, missing fields, and populated unexported struct fields cleanly.
+	if got := extractDMConnectionExplain(nil); got != "" {
+		t.Fatalf("expected empty explain for nil, got %q", got)
+	}
+	if got := extractDMConnectionExplain(&stubSQLConn{}); got != "" {
+		t.Fatalf("expected empty explain for stubSQLConn, got %q", got)
+	}
+	type mockExecInfo struct{ explain string }
+	type mockDMConn struct{ lastExecInfo *mockExecInfo }
+	if got := extractDMConnectionExplain(&mockDMConn{lastExecInfo: &mockExecInfo{explain: "1 #CSCN2: [1, 42, 8]"}}); !strings.Contains(got, "#CSCN2") {
+		t.Fatalf("expected extracted explain plan, got %q", got)
+	}
+}
+
+func TestOpenGaussKingbaseDamengCustomDialWiringAndCleanup(t *testing.T) {
+	drivers := []struct {
+		name string
+		drv  driver.Driver
+		eng  string
+	}{
+		{name: "opengauss", drv: &OpenGaussDriver{}, eng: "opengauss"},
+		{name: "kingbase", drv: &KingbaseDriver{}, eng: "kingbase"},
+		{name: "dameng", drv: &DamengDriver{}, eng: "dameng"},
+	}
+	for _, tc := range drivers {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = ln.Close() }()
+			go func() {
+				for {
+					c, aErr := ln.Accept()
+					if aErr != nil {
+						return
+					}
+					_ = c.Close()
+				}
+			}()
+
+			host, portStr, _ := net.SplitHostPort(ln.Addr().String())
+			port, _ := strconv.Atoi(portStr)
+
+			var dialCalls atomic.Int32
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, openErr := tc.drv.Open(ctx, driver.ConnectionConfig{
+				Engine:       tc.eng,
+				Host:         host,
+				Port:         port,
+				DatabaseName: "testdb",
+				TLSMode:      "disable",
+				Credential:   secrets.ResolvedSecret{Username: "u", Secret: "p"},
+				DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+					dialCalls.Add(1)
+					var d net.Dialer
+					return d.DialContext(dctx, network, addr)
+				},
+			})
+			if openErr == nil {
+				t.Fatalf("expected handshake failure against immediate-close stub listener")
+			}
+			if dialCalls.Load() == 0 {
+				t.Fatalf("expected custom DialContext to be invoked for %s", tc.name)
+			}
+		})
 	}
 }

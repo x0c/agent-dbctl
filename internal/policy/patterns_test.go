@@ -196,7 +196,7 @@ func TestMultiModalPatternMatchersAndPreflight(t *testing.T) {
 		t.Fatalf("expected both deny preflight rule and sleep regex match, got %+v", matchedBypass)
 	}
 
-	// Verify all 5 builtin packs pass validation cleanly.
+	// Verify all builtin packs pass validation cleanly and Xinchuang rules trigger as expected.
 	for _, pack := range policy.BuiltinRulePacks() {
 		for _, r := range pack.Rules {
 			r.ScopeType = "global"
@@ -204,6 +204,46 @@ func TestMultiModalPatternMatchersAndPreflight(t *testing.T) {
 			if err := policy.ValidateRiskPatternRule(r); err != nil {
 				t.Fatalf("builtin pack %s rule %s invalid: %v", pack.ID, r.Name, err)
 			}
+		}
+	}
+
+	var dmGuardRules, pgSideRules []types.RiskPatternRule
+	for _, pack := range policy.BuiltinRulePacks() {
+		for _, r := range pack.Rules {
+			r.ScopeType = "global"
+			r.ScopeID = "global"
+			switch pack.ID {
+			case "dameng-sys-guard":
+				dmGuardRules = append(dmGuardRules, r)
+			case "pg-side-effect":
+				pgSideRules = append(pgSideRules, r)
+			}
+		}
+	}
+	if len(dmGuardRules) == 0 {
+		t.Fatal("expected dameng-sys-guard builtin pack")
+	}
+
+	dmSys := &types.System{ID: "sys_dm", Slug: "erp"}
+	prodEnv := &types.Environment{Code: "prod", SafetyTier: types.SafetyTierStrict}
+	dmTgt := types.Target{ID: "tgt_dm", Ref: "erp/prod/dm", OwnerSystemID: "sys_dm", EnvironmentCode: "prod", Status: types.TargetActive}
+	resolvedDM := policy.ResolveEffectivePatternRules(prodEnv, dmSys, dmTgt, "dameng", types.FamilySQL, dmGuardRules)
+	if len(resolvedDM) == 0 {
+		t.Fatal("expected dameng-sys-guard rule resolved for dameng engine")
+	}
+	dmSQL := "CALL SP_SET_PARA_VALUE(1, 'ENABLE_MONITOR', 0)"
+	if matches, _ := policy.MatchPatternRules(resolvedDM, classify.Classify("dameng", dmSQL), nil, dmSQL); len(matches) == 0 {
+		t.Fatalf("expected dameng-sys-guard to match %q", dmSQL)
+	}
+
+	for _, eng := range []string{"opengauss", "kingbase"} {
+		resolvedPG := policy.ResolveEffectivePatternRules(prodEnv, dmSys, dmTgt, eng, types.FamilySQL, pgSideRules)
+		if len(resolvedPG) == 0 {
+			t.Fatalf("expected pg-side-effect rules resolved for %s", eng)
+		}
+		pgSQL := "SELECT pg_sleep(5)"
+		if matches, _ := policy.MatchPatternRules(resolvedPG, classify.Classify(eng, pgSQL), nil, pgSQL); len(matches) == 0 {
+			t.Fatalf("expected pg-side-effect to match %s query %q", eng, pgSQL)
 		}
 	}
 }

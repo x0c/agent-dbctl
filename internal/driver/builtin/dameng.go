@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -295,27 +296,47 @@ func (c *damengConn) Preflight(ctx context.Context, raw string, _ driver.Preflig
 		return report, nil
 	}
 
-	// DM8 EXPLAIN FOR populates session-local ##PLAN_TABLE with structured plan columns;
-	// fall back to direct EXPLAIN <sql> if ##PLAN_TABLE is unavailable.
-	if _, err := c.db.ExecContext(ctx, "EXPLAIN FOR "+raw); err == nil {
-		rows, qErr := c.db.QueryContext(ctx, "SELECT OPERATION, COALESCE(OPTIONS, ''), COALESCE(OBJECT_NAME, ''), COALESCE(CARDINALITY, 0), COALESCE(COST, 0) FROM ##PLAN_TABLE ORDER BY ID")
-		if qErr == nil {
-			defer func() { _ = rows.Close() }()
+	// DM8 `EXPLAIN <sql>` works even under SP_SET_SESSION_READONLY(1) (whereas `EXPLAIN FOR`
+	// returns [-6506]: Readonly transaction). dm@v1.8.23 records the server's explain text on
+	// DmConnection.lastExecInfo.explain rather than returning a Rows cursor, so inspect that first.
+	if sqlConn, connErr := c.db.Conn(ctx); connErr == nil {
+		var explainText string
+		rawErr := sqlConn.Raw(func(driverConn any) error {
+			execer, ok := driverConn.(sqldriver.ExecerContext)
+			if !ok {
+				return nil
+			}
+			if _, eErr := execer.ExecContext(ctx, "EXPLAIN "+raw, nil); eErr != nil {
+				return eErr
+			}
+			explainText = extractDMConnectionExplain(driverConn)
+			return nil
+		})
+		_ = sqlConn.Close()
+		if rawErr == nil {
 			var lines []string
-			for rows.Next() {
-				var op, opts, obj string
-				var card, cost int64
-				if rows.Scan(&op, &opts, &obj, &card, &cost) == nil {
-					lines = append(lines, fmt.Sprintf("%s %s %s [cost=%d, rows=%d]", op, opts, obj, cost, card))
-					if card > report.EstimatedRows {
-						report.EstimatedRows = card
-					}
+			for _, ln := range strings.Split(strings.ReplaceAll(explainText, "\r\n", "\n"), "\n") {
+				if trimmed := strings.TrimSpace(ln); trimmed != "" {
+					lines = append(lines, trimmed)
 				}
 			}
 			if len(lines) > 0 {
 				parseDamengExplainLines(lines, report)
 				return report, nil
 			}
+		}
+	}
+
+	// Fallback 1: `EXPLAIN FOR <sql>` returns structured plan rows via QueryContext when session allows it.
+	if planRows, err := c.db.QueryContext(ctx, "EXPLAIN FOR "+raw); err == nil {
+		lines, estRows := collectDamengPlanRows(planRows)
+		_ = planRows.Close()
+		if estRows > report.EstimatedRows {
+			report.EstimatedRows = estRows
+		}
+		if len(lines) > 0 {
+			parseDamengExplainLines(lines, report)
+			return report, nil
 		}
 	}
 
@@ -338,6 +359,110 @@ func (c *damengConn) Preflight(ctx context.Context, raw string, _ driver.Preflig
 	}
 	parseDamengExplainLines(lines, report)
 	return report, nil
+}
+
+func extractDMConnectionExplain(driverConn any) string {
+	v := reflect.ValueOf(driverConn)
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return ""
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return ""
+	}
+	info := v.FieldByName("lastExecInfo")
+	if !info.IsValid() {
+		return ""
+	}
+	if info.Kind() == reflect.Pointer {
+		if info.IsNil() {
+			return ""
+		}
+		info = info.Elem()
+	}
+	if info.Kind() != reflect.Struct {
+		return ""
+	}
+	exp := info.FieldByName("explain")
+	if !exp.IsValid() || exp.Kind() != reflect.String {
+		return ""
+	}
+	return exp.String()
+}
+
+func collectDamengPlanRows(rows *sql.Rows) ([]string, int64) {
+	cols, err := rows.Columns()
+	if err != nil || len(cols) == 0 {
+		return nil, 0
+	}
+	colIdx := make(map[string]int, len(cols))
+	for i, c := range cols {
+		colIdx[strings.ToUpper(strings.TrimSpace(c))] = i
+	}
+	getField := func(vals []string, names ...string) string {
+		for _, n := range names {
+			if idx, ok := colIdx[n]; ok && idx < len(vals) {
+				if v := strings.TrimSpace(vals[idx]); v != "" && !strings.EqualFold(v, "NULL") {
+					return v
+				}
+			}
+		}
+		return ""
+	}
+
+	var lines []string
+	var maxRows int64
+	rawVals := make([]any, len(cols))
+	strVals := make([]sql.NullString, len(cols))
+	for i := range cols {
+		rawVals[i] = &strVals[i]
+	}
+	for rows.Next() {
+		if rows.Scan(rawVals...) != nil {
+			continue
+		}
+		strs := make([]string, len(cols))
+		for i, ns := range strVals {
+			if ns.Valid {
+				strs[i] = ns.String
+			}
+		}
+		op := getField(strs, "OPERATION")
+		if op == "" && len(strs) == 1 {
+			lines = append(lines, strs[0])
+			continue
+		}
+		tab := getField(strs, "TAB_NAME", "OBJECT_NAME")
+		idx := getField(strs, "IDX_NAME")
+		scanType := getField(strs, "SCAN_TYPE", "OPTIONS")
+		rowStr := getField(strs, "ROW_NUMS", "CARDINALITY")
+		costStr := getField(strs, "COST")
+		if n, pErr := strconv.ParseInt(rowStr, 10, 64); pErr == nil && n > maxRows {
+			maxRows = n
+		}
+		var parts []string
+		if op != "" {
+			parts = append(parts, op)
+		}
+		if scanType != "" {
+			parts = append(parts, scanType)
+		}
+		if tab != "" {
+			parts = append(parts, tab)
+		}
+		if idx != "" {
+			parts = append(parts, "idx="+idx)
+		}
+		if rowStr != "" || costStr != "" {
+			parts = append(parts, fmt.Sprintf("[rows=%s, cost=%s]", rowStr, costStr))
+		}
+		if len(parts) > 0 {
+			lines = append(lines, strings.Join(parts, " "))
+		}
+	}
+	return lines, maxRows
 }
 
 func parseDamengExplainLines(lines []string, report *types.PreflightReport) {

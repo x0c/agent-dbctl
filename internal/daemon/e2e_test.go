@@ -1164,3 +1164,104 @@ func TestSystemGitRemoteMatchingPriorityAndDBAddConvergence(t *testing.T) {
 		t.Fatalf("expected normalized git_remote persisted on payment-gateway, got %+v err=%v", gotPaySys, err)
 	}
 }
+
+func TestTDengineFullApprovalAndAuditLifecycleE2E(t *testing.T) {
+	var insertCalls atomic.Int32
+	tdSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		sqlText := strings.TrimSpace(string(bodyBytes))
+		upper := strings.ToUpper(sqlText)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case upper == "SELECT SERVER_VERSION()":
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "column_meta": [][]any{{"server_version()", "VARCHAR", 16}}, "data": [][]any{{"3.3.2.0"}}, "rows": 1})
+		case upper == "SHOW DATABASES":
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "column_meta": [][]any{{"name", "VARCHAR", 64}}, "data": [][]any{{"power"}}, "rows": 1})
+		case upper == "SHOW STABLES":
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "column_meta": [][]any{{"stable_name", "VARCHAR", 64}}, "data": [][]any{{"meters"}}, "rows": 1})
+		case upper == "SHOW TABLES":
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "column_meta": [][]any{{"table_name", "VARCHAR", 64}}, "data": [][]any{{"d1001"}}, "rows": 1})
+		case strings.HasPrefix(upper, "DESCRIBE "):
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "column_meta": [][]any{{"field", "VARCHAR", 64}, {"type", "VARCHAR", 16}, {"length", "INT", 4}, {"note", "VARCHAR", 8}}, "data": [][]any{{"ts", "TIMESTAMP", 8, ""}, {"current", "FLOAT", 4, ""}}, "rows": 2})
+		case strings.HasPrefix(upper, "EXPLAIN "):
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "column_meta": [][]any{{"plan", "VARCHAR", 128}}, "data": [][]any{{"FULL TABLE SCAN on meters"}}, "rows": 1})
+		case strings.HasPrefix(upper, "SELECT "):
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "column_meta": [][]any{{"ts", "TIMESTAMP", 8}, {"current", "FLOAT", 4}}, "data": [][]any{{"2026-11-25T10:00:00Z", 12.5}}, "rows": 1})
+		case strings.HasPrefix(upper, "INSERT "):
+			insertCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "column_meta": [][]any{}, "data": [][]any{}, "rows": 1})
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 9728, "desc": "unexpected SQL"})
+		}
+	}))
+	defer tdSrv.Close()
+
+	u, _ := url.Parse(tdSrv.URL)
+	host, portStr, _ := net.SplitHostPort(u.Host)
+	port, _ := strconv.Atoi(portStr)
+
+	srv, _ := setupIsolatedServer(t)
+	svc := srv.Service()
+	ctx := context.Background()
+
+	addRes, err := svc.AdminAddDatabase(ctx, "qa", daemon.DBAddRequest{
+		Engine:         "tdengine",
+		Host:           host,
+		Port:           port,
+		Database:       "power",
+		System:         "grid-telemetry",
+		Env:            "prod",
+		Alias:          "prod-tsdb",
+		AccessLevel:    types.AccessReadWrite,
+		User:           "root",
+		SecretValue:    "taosdata",
+		SecretProvided: true,
+	})
+	if err != nil {
+		t.Fatalf("AdminAddDatabase tdengine: %v", err)
+	}
+
+	det, err := svc.ResolveTarget(ctx, addRes.Target.Ref, "")
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
+	if ping := svc.PingTarget(ctx, det); !ping.Reachable || ping.Dialect != "tdengine" {
+		t.Fatalf("PingTarget = %+v", ping)
+	}
+	schemaRes, err := svc.InspectSchema(ctx, "prod-tsdb", "", "meters", "", 0)
+	ts, ok := schemaRes.(*types.TableSchema)
+	if err != nil || !ok || len(ts.Columns) != 2 {
+		t.Fatalf("InspectSchema = (%+v, %v)", schemaRes, err)
+	}
+
+	// Read with preflight surfaces FullScan escalation on prod strict environment.
+	pfRes, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: "prod-tsdb",
+		Query:            "SELECT ts, current FROM meters LIMIT 1",
+		Preflight:        true,
+	})
+	if err != nil || pfRes.Preflight == nil || !pfRes.Preflight.FullScan || pfRes.Evaluation.Decision != types.DecisionRequireApproval {
+		t.Fatalf("expected TDengine preflight full scan escalation, got %+v err=%v", pfRes, err)
+	}
+
+	// Write triggers approval queue -> HTTP approve -> executes against mock TDengine -> valid hash-chain audit.
+	wrRes, err := svc.Execute(ctx, types.ExecRequest{
+		TargetRefOrAlias: "prod-tsdb",
+		Query:            "INSERT INTO d1001 VALUES (NOW, 12.5)",
+		Reason:           "Seed telemetry sample",
+		Wait:             false,
+	})
+	if err != nil || wrRes.Status != types.OpWaitingApproval {
+		t.Fatalf("expected waiting_approval, got %+v err=%v", wrRes, err)
+	}
+	approvePendingHTTP(t, srv.WebURL(), wrRes.ApprovalID, wrRes.ApprovalURL, "approved telemetry insert")
+	done := waitOpTerminal(t, ctx, svc, wrRes.OperationID)
+	if done.Status != types.OpSucceeded || insertCalls.Load() != 1 {
+		t.Fatalf("expected approved TDengine insert to succeed, status=%s inserts=%d err=%s", done.Status, insertCalls.Load(), done.ErrorMessage)
+	}
+	verify, err := svc.Store().VerifyAuditChain(ctx)
+	if err != nil || !verify.Valid {
+		t.Fatalf("VerifyAuditChain failed: %+v err=%v", verify, err)
+	}
+}

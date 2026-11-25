@@ -323,60 +323,47 @@ func (c *pgWireConn) DescribeTable(ctx context.Context, name string) (*types.Tab
 	if tbl == "" {
 		return nil, fmt.Errorf("table name is required")
 	}
-	if sch == "" {
+	explicitSchema := sch != ""
+	if !explicitSchema {
 		_ = c.db.QueryRowContext(ctx, "SELECT current_schema()").Scan(&sch)
 		if sch == "" {
 			sch = "public"
 		}
 	}
 
-	pkSet := map[string]bool{}
-	pkRows, err := c.db.QueryContext(ctx, `
-		SELECT kcu.column_name
-		FROM information_schema.table_constraints tc
-		JOIN information_schema.key_column_usage kcu
-		  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-		WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 AND tc.table_name = $2`, sch, tbl)
-	if err == nil {
-		for pkRows.Next() {
-			var col string
-			if pkRows.Scan(&col) == nil {
-				pkSet[col] = true
-			}
-		}
-		_ = pkRows.Close()
-	}
-
-	colRows, err := c.db.QueryContext(ctx, `
-		SELECT column_name, data_type, is_nullable, COALESCE(column_default, '')
-		FROM information_schema.columns
-		WHERE table_schema = $1 AND table_name = $2
-		ORDER BY ordinal_position`, sch, tbl)
+	cols, pkSet, err := c.queryColumnsAndPK(ctx, sch, tbl)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = colRows.Close() }()
-
-	var cols []types.SchemaColumn
-	for colRows.Next() {
-		var cname, dtype, nullable, defVal string
-		if err := colRows.Scan(&cname, &dtype, &nullable, &defVal); err != nil {
-			return nil, err
+	if len(cols) == 0 && !explicitSchema {
+		// Engines like openGauss return "$user" from current_schema() even when no user schema exists
+		// and tables live in "public" or another visible schema on search_path.
+		var candidates []string
+		if !strings.EqualFold(sch, "public") {
+			candidates = append(candidates, "public")
 		}
-		cols = append(cols, types.SchemaColumn{
-			Name:       cname,
-			Type:       dtype,
-			Nullable:   strings.EqualFold(nullable, "YES"),
-			PrimaryKey: pkSet[cname],
-			Default:    defVal,
-		})
-	}
-	if err := colRows.Err(); err != nil {
-		return nil, err
+		var resolved string
+		if rErr := c.db.QueryRowContext(ctx, `
+			SELECT table_schema
+			FROM information_schema.tables
+			WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'sys_catalog')
+			  AND table_name = $1
+			ORDER BY table_schema
+			LIMIT 1`, tbl).Scan(&resolved); rErr == nil && resolved != "" && resolved != sch {
+			candidates = append(candidates, resolved)
+		}
+		for _, cand := range candidates {
+			cCols, cPK, cErr := c.queryColumnsAndPK(ctx, cand, tbl)
+			if cErr == nil && len(cCols) > 0 {
+				sch, cols, pkSet = cand, cCols, cPK
+				break
+			}
+		}
 	}
 	if len(cols) == 0 {
 		return nil, fmt.Errorf("table or view %s.%s not found", sch, tbl)
 	}
+	_ = pkSet
 
 	var fks []types.SchemaForeignKey
 	fkRows, err := c.db.QueryContext(ctx, `
@@ -429,6 +416,54 @@ func (c *pgWireConn) DescribeTable(ctx context.Context, name string) (*types.Tab
 		Indexes:     idxs,
 		ForeignKeys: fks,
 	}, nil
+}
+
+func (c *pgWireConn) queryColumnsAndPK(ctx context.Context, sch, tbl string) ([]types.SchemaColumn, map[string]bool, error) {
+	pkSet := map[string]bool{}
+	pkRows, err := c.db.QueryContext(ctx, `
+		SELECT kcu.column_name
+		FROM information_schema.table_constraints tc
+		JOIN information_schema.key_column_usage kcu
+		  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+		WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 AND tc.table_name = $2`, sch, tbl)
+	if err == nil {
+		for pkRows.Next() {
+			var col string
+			if pkRows.Scan(&col) == nil {
+				pkSet[col] = true
+			}
+		}
+		_ = pkRows.Close()
+	}
+
+	colRows, err := c.db.QueryContext(ctx, `
+		SELECT column_name, data_type, is_nullable, COALESCE(column_default, '')
+		FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = $2
+		ORDER BY ordinal_position`, sch, tbl)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = colRows.Close() }()
+
+	var cols []types.SchemaColumn
+	for colRows.Next() {
+		var cname, dtype, nullable, defVal string
+		if err := colRows.Scan(&cname, &dtype, &nullable, &defVal); err != nil {
+			return nil, nil, err
+		}
+		cols = append(cols, types.SchemaColumn{
+			Name:       cname,
+			Type:       dtype,
+			Nullable:   strings.EqualFold(nullable, "YES"),
+			PrimaryKey: pkSet[cname],
+			Default:    defVal,
+		})
+	}
+	if err := colRows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return cols, pkSet, nil
 }
 
 func (c *pgWireConn) activeDialect() string {

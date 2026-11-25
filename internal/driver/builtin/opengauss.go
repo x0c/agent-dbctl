@@ -4,8 +4,6 @@ import (
 	"context"
 	"database/sql"
 	sqldriver "database/sql/driver"
-	"net"
-	"time"
 
 	opengauss "gitcode.com/opengauss/openGauss-connector-go-pq"
 
@@ -51,54 +49,47 @@ func (d *OpenGaussDriver) Classify(_ context.Context, raw string) (types.Classif
 	return classify.Classify("opengauss", raw), nil
 }
 
-type openGaussDialerAdapter struct {
-	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-}
-
-func (a openGaussDialerAdapter) Dial(network, address string) (net.Conn, error) {
-	return a.DialTimeout(network, address, 10*time.Second)
-}
-
-func (a openGaussDialerAdapter) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return a.DialContext(ctx, network, address)
-}
-
-func (a openGaussDialerAdapter) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	return a.dialContext(ctx, network, address)
-}
-
 type openGaussConnector struct {
-	dsn    string
-	dialer opengauss.Dialer
+	inner sqldriver.Connector
 }
 
-func (c *openGaussConnector) Connect(_ context.Context) (sqldriver.Conn, error) {
-	if c.dialer != nil {
-		return opengauss.DialOpen(c.dialer, c.dsn)
-	}
-	return opengauss.Open(c.dsn)
+func (c *openGaussConnector) Connect(ctx context.Context) (sqldriver.Conn, error) {
+	return c.inner.Connect(ctx)
 }
 
 func (c *openGaussConnector) Driver() sqldriver.Driver {
-	return opengauss.Driver{}
+	return c.inner.Driver()
 }
 
 func buildOpenGaussDSN(cfg driver.ConnectionConfig) string {
-	return buildPGWireURI("opengauss", cfg, openGaussDialectConfig.DefaultPort, openGaussDialectConfig.DefaultDatabase)
+	// openGauss-connector-go-pq ParseURL only accepts postgres:// or postgresql:// URI schemes.
+	return buildPGWireURI("postgres", cfg, openGaussDialectConfig.DefaultPort, openGaussDialectConfig.DefaultDatabase)
 }
 
 func (d *OpenGaussDriver) Open(ctx context.Context, cfg driver.ConnectionConfig) (driver.Conn, error) {
 	dsn := buildOpenGaussDSN(cfg)
-	var baseConn sqldriver.Connector = &openGaussConnector{dsn: dsn}
+	parsedCfg, err := opengauss.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	// openGauss-connector-go-pq DialOpen leaves DialFunc untouched; wire DialFunc and LookupFunc directly on Config.
 	if cfg.DialContext != nil {
-		baseConn = &openGaussConnector{
-			dsn:    dsn,
-			dialer: openGaussDialerAdapter{dialContext: cfg.DialContext},
+		parsedCfg.DialFunc = cfg.DialContext
+		parsedCfg.LookupFunc = func(_ context.Context, host string) ([]string, error) {
+			return []string{host}, nil
 		}
 	}
-	connector := baseConn
+	if cfg.TLSConfig != nil {
+		parsedCfg.TLSConfig = cfg.TLSConfig
+		for _, fb := range parsedCfg.Fallbacks {
+			fb.TLSConfig = cfg.TLSConfig
+		}
+	}
+	baseConn, err := opengauss.NewConnectorConfig(parsedCfg)
+	if err != nil {
+		return nil, err
+	}
+	var connector sqldriver.Connector = &openGaussConnector{inner: baseConn}
 	if cfg.ReadOnly {
 		connector = &readOnlyExecConnector{
 			inner: baseConn,

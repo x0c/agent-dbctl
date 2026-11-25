@@ -406,14 +406,22 @@ func TestLiveMultiDatabaseEngines(t *testing.T) {
 			t.Fatalf("expected normalized JSON doc with customer_email, got %s", string(b))
 		}
 
-		// Preflight COLLSCAN
-		pf, err := svc.Execute(ctx, types.ExecRequest{
+		// Bounded COLLSCAN (limit <= 1000) stays safe; unbounded COLLSCAN must set FullScan=true.
+		boundedPF, err := svc.Execute(ctx, types.ExecRequest{
 			TargetRefOrAlias: prodTgt.Alias,
 			Query:            `{"find": "orders", "filter": {"status": "pending"}, "limit": 5}`,
 			Preflight:        true,
 		})
+		if err != nil || boundedPF.Preflight == nil || boundedPF.Preflight.FullScan {
+			t.Fatalf("expected bounded Mongo COLLSCAN FullScan=false, got pf=%+v err=%v", boundedPF.Preflight, err)
+		}
+		pf, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            `{"find": "orders", "filter": {"status": "pending"}}`,
+			Preflight:        true,
+		})
 		if err != nil || pf.Preflight == nil || !pf.Preflight.FullScan {
-			t.Fatalf("expected Mongo preflight COLLSCAN FullScan=true, got %+v err=%v", pf, err)
+			t.Fatalf("expected Mongo preflight COLLSCAN FullScan=true, got pf=%+v resp=%+v err=%v", pf.Preflight, pf, err)
 		}
 
 		// Approved Mongo update write
@@ -864,7 +872,357 @@ func TestLiveMultiDatabaseEngines(t *testing.T) {
 		}
 	})
 
-	// ---- 9. SSH Tunnel ----
+	// ---- 9. OpenGauss ----
+	t.Run("OpenGauss", func(t *testing.T) {
+		inst, err := svc.Store().UpsertInstance(ctx, "live-test", types.Instance{
+			Name:   "live-opengauss",
+			Engine: "opengauss",
+			Host:   host,
+			Port:   25433,
+			Role:   types.RolePrimary,
+		})
+		if err != nil {
+			t.Fatalf("upsert opengauss inst: %v", err)
+		}
+		devTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/dev/opengauss",
+			Alias:           "live-dev-opengauss",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "dev",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders_test",
+			ROCredentialID:  pgRO,
+			RWCredentialID:  pgRW,
+		})
+		prodTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/prod/opengauss",
+			Alias:           "live-prod-opengauss",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "prod",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders_test",
+			ROCredentialID:  pgRO,
+			RWCredentialID:  pgRW,
+		})
+
+		prodDet, err := svc.ResolveTarget(ctx, prodTgt.Ref, "")
+		if err != nil {
+			t.Fatalf("resolve opengauss prod target: %v", err)
+		}
+		ping := svc.PingTarget(ctx, prodDet)
+		if !ping.Reachable || ping.Dialect != "opengauss" {
+			t.Fatalf("OpenGauss Ping failed: %+v", ping)
+		}
+		dbs, err := svc.DiscoverInstance(ctx, inst.ID, pgRW, "orders_test")
+		if err != nil || len(dbs) == 0 {
+			t.Fatalf("OpenGauss DiscoverDatabases failed: dbs=%v err=%v", dbs, err)
+		}
+		if _, err := svc.InspectSchema(ctx, prodTgt.Alias, "", "orders", "", 0); err != nil {
+			t.Fatalf("OpenGauss InspectSchema failed: %v", err)
+		}
+
+		devRes, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: devTgt.Alias,
+			Query:            "SELECT id, customer_email, amount_cents, status FROM orders WHERE id <= 5 ORDER BY id",
+			Wait:             true,
+		})
+		if err != nil || devRes.Status != types.OpSucceeded || len(devRes.Result.Rows) != 5 {
+			t.Fatalf("OpenGauss dev select failed: %+v err=%v", devRes, err)
+		}
+
+		prodRead, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT id, customer_email, status FROM orders WHERE id = 42 LIMIT 1",
+			Wait:             true,
+		})
+		if err != nil || prodRead.Status != types.OpSucceeded || len(prodRead.Result.Rows) != 1 {
+			t.Fatalf("OpenGauss prod indexed select failed: %+v err=%v", prodRead, err)
+		}
+
+		pf, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT id, status FROM orders WHERE status = 'pending' LIMIT 10",
+			Preflight:        true,
+		})
+		if err != nil || pf.Preflight == nil || !pf.Preflight.FullScan || pf.Evaluation.Decision != types.DecisionRequireApproval {
+			t.Fatalf("expected OpenGauss seq scan preflight escalation, got %+v err=%v", pf, err)
+		}
+
+		upd, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "UPDATE orders SET amount_cents = amount_cents + 1 WHERE id = 42",
+			Reason:           "Live OpenGauss approval test",
+			Wait:             false,
+		})
+		if err != nil || upd.Status != types.OpWaitingApproval {
+			t.Fatalf("expected OpenGauss waiting_approval, got %+v err=%v", upd, err)
+		}
+		approvePendingHTTP(t, srv.WebURL(), upd.ApprovalID, upd.ApprovalURL, "approved opengauss")
+		done := waitOpTerminal(t, ctx, svc, upd.OperationID)
+		if done.Status != types.OpSucceeded || done.Result == nil || done.Result.AffectedRows == nil || *done.Result.AffectedRows != 1 {
+			t.Fatalf("expected OpenGauss write affected=1, got %+v", done)
+		}
+	})
+
+	// ---- 10. Dameng DM8 ----
+	t.Run("Dameng", func(t *testing.T) {
+		dmRW := seedCred("dameng-rw", types.AccessReadWrite, "ADB_RW", rwPass)
+		dmRO := seedCred("dameng-ro", types.AccessReadOnly, "ADB_RO", roPass)
+		inst, err := svc.Store().UpsertInstance(ctx, "live-test", types.Instance{
+			Name:   "live-dameng",
+			Engine: "dameng",
+			Host:   host,
+			Port:   25236,
+			Role:   types.RolePrimary,
+		})
+		if err != nil {
+			t.Fatalf("upsert dameng inst: %v", err)
+		}
+		devTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/dev/dameng",
+			Alias:           "live-dev-dameng",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "dev",
+			InstanceID:      inst.ID,
+			DatabaseName:    "ADB_RW",
+			ROCredentialID:  dmRO,
+			RWCredentialID:  dmRW,
+		})
+		prodTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/prod/dameng",
+			Alias:           "live-prod-dameng",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "prod",
+			InstanceID:      inst.ID,
+			DatabaseName:    "ADB_RO",
+			ROCredentialID:  dmRO,
+			RWCredentialID:  dmRW,
+		})
+
+		prodDet, err := svc.ResolveTarget(ctx, prodTgt.Ref, "")
+		if err != nil {
+			t.Fatalf("resolve dameng prod target: %v", err)
+		}
+		ping := svc.PingTarget(ctx, prodDet)
+		if !ping.Reachable || ping.Dialect != "dameng" {
+			t.Fatalf("Dameng Ping failed: %+v", ping)
+		}
+		dbs, err := svc.DiscoverInstance(ctx, inst.ID, dmRW, "ADB_RW")
+		if err != nil || len(dbs) == 0 {
+			t.Fatalf("Dameng DiscoverDatabases failed: dbs=%v err=%v", dbs, err)
+		}
+		if _, err := svc.InspectSchema(ctx, prodTgt.Alias, "", "orders", "", 0); err != nil {
+			t.Fatalf("Dameng InspectSchema (synonym orders) failed: %v", err)
+		}
+
+		devRes, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: devTgt.Alias,
+			Query:            "SELECT ID, CUSTOMER_EMAIL, STATUS FROM ADB_RW.ORDERS WHERE ID <= 5 ORDER BY ID",
+			Wait:             true,
+		})
+		if err != nil || devRes.Status != types.OpSucceeded || len(devRes.Result.Rows) != 5 {
+			t.Fatalf("Dameng dev select failed: %+v err=%v", devRes, err)
+		}
+
+		prodRead, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT ID, CUSTOMER_EMAIL, STATUS FROM ORDERS WHERE ID = 42",
+			Wait:             true,
+		})
+		if err != nil || prodRead.Status != types.OpSucceeded || len(prodRead.Result.Rows) != 1 {
+			t.Fatalf("Dameng prod PK select failed: %+v err=%v", prodRead, err)
+		}
+
+		pf, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT ID, STATUS FROM ORDERS WHERE STATUS = 'pending' FETCH FIRST 5 ROWS ONLY",
+			Preflight:        true,
+		})
+		if err != nil || pf.Preflight == nil || !pf.Preflight.FullScan {
+			t.Fatalf("expected Dameng preflight FullScan=true, got pf=%+v resp=%+v err=%v", pf.Preflight, pf, err)
+		}
+
+		upd, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "UPDATE ADB_RW.ORDERS SET AMOUNT_CENTS = AMOUNT_CENTS + 1 WHERE ID = 42",
+			Reason:           "Live Dameng approval test",
+			Wait:             false,
+		})
+		if err != nil || upd.Status != types.OpWaitingApproval {
+			t.Fatalf("expected Dameng waiting_approval, got %+v err=%v", upd, err)
+		}
+		approvePendingHTTP(t, srv.WebURL(), upd.ApprovalID, upd.ApprovalURL, "approved dameng")
+		done := waitOpTerminal(t, ctx, svc, upd.OperationID)
+		if done.Status != types.OpSucceeded || done.Result == nil || done.Result.AffectedRows == nil || *done.Result.AffectedRows != 1 {
+			t.Fatalf("expected Dameng write affected=1, got %+v", done)
+		}
+	})
+
+	// ---- 11. TDengine ----
+	t.Run("TDengine", func(t *testing.T) {
+		tdPass := envOr("AGENT_DBCTL_TEST_TDENGINE_PASS", "taosdata")
+		tdCred := seedCred("tdengine-rw", types.AccessReadWrite, "root", tdPass)
+		inst, err := svc.Store().UpsertInstance(ctx, "live-test", types.Instance{
+			Name:   "live-tdengine",
+			Engine: "tdengine",
+			Host:   host,
+			Port:   26041,
+			Role:   types.RolePrimary,
+		})
+		if err != nil {
+			t.Fatalf("upsert tdengine inst: %v", err)
+		}
+		devTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/dev/tdengine",
+			Alias:           "live-dev-tdengine",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "dev",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders_test",
+			ROCredentialID:  tdCred,
+			RWCredentialID:  tdCred,
+		})
+		prodTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/prod/tdengine",
+			Alias:           "live-prod-tdengine",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "prod",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders_test",
+			ROCredentialID:  tdCred,
+			RWCredentialID:  tdCred,
+		})
+
+		prodDet, err := svc.ResolveTarget(ctx, prodTgt.Ref, "")
+		if err != nil {
+			t.Fatalf("resolve tdengine prod target: %v", err)
+		}
+		ping := svc.PingTarget(ctx, prodDet)
+		if !ping.Reachable || ping.Dialect != "tdengine" {
+			t.Fatalf("TDengine Ping failed: %+v", ping)
+		}
+		dbs, err := svc.DiscoverInstance(ctx, inst.ID, tdCred, "orders_test")
+		if err != nil || len(dbs) == 0 {
+			t.Fatalf("TDengine DiscoverDatabases failed: dbs=%v err=%v", dbs, err)
+		}
+		if _, err := svc.InspectSchema(ctx, prodTgt.Alias, "", "orders", "", 0); err != nil {
+			t.Fatalf("TDengine InspectSchema failed: %v", err)
+		}
+
+		devRes, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: devTgt.Alias,
+			Query:            "SELECT order_id, customer_email, status FROM orders WHERE order_id = 42 LIMIT 1",
+			Wait:             true,
+		})
+		if err != nil || devRes.Status != types.OpSucceeded || len(devRes.Result.Rows) != 1 {
+			t.Fatalf("TDengine dev select failed: %+v err=%v", devRes, err)
+		}
+
+		pf, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "SELECT order_id, status FROM orders WHERE status = 'pending' LIMIT 5",
+			Preflight:        true,
+		})
+		if err != nil || pf.Preflight == nil || !pf.Preflight.Supported {
+			t.Fatalf("TDengine preflight failed: %+v err=%v", pf, err)
+		}
+
+		ins, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "INSERT INTO ord_cn VALUES ('2026-11-25 10:00:09.000', 99, 'user99@example.com', 9900, 'paid')",
+			Reason:           "Live TDengine approval test",
+			Wait:             false,
+		})
+		if err != nil || ins.Status != types.OpWaitingApproval {
+			t.Fatalf("expected TDengine waiting_approval, got %+v err=%v", ins, err)
+		}
+		approvePendingHTTP(t, srv.WebURL(), ins.ApprovalID, ins.ApprovalURL, "approved tdengine")
+		done := waitOpTerminal(t, ctx, svc, ins.OperationID)
+		if done.Status != types.OpSucceeded {
+			t.Fatalf("expected TDengine approved insert to succeed, got %+v", done)
+		}
+	})
+
+	// ---- 12. Easysearch ----
+	t.Run("Easysearch", func(t *testing.T) {
+		inst, err := svc.Store().UpsertInstance(ctx, "live-test", types.Instance{
+			Name:   "live-easysearch",
+			Engine: "easysearch",
+			Host:   host,
+			Port:   29201,
+			Role:   types.RolePrimary,
+		})
+		if err != nil {
+			t.Fatalf("upsert easysearch inst: %v", err)
+		}
+		devTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/dev/easysearch",
+			Alias:           "live-dev-easysearch",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "dev",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders",
+		})
+		prodTgt, _ := svc.Store().UpsertTarget(ctx, "live-test", types.Target{
+			Ref:             "live-commerce/prod/easysearch",
+			Alias:           "live-prod-easysearch",
+			OwnerSystemID:   sys.ID,
+			EnvironmentCode: "prod",
+			InstanceID:      inst.ID,
+			DatabaseName:    "orders",
+		})
+
+		prodDet, err := svc.ResolveTarget(ctx, prodTgt.Ref, "")
+		if err != nil {
+			t.Fatalf("resolve easysearch prod target: %v", err)
+		}
+		ping := svc.PingTarget(ctx, prodDet)
+		if !ping.Reachable || ping.Dialect != "easysearch" {
+			t.Fatalf("Easysearch Ping failed: %+v", ping)
+		}
+		dbs, err := svc.DiscoverInstance(ctx, inst.ID, "", "orders")
+		if err != nil || len(dbs) == 0 {
+			t.Fatalf("Easysearch DiscoverDatabases failed: dbs=%v err=%v", dbs, err)
+		}
+		if _, err := svc.InspectSchema(ctx, prodTgt.Alias, "", "orders", "", 0); err != nil {
+			t.Fatalf("Easysearch InspectSchema failed: %v", err)
+		}
+
+		devRes, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: devTgt.Alias,
+			Query:            "POST /orders/_search\n{\"query\":{\"term\":{\"order_id\":42}},\"size\":1}",
+			Wait:             true,
+		})
+		if err != nil || devRes.Status != types.OpSucceeded || len(devRes.Result.Documents) != 1 {
+			t.Fatalf("Easysearch dev search failed: %+v err=%v", devRes, err)
+		}
+
+		pf, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            `{"index":"orders","query":{"match_all":{}}}`,
+			Preflight:        true,
+		})
+		if err != nil || pf.Preflight == nil || !pf.Preflight.FullScan || pf.Evaluation.Decision != types.DecisionRequireApproval {
+			t.Fatalf("expected Easysearch match_all preflight escalation, got %+v err=%v", pf, err)
+		}
+
+		docWrite, err := svc.Execute(ctx, types.ExecRequest{
+			TargetRefOrAlias: prodTgt.Alias,
+			Query:            "POST /orders/_doc/9999\n{\"order_id\":9999,\"customer_email\":\"es@example.com\",\"amount_cents\":100,\"status\":\"paid\"}",
+			Reason:           "Live Easysearch approval test",
+			Wait:             false,
+		})
+		if err != nil || docWrite.Status != types.OpWaitingApproval {
+			t.Fatalf("expected Easysearch write waiting_approval, got %+v err=%v", docWrite, err)
+		}
+		approvePendingHTTP(t, srv.WebURL(), docWrite.ApprovalID, docWrite.ApprovalURL, "approved easysearch")
+		done := waitOpTerminal(t, ctx, svc, docWrite.OperationID)
+		if done.Status != types.OpSucceeded {
+			t.Fatalf("expected Easysearch approved write to succeed, got %+v", done)
+		}
+	})
+
+	// ---- 13. SSH Tunnel ----
 	sshHost := strings.TrimSpace(os.Getenv("AGENT_DBCTL_TEST_SSH_HOST"))
 	if sshHost != "" {
 		t.Run("SSHTunnel", func(t *testing.T) {

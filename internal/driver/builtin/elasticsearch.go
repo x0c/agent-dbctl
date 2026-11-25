@@ -206,7 +206,11 @@ func (c *esConn) Ping(ctx context.Context) (types.PingResult, error) {
 			dist, _ = vm["distribution"].(string)
 		}
 	}
-	caps := driver.DetectServerCapabilities("elasticsearch", ver, driver.DialectHints{Distribution: dist})
+	engineHint := strings.TrimSpace(c.cfg.Engine)
+	if engineHint == "" {
+		engineHint = "elasticsearch"
+	}
+	caps := driver.DetectServerCapabilities(engineHint, ver, driver.DialectHints{Distribution: dist})
 	c.caps.Store(&caps)
 	return types.PingResult{
 		Engine:        "elasticsearch",
