@@ -9,7 +9,7 @@
     "typecheck": "tsc -b"
   },
   "dependencies": {
-    "@x0c/ui": "https://github.com/x0c/web-ui-kit/releases/download/v0.3.1/x0c-ui-0.3.1.tgz",
+    "@x0c/ui": "https://github.com/x0c/web-ui-kit/releases/download/v0.4.1/x0c-ui-0.4.1.tgz",
     "lucide-react": "^1.78.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
