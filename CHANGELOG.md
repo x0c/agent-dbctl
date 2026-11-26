@@ -1,18 +1,20 @@
 # Changelog
 
-## Unreleased
+## v0.5.1
 
 ### English
 
 - **SQLite write reliability**: Serialized standalone maintenance writes with read-write transactions, preventing `SQLITE_BUSY_SNAPSHOT` / `database is locked (517)` failures during concurrent server authentication and catalog mutations.
 - **Verified stable release gate**: Stable local packaging now requires exact-commit green Linux, macOS, Windows, and Linux server-smoke CI jobs; prerelease-only `--skip-ci-check` preserves offline packaging.
 - **Real server acceptance**: Added an isolated Compose smoke path covering PostgreSQL control-plane storage, Redis events/results, RS256/PKCE OIDC, CLI device confirmation, four-eyes approvals, readback, and audit verification. Added roadmap, issue forms, and repeatable-install documentation.
+- **Cross-platform build reliability**: Fixed Windows test daemon cleanup and permission assertions, corrected the Docker module-download retry shell, bounded Compose retries to network failures, aligned `context add --auth` documentation, and made server acceptance run concurrently with the platform test matrix.
 
 ### 简体中文
 
 - **SQLite 写入可靠性**：将独立维护写入与读写事务串行化，避免服务端认证和目录变更并发时出现 `SQLITE_BUSY_SNAPSHOT` / `database is locked (517)`。
 - **稳定版发布硬门禁**：本地稳定版打包现在要求同一提交的 Linux、macOS、Windows 与 Linux 服务端烟雾 CI 作业全部通过；仅限预发布版本的 `--skip-ci-check` 仍支持离线打包。
 - **真实服务端验收**：新增隔离 Compose 验收链路，覆盖 PostgreSQL 控制面、Redis 事件与结果通道、RS256/PKCE OIDC、CLI 设备确认、四眼审批、数据回读和审计验证；同时补充路线图、问题表单与可重复安装文档。
+- **跨平台构建可靠性**：修复 Windows 测试 daemon 清理和权限断言、Docker 模块下载重试 shell，将 Compose 重试限定于网络故障，对齐 `context add --auth` 文档，并让服务端验收与平台测试矩阵并行运行。
 
 ## v0.5.0
 
