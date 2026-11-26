@@ -26,8 +26,6 @@ secrets:
   allow_exec_provider_for_admin: false
 auth:
   local_login_enabled: true
-  bootstrap_admin_email: admin@example.com
-  bootstrap_admin_password_env: AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD
   session_ttl_hours: 1
   forbid_self_approval: true
   oidc:
@@ -36,9 +34,8 @@ auth:
     client_id: smoke-client
     client_secret_env: AGENT_DBCTL_OIDC_SECRET
     device_flow_enabled: true
-    admin_groups: []
-    admin_emails:
-      - admin@example.com
+    admin_subjects:
+      - smoke-admin-subject
     scopes:
       - openid
       - profile

@@ -126,7 +126,7 @@ agent-dbctl doctor [--live]
 agent-dbctl describe [command...]
 agent-dbctl version
 agent-dbctl capabilities
-agent-dbctl serve [--config <path>] [--listen <addr>] [--public-url <url>]
+agent-dbctl serve [--config <path>] [--listen <addr>] [--public-url <url>] [--migrate-only]
 agent-dbctl context list | show | add <name> --endpoint <url> [--ca-cert <path>] [--client-cert <path> --client-key <path>] [--auth oidc_device|bearer_token] | use <name> | remove <name>
 agent-dbctl login [--context <name>] [--token-stdin | --token-env <var>]
 agent-dbctl logout [--context <name>]
@@ -194,6 +194,8 @@ agent-dbctl skill print
 | `AGENT_DBCTL_REDIS_URL` | Optional Redis connection URL for multi-replica `ResultSlot` and `EventBus` |
 
 ## 6. Remote Context Behavior
+
+For a PostgreSQL control plane, run `agent-dbctl serve --config <path> --migrate-only --json` with the schema owner's DSN before starting a server with `storage.postgres_skip_migrations: true` and a separate runtime DSN. This command migrates the control-plane schema and initializes defaults without listening, opening target databases, or creating login accounts. The normal server refuses a pre-migration schema in this mode. Keep the schema-owner DSN out of the runtime environment.
 
 When targeting a remote context (`mode: remote`):
 

@@ -462,6 +462,9 @@ CREATE TABLE IF NOT EXISTS users (
 	updated_at_utc TEXT NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc_identity ON users(oidc_issuer, oidc_subject)
+WHERE oidc_issuer <> '' AND oidc_subject <> '';
+
 CREATE TABLE IF NOT EXISTS role_bindings (
 	id TEXT PRIMARY KEY,
 	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -552,7 +555,7 @@ CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
 	}
 
 	now := nowUTC()
-	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?), (6, ?)`, now, now, now, now, now, now); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version, applied_at_utc) VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?), (6, ?), (7, ?)`, now, now, now, now, now, now, now); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
 	return nil
@@ -560,7 +563,7 @@ CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
 
 func (s *Store) isCurrentSQLiteSchema(ctx context.Context) bool {
 	var hasMig int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM schema_migrations WHERE version = 6`).Scan(&hasMig); err != nil || hasMig == 0 {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM schema_migrations WHERE version = 7`).Scan(&hasMig); err != nil || hasMig == 0 {
 		return false
 	}
 	var hasLatestTbl int

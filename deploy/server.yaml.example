@@ -26,6 +26,8 @@ replicas: 1
 storage:
   driver: postgres
   dsn_env: AGENT_DBCTL_STORE_DSN
+  # Run serve --migrate-only with the schema owner's DSN before enabling this.
+  postgres_skip_migrations: false
 
 pubsub:
   driver: redis
@@ -52,8 +54,8 @@ auth:
     client_id: ""
     client_secret_env: AGENT_DBCTL_OIDC_SECRET
     device_flow_enabled: true
-    admin_groups: []
-    admin_emails: []
+    # Stable subject IDs issued by issuer_url. Never put email addresses here.
+    admin_subjects: []
     scopes:
       - openid
       - profile

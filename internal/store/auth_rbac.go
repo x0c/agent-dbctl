@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -61,60 +62,45 @@ func (s *Store) CreateUser(ctx context.Context, actor string, u types.User) (typ
 // UpsertOIDCUser finds or creates a user matching (oidc_issuer, oidc_subject) or email.
 func (s *Store) UpsertOIDCUser(ctx context.Context, issuer, subject, email, displayName string) (types.User, bool, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
-	if email == "" {
-		return types.User{}, false, fmt.Errorf("oidc user missing email claim")
+	if email == "" || issuer == "" || strings.TrimSpace(subject) == "" {
+		return types.User{}, false, fmt.Errorf("OIDC provisioning requires an issuer, subject, and email")
 	}
 	var out types.User
 	var created bool
 	now := nowUTC()
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		row := s.txQueryRow(ctx, tx, `
-			SELECT id, email, display_name, oidc_issuer, oidc_subject, password_hash, status, created_at_utc, updated_at_utc
-			FROM users WHERE (oidc_issuer = ? AND oidc_subject = ?) OR email = ? LIMIT 1`, issuer, subject, email)
-		u, err := scanUser(row)
+		lookup := func() (types.User, error) {
+			return scanUser(s.txQueryRow(ctx, tx, `
+				SELECT id, email, display_name, oidc_issuer, oidc_subject, password_hash, status, created_at_utc, updated_at_utc
+				FROM users WHERE oidc_issuer = ? AND oidc_subject = ?`, issuer, subject))
+		}
+		u, err := lookup()
 		if errors.Is(err, ErrNotFound) {
-			created = true
-			u = types.User{
-				ID:           newID("usr"),
-				Email:        email,
-				DisplayName:  displayName,
-				OIDCIssuer:   issuer,
-				OIDCSubject:  subject,
-				Status:       "active",
-				CreatedAtUTC: now,
-				UpdatedAtUTC: now,
-			}
+			id := newID("usr")
 			if _, err := s.txExec(ctx, tx, `
 				INSERT INTO users(id, email, display_name, oidc_issuer, oidc_subject, password_hash, status, created_at_utc, updated_at_utc)
-				VALUES (?, ?, ?, ?, ?, '', 'active', ?, ?)`,
-				u.ID, u.Email, u.DisplayName, u.OIDCIssuer, u.OIDCSubject, u.CreatedAtUTC, u.UpdatedAtUTC); err != nil {
+				VALUES (?, ?, ?, ?, ?, '', 'active', ?, ?) ON CONFLICT DO NOTHING`,
+				id, email, displayName, issuer, subject, now, now); err != nil {
 				return err
 			}
-			if err := s.appendAuditTx(ctx, tx, "user:"+u.Email, "user.oidc_provision", u.ID, "", map[string]any{
-				"email":  u.Email,
-				"issuer": issuer,
-			}, now); err != nil {
-				return err
+			u, err = lookup()
+			if errors.Is(err, ErrNotFound) {
+				return fmt.Errorf("%w: OIDC identity cannot be linked to an existing account by email", ErrConflict)
 			}
-			out = u
-			return nil
+			created = u.ID == id
 		}
 		if err != nil {
 			return err
 		}
 		if u.Status != "active" {
-			return fmt.Errorf("user %q is disabled", u.Email)
+			return fmt.Errorf("OIDC user account is disabled")
 		}
-		if displayName != "" {
-			u.DisplayName = displayName
-		}
-		u.OIDCIssuer = issuer
-		u.OIDCSubject = subject
-		u.UpdatedAtUTC = now
-		if _, err := s.txExec(ctx, tx, `
-			UPDATE users SET display_name = ?, oidc_issuer = ?, oidc_subject = ?, updated_at_utc = ? WHERE id = ?`,
-			u.DisplayName, u.OIDCIssuer, u.OIDCSubject, u.UpdatedAtUTC, u.ID); err != nil {
-			return err
+		if created {
+			if err := s.appendAuditTx(ctx, tx, "user:"+u.Email, "user.oidc_provision", u.ID, "", map[string]any{
+				"email": u.Email, "issuer": issuer,
+			}, now); err != nil {
+				return err
+			}
 		}
 		out = u
 		return nil
@@ -227,25 +213,69 @@ func (s *Store) UpsertRoleBinding(ctx context.Context, actor string, b types.Rol
 		b.CreatedBy = actor
 	}
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		var existingID string
-		err := s.txQueryRow(ctx, tx, `SELECT id FROM role_bindings WHERE user_id = ? AND role = ? AND scope_type = ? AND scope_id = ?`,
-			b.UserID, string(b.Role), string(b.ScopeType), b.ScopeID).Scan(&existingID)
-		if err == nil {
-			b.ID = existingID
-			return nil
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if _, err := s.txExec(ctx, tx, `
+		res, err := s.txExec(ctx, tx, `
 			INSERT INTO role_bindings(id, user_id, role, scope_type, scope_id, created_by, created_at_utc)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			b.ID, b.UserID, string(b.Role), string(b.ScopeType), b.ScopeID, b.CreatedBy, b.CreatedAtUTC); err != nil {
+			VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, role, scope_type, scope_id) DO NOTHING`,
+			b.ID, b.UserID, string(b.Role), string(b.ScopeType), b.ScopeID, b.CreatedBy, b.CreatedAtUTC)
+		if err != nil {
 			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return s.txQueryRow(ctx, tx, `SELECT id, created_by, created_at_utc FROM role_bindings
+				WHERE user_id = ? AND role = ? AND scope_type = ? AND scope_id = ?`,
+				b.UserID, string(b.Role), string(b.ScopeType), b.ScopeID).Scan(&b.ID, &b.CreatedBy, &b.CreatedAtUTC)
 		}
 		return s.appendAuditTx(ctx, tx, actor, "role_binding.grant", b.UserID, "", b, now)
 	})
 	return b, err
+}
+
+// ReconcileOIDCAdminBindings revokes only obsolete configuration-managed global grants.
+func (s *Store) ReconcileOIDCAdminBindings(ctx context.Context, issuer string, allowedSubjects []string) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		rows, err := s.txQuery(ctx, tx, `SELECT b.id, u.oidc_issuer, u.oidc_subject
+			FROM role_bindings b JOIN users u ON u.id = b.user_id
+			WHERE b.role = 'platform_admin' AND b.scope_type = 'global' AND b.created_by = 'oidc-sync'`)
+		if err != nil {
+			return err
+		}
+		var obsolete []string
+		for rows.Next() {
+			var id, storedIssuer, subject string
+			if err := rows.Scan(&id, &storedIssuer, &subject); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if storedIssuer != issuer || !slices.Contains(allowedSubjects, subject) {
+				obsolete = append(obsolete, id)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		_ = rows.Close()
+		for _, id := range obsolete {
+			res, err := s.txExec(ctx, tx, `DELETE FROM role_bindings WHERE id = ? AND created_by = 'oidc-sync'`, id)
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if n > 0 {
+				if err := s.appendAuditTx(ctx, tx, "oidc-sync", "role_binding.revoke", id, "", map[string]string{"reason": "OIDC subject is no longer configured"}, nowUTC()); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
 }
 
 // DeleteRoleBinding removes a role binding with an audit event.

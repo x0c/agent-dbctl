@@ -19,6 +19,7 @@ import (
 	"github.com/x0c/agent-dbctl/internal/config"
 	"github.com/x0c/agent-dbctl/internal/daemon"
 	"github.com/x0c/agent-dbctl/internal/secrets"
+	"github.com/x0c/agent-dbctl/internal/store"
 	"github.com/x0c/agent-dbctl/internal/types"
 )
 
@@ -96,7 +97,7 @@ func waitForOperationLoop(ctx context.Context, client *daemon.Client, opID strin
 
 func newServeCmd(ioCtx func() IOContext, version, commit string, exitCode *int) *cobra.Command {
 	var cfgPath, listenAddr, publicURL string
-	var allowSQLite bool
+	var allowSQLite, migrateOnly bool
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run multi-user centralized agent-dbctl server (Web Console + HTTPS/RPC)",
@@ -125,6 +126,22 @@ func newServeCmd(ioCtx func() IOContext, version, commit string, exitCode *int) 
 				*exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, err.Error(), "", nil, nil, types.Meta{})
 				return nil
 			}
+			if migrateOnly {
+				if !strings.EqualFold(cfg.Storage.Driver, "postgres") {
+					*exitCode = ic.WriteError(types.ErrCodeInvalidUsage, false, "--migrate-only requires storage.driver=postgres", "", nil, nil, types.Meta{})
+					return nil
+				}
+				st, err := store.OpenPostgres(cmd.Context(), cfg.Storage.DSN)
+				if err == nil {
+					err = st.Close()
+				}
+				if err != nil {
+					*exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
+					return nil
+				}
+				*exitCode = ic.WriteSuccess(map[string]bool{"migrated": true}, types.Meta{})
+				return nil
+			}
 			srv, err := daemon.StartRemoteServer(cmd.Context(), paths, cfg, version, commit)
 			if err != nil {
 				*exitCode = ic.WriteError(types.ErrCodeInternalError, false, err.Error(), "", nil, nil, types.Meta{})
@@ -143,6 +160,7 @@ func newServeCmd(ioCtx func() IOContext, version, commit string, exitCode *int) 
 	cmd.Flags().StringVar(&listenAddr, "listen", "", "Override HTTP listen address (e.g. 127.0.0.1:8443)")
 	cmd.Flags().StringVar(&publicURL, "public-url", "", "Override canonical external base URL (e.g. https://db.example.com)")
 	cmd.Flags().BoolVar(&allowSQLite, "allow-sqlite", false, "Allow SQLite database targets in server mode")
+	cmd.Flags().BoolVar(&migrateOnly, "migrate-only", false, "Prepare PostgreSQL schema and defaults without starting a server")
 	annotateCommand(cmd, RiskWriteLocal, "agent-dbctl serve --config /etc/agent-dbctl/server.yaml")
 	return cmd
 }

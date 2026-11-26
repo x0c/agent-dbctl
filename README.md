@@ -188,7 +188,7 @@ For teams that want centralized PostgreSQL metadata, AES-256-GCM encrypted crede
 ```sh
 cp .env.example .env
 # Set POSTGRES_PASSWORD, AGENT_DBCTL_MASTER_KEY (`openssl rand -hex 32`),
-# and optionally AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD in .env
+# and AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD for the initial local administrator
 docker compose up -d --build
 ```
 

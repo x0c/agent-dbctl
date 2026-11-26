@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -39,7 +40,9 @@ func NewServerService(ctx context.Context, paths config.Paths, srvCfg config.Ser
 
 	var st *store.Store
 	var err error
-	if strings.EqualFold(srvCfg.Storage.Driver, "postgres") {
+	if srvCfg.Storage.PostgresSkipMigrations {
+		st, err = store.OpenPreparedPostgres(ctx, srvCfg.Storage.DSN)
+	} else if strings.EqualFold(srvCfg.Storage.Driver, "postgres") {
 		st, err = store.OpenPostgres(ctx, srvCfg.Storage.DSN)
 	} else {
 		st, err = store.Open(ctx, srvCfg.Storage.DBPath)
@@ -174,6 +177,16 @@ func NewServerService(ctx context.Context, paths config.Paths, srvCfg config.Ser
 	appMgr.RegisterProvider(lw)
 	_ = svc.RegisterWebhookProviderFromEnv()
 
+	var issuer string
+	var adminSubjects []string
+	if oidcClient != nil {
+		issuer = oidcClient.IssuerURL
+		adminSubjects = srvCfg.Auth.OIDC.AdminSubjects
+	}
+	if err := st.ReconcileOIDCAdminBindings(ctx, issuer, adminSubjects); err != nil {
+		svc.Shutdown()
+		return nil, fmt.Errorf("reconcile OIDC admin bindings: %w", err)
+	}
 	if err := seedBootstrapAdminIfEmpty(ctx, st, srvCfg); err != nil {
 		svc.Shutdown()
 		return nil, err
@@ -187,7 +200,7 @@ func NewServerService(ctx context.Context, paths config.Paths, srvCfg config.Ser
 }
 
 func seedBootstrapAdminIfEmpty(ctx context.Context, st *store.Store, cfg config.ServerConfig) error {
-	if !cfg.Auth.LocalLoginEnabled {
+	if !cfg.Auth.LocalLoginEnabled || (cfg.Auth.OIDC.Enabled && len(cfg.Auth.OIDC.AdminSubjects) != 0 && cfg.Auth.BootstrapAdminEmail == "") {
 		return nil
 	}
 	cnt, err := st.CountUsers(ctx)
@@ -202,10 +215,8 @@ func seedBootstrapAdminIfEmpty(ctx context.Context, st *store.Store, cfg config.
 	if cfg.Auth.BootstrapAdminPassEnv != "" {
 		pass = strings.TrimSpace(os.Getenv(cfg.Auth.BootstrapAdminPassEnv))
 	}
-	generated := false
 	if pass == "" {
-		pass = "Adb_" + randomHexToken(12)
-		generated = true
+		return fmt.Errorf("first local administrator requires a password via auth.bootstrap_admin_password_env")
 	}
 	hash, err := auth.HashPassword(pass)
 	if err != nil {
@@ -227,9 +238,6 @@ func seedBootstrapAdminIfEmpty(ctx context.Context, st *store.Store, cfg config.
 		CreatedBy: "system",
 	}); err != nil {
 		return err
-	}
-	if generated {
-		_, _ = fmt.Fprintf(os.Stderr, "[agent-dbctl serve] Initialized bootstrap platform_admin user=%s password=%s (change or remove after first login)\n", email, pass)
 	}
 	return nil
 }
@@ -329,6 +337,7 @@ func NewRemoteServerHandler(svc *Service) http.Handler {
 }
 
 func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
+	passwordGuard := newPasswordLoginGuard()
 	mux.HandleFunc("GET /api/v1/auth/config", func(w http.ResponseWriter, r *http.Request) {
 		p, ok := resolveRequestPrincipal(r, svc)
 		info := publicAuthInfo(svc, ok && p.Kind == types.PrincipalHuman)
@@ -341,16 +350,33 @@ func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
 			writeHTTPErr(w, http.StatusForbidden, "local password login is disabled")
 			return
 		}
+		if !passwordGuard.allow(loginPeerIP(r, cfg), time.Now()) {
+			w.Header().Set("Retry-After", "60")
+			writeHTTPErr(w, http.StatusTooManyRequests, "too many sign-in attempts; retry in one minute")
+			return
+		}
 		var body struct {
 			Email    string `json:"email"`
 			Password string `json:"password"`
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 		if err := decodeJSONBody(r, &body); err != nil {
 			writeHTTPErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if !passwordGuard.tryVerify() {
+			w.Header().Set("Retry-After", "1")
+			writeHTTPErr(w, http.StatusTooManyRequests, "sign-in is busy; try again shortly")
+			return
+		}
+		defer passwordGuard.endVerify()
 		u, err := svc.Store().GetUserByEmail(r.Context(), body.Email)
-		if err != nil || u.Status != "active" || u.PasswordHash == "" || !auth.VerifyPassword(u.PasswordHash, body.Password) {
+		eligible := err == nil && u.Status == "active" && u.PasswordHash != ""
+		hash := dummyLoginPasswordHash
+		if eligible {
+			hash = u.PasswordHash
+		}
+		if !auth.VerifyPassword(hash, body.Password) || !eligible {
 			writeHTTPErr(w, http.StatusUnauthorized, "invalid email or password")
 			return
 		}
@@ -385,15 +411,27 @@ func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		nonce, _ := auth.RandomHex(16)
+		nonce, err := auth.RandomHex(16)
+		if err != nil {
+			writeHTTPErr(w, http.StatusInternalServerError, "could not start sign-in")
+			return
+		}
+		browserKey := readOIDCBrowserKey(r, svc.ServerConfig())
+		if browserKey == "" {
+			browserKey, err = auth.RandomHex(32)
+			if err != nil {
+				writeHTTPErr(w, http.StatusInternalServerError, "could not start sign-in")
+				return
+			}
+		}
 		verifier, challenge, err := auth.GeneratePKCE()
 		if err != nil {
 			writeHTTPErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		exp := time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339Nano)
+		exp := time.Now().UTC().Add(oidcBrowserTTL).Format(time.RFC3339Nano)
 		if err := svc.Store().CreateOIDCAuthState(r.Context(), types.OIDCAuthState{
-			StateHash:    auth.HashToken(stateRaw),
+			StateHash:    oidcBrowserStateHash(stateRaw, browserKey),
 			Nonce:        nonce,
 			PKCEVerifier: verifier,
 			ReturnTo:     returnTo,
@@ -408,6 +446,7 @@ func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
 			writeHTTPErr(w, http.StatusBadGateway, "oidc discovery failed: "+err.Error())
 			return
 		}
+		setOIDCBrowserKey(w, svc.ServerConfig(), browserKey)
 		http.Redirect(w, r, authURL, http.StatusFound)
 	})
 
@@ -416,35 +455,30 @@ func registerServerAuthAndAdminRoutes(mux *http.ServeMux, svc *Service) {
 			writeHTTPErr(w, http.StatusNotFound, "OIDC is not enabled")
 			return
 		}
-		if oidcErr := strings.TrimSpace(r.URL.Query().Get("error")); oidcErr != "" {
-			msg := strings.TrimSpace(r.URL.Query().Get("error_description"))
-			if msg == "" {
-				msg = oidcErr
-			}
-			returnTo := "/"
-			if stateRaw := strings.TrimSpace(r.URL.Query().Get("state")); stateRaw != "" {
-				if st, stErr := svc.Store().ConsumeOIDCAuthState(r.Context(), auth.HashToken(stateRaw)); stErr == nil {
-					returnTo = sanitizeReturnTo(st.ReturnTo)
-				}
-			}
-			http.Redirect(w, r, appendQueryParam(returnTo, "error", msg), http.StatusFound)
+		q := r.URL.Query()
+		stateRaw, code, oidcErr := q.Get("state"), q.Get("code"), q.Get("error")
+		browserKey := readOIDCBrowserKey(r, svc.ServerConfig())
+		if browserKey == "" || !isHexToken(stateRaw, 24) || (code == "" && oidcErr == "") {
+			writeHTTPErr(w, http.StatusForbidden, "invalid or expired OIDC sign-in; start sign-in again")
 			return
 		}
-		stateRaw := r.URL.Query().Get("state")
-		code := r.URL.Query().Get("code")
-		if stateRaw == "" || code == "" {
-			writeHTTPErr(w, http.StatusBadRequest, "missing state or code")
+		if iss := q.Get("iss"); iss != "" && iss != svc.oidcClient.IssuerURL {
+			writeHTTPErr(w, http.StatusForbidden, "unexpected OIDC issuer")
 			return
 		}
-		st, err := svc.Store().ConsumeOIDCAuthState(r.Context(), auth.HashToken(stateRaw))
+		st, err := svc.Store().ConsumeOIDCAuthState(r.Context(), oidcBrowserStateHash(stateRaw, browserKey))
 		if err != nil {
-			writeHTTPErr(w, http.StatusForbidden, "invalid or expired OIDC state")
+			writeHTTPErr(w, http.StatusForbidden, "invalid or expired OIDC sign-in; start sign-in again")
+			return
+		}
+		if oidcErr != "" {
+			http.Redirect(w, r, appendQueryParam(sanitizeReturnTo(st.ReturnTo), "error", "Sign-in was not completed."), http.StatusFound)
 			return
 		}
 		redirectURI := strings.TrimRight(svc.ServerConfig().PublicURL, "/") + "/api/v1/auth/oidc/callback"
 		tokResp, err := svc.oidcClient.ExchangeCode(r.Context(), code, redirectURI, st.PKCEVerifier)
 		if err != nil || tokResp.Error != "" {
-			writeHTTPErr(w, http.StatusBadGateway, fmt.Sprintf("oidc token exchange failed: %s %v", tokResp.ErrorDesc, err))
+			writeHTTPErr(w, http.StatusBadGateway, "OIDC token exchange failed")
 			return
 		}
 		claims, u, err := verifyAndProvisionOIDCUser(r.Context(), svc, tokResp.IDToken, st.Nonce)
@@ -1028,42 +1062,18 @@ func clearWebSessionCookie(w http.ResponseWriter, svc *Service) {
 	})
 }
 
-func syncOIDCAdminRoles(ctx context.Context, svc *Service, userID string, claims auth.IDTokenClaims) {
+func grantConfiguredOIDCAdmin(ctx context.Context, svc *Service, user types.User) error {
 	cfg := svc.ServerConfig()
-	if cfg == nil {
-		return
+	if cfg == nil || !slices.Contains(cfg.Auth.OIDC.AdminSubjects, user.OIDCSubject) {
+		return nil
 	}
-	promote := false
-	emailNorm := strings.ToLower(strings.TrimSpace(claims.Email))
-	if emailNorm != "" && (claims.EmailVerified == nil || *claims.EmailVerified) {
-		for _, ae := range cfg.Auth.OIDC.AdminEmails {
-			if strings.ToLower(strings.TrimSpace(ae)) == emailNorm {
-				promote = true
-				break
-			}
-		}
-	}
-	if !promote && len(cfg.Auth.OIDC.AdminGroups) > 0 && len(claims.Groups) > 0 {
-		adminSet := map[string]bool{}
-		for _, g := range cfg.Auth.OIDC.AdminGroups {
-			adminSet[strings.ToLower(strings.TrimSpace(g))] = true
-		}
-		for _, ug := range claims.Groups {
-			if adminSet[strings.ToLower(strings.TrimSpace(ug))] {
-				promote = true
-				break
-			}
-		}
-	}
-	if !promote {
-		return
-	}
-	_, _ = svc.Store().UpsertRoleBinding(ctx, "oidc-sync", types.RoleBinding{
-		UserID:    userID,
+	_, err := svc.Store().UpsertRoleBinding(ctx, "oidc-sync", types.RoleBinding{
+		UserID:    user.ID,
 		Role:      types.RolePlatformAdmin,
 		ScopeType: types.ScopeGlobal,
 		CreatedBy: "oidc-sync",
 	})
+	return err
 }
 
 func verifyAndProvisionOIDCUser(ctx context.Context, svc *Service, rawIDToken, expectedNonce string) (auth.IDTokenClaims, types.User, error) {
@@ -1077,17 +1087,19 @@ func verifyAndProvisionOIDCUser(ctx context.Context, svc *Service, rawIDToken, e
 	if strings.TrimSpace(claims.Email) == "" {
 		return auth.IDTokenClaims{}, types.User{}, fmt.Errorf("oidc token missing email claim")
 	}
-	if claims.EmailVerified != nil && !*claims.EmailVerified {
-		return auth.IDTokenClaims{}, types.User{}, fmt.Errorf("oidc email address is not verified")
+	if claims.EmailVerified == nil || !*claims.EmailVerified {
+		return auth.IDTokenClaims{}, types.User{}, fmt.Errorf("OIDC email address must be verified")
 	}
-	u, _, err := svc.Store().UpsertOIDCUser(ctx, claims.Issuer, claims.Subject, claims.Email, claims.Name)
+	u, _, err := svc.Store().UpsertOIDCUser(ctx, svc.oidcClient.IssuerURL, claims.Subject, claims.Email, claims.Name)
 	if err != nil {
 		return auth.IDTokenClaims{}, types.User{}, err
 	}
 	if u.Status != "active" {
 		return auth.IDTokenClaims{}, types.User{}, fmt.Errorf("user account is disabled")
 	}
-	syncOIDCAdminRoles(ctx, svc, u.ID, claims)
+	if err := grantConfiguredOIDCAdmin(ctx, svc, u); err != nil {
+		return auth.IDTokenClaims{}, types.User{}, fmt.Errorf("assign configured OIDC roles: %w", err)
+	}
 	return claims, u, nil
 }
 
@@ -1147,6 +1159,7 @@ func extractBearerToken(r *http.Request) string {
 func ServerSecurityMiddleware(svc *Service, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := svc.ServerConfig()
+		setServerSecurityHeaders(w.Header(), r.URL.Path, cfg)
 		effectiveHost := effectiveRequestHost(r, cfg)
 		if !isAllowedServerHost(effectiveHost, cfg) {
 			writeHTTPErr(w, http.StatusForbidden, "host not in server allowed_hosts")

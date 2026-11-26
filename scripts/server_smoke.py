@@ -270,7 +270,6 @@ def run(args) -> None:
             f"POSTGRES_PASSWORD={secrets.token_hex(24)}\n"
             f"AGENT_DBCTL_REDIS_PASSWORD={secrets.token_hex(24)}\n"
             f"AGENT_DBCTL_MASTER_KEY={secrets.token_hex(32)}\n"
-            f"AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD={secrets.token_urlsafe(24)}\n"
             f"AGENT_DBCTL_OIDC_SECRET={secrets.token_urlsafe(24)}\n"
             f"AGENT_DBCTL_BIND_ADDR=127.0.0.1:{args.port}\n"
             f"AGENT_DBCTL_PUBLIC_URL={base}\n"

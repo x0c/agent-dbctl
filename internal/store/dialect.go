@@ -121,11 +121,22 @@ func isUniqueErr(err error) bool {
 	return strings.Contains(msg, "UNIQUE") || strings.Contains(msg, "23505")
 }
 
-// OpenPostgres initializes a Store backed by PostgreSQL using pgxpool with schema migration and advisory locking.
+const postgresSchemaVersion = 7
+
+// OpenPostgres initializes a Store with migrations and defaults under the schema owner.
 func OpenPostgres(ctx context.Context, dsn string) (*Store, error) {
+	return openPostgres(ctx, dsn, true)
+}
+
+// OpenPreparedPostgres opens a migrated store without schema or bootstrap writes.
+func OpenPreparedPostgres(ctx context.Context, dsn string) (*Store, error) {
+	return openPostgres(ctx, dsn, false)
+}
+
+func openPostgres(ctx context.Context, dsn string, migrate bool) (*Store, error) {
 	poolCfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse postgres store dsn: %w", err)
+		return nil, fmt.Errorf("invalid PostgreSQL store DSN")
 	}
 	if poolCfg.MaxConns == 0 || poolCfg.MaxConns < 16 {
 		poolCfg.MaxConns = 32
@@ -147,13 +158,22 @@ func OpenPostgres(ctx context.Context, dsn string) (*Store, error) {
 		dialect:   DialectPostgres,
 		txBatches: make(map[*sql.Tx]*auditBatch),
 	}
-	if err := s.migratePostgres(ctx); err != nil {
-		_ = s.Close()
-		return nil, err
-	}
-	if err := s.seedDefaults(ctx); err != nil {
-		_ = s.Close()
-		return nil, err
+	if migrate {
+		if err := s.migratePostgres(ctx); err != nil {
+			_ = s.Close()
+			return nil, err
+		}
+		if err := s.seedDefaults(ctx); err != nil {
+			_ = s.Close()
+			return nil, err
+		}
+	} else {
+		var version int
+		err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&version)
+		if err != nil || version != postgresSchemaVersion {
+			_ = s.Close()
+			return nil, fmt.Errorf("PostgreSQL schema must be at version %d; run serve --migrate-only with the schema owner first", postgresSchemaVersion)
+		}
 	}
 	return s, nil
 }
@@ -456,6 +476,9 @@ CREATE TABLE IF NOT EXISTS users (
 	updated_at_utc TEXT NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc_identity ON users(oidc_issuer, oidc_subject)
+WHERE oidc_issuer <> '' AND oidc_subject <> '';
+
 CREATE TABLE IF NOT EXISTS role_bindings (
 	id TEXT PRIMARY KEY,
 	user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -560,8 +583,7 @@ CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions(user_id);
 		return fmt.Errorf("init audit_chain_head: %w", err)
 	}
 	now := nowUTC()
-	if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at_utc) VALUES (1, $1), (2, $2), (3, $3), (4, $4), (5, $5), (6, $6) ON CONFLICT DO NOTHING`,
-		now, now, now, now, now, now); err != nil {
+	if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at_utc) VALUES (1, $1), (2, $1), (3, $1), (4, $1), (5, $1), (6, $1), (7, $1) ON CONFLICT DO NOTHING`, now); err != nil {
 		return fmt.Errorf("record postgres schema migrations: %w", err)
 	}
 	return nil

@@ -306,8 +306,11 @@ func (c *OIDCClient) VerifyJWT(ctx context.Context, token, expectedNonce string)
 	if claims.Exp <= now-30 {
 		return IDTokenClaims{}, fmt.Errorf("JWT expired")
 	}
-	if strings.TrimRight(claims.Issuer, "/") != c.IssuerURL {
-		return IDTokenClaims{}, fmt.Errorf("JWT issuer mismatch %q", claims.Issuer)
+	if claims.Issuer != c.IssuerURL {
+		return IDTokenClaims{}, fmt.Errorf("JWT issuer mismatch")
+	}
+	if strings.TrimSpace(claims.Subject) == "" || len(claims.Subject) > 255 {
+		return IDTokenClaims{}, fmt.Errorf("JWT subject is missing or invalid")
 	}
 	if c.ClientID != "" && !audContains(claims.AudRaw, c.ClientID) {
 		return IDTokenClaims{}, fmt.Errorf("JWT audience mismatch")

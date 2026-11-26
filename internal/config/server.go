@@ -45,10 +45,11 @@ type ServerConfig struct {
 
 // ServerStorageConfig configures SQLite WAL or PostgreSQL repository storage.
 type ServerStorageConfig struct {
-	Driver string `yaml:"driver" json:"driver"` // sqlite | postgres
-	DBPath string `yaml:"db_path" json:"db_path"`
-	DSN    string `yaml:"dsn" json:"dsn"`
-	DSNEnv string `yaml:"dsn_env" json:"dsn_env"`
+	Driver                 string `yaml:"driver" json:"driver"` // sqlite | postgres
+	DBPath                 string `yaml:"db_path" json:"db_path"`
+	DSN                    string `yaml:"dsn" json:"-"`
+	DSNEnv                 string `yaml:"dsn_env" json:"dsn_env"`
+	PostgresSkipMigrations bool   `yaml:"postgres_skip_migrations" json:"postgres_skip_migrations"`
 }
 
 // ServerPubSubConfig configures cross-node event distribution.
@@ -92,8 +93,9 @@ type ServerOIDCConfig struct {
 	ClientSecret      string   `yaml:"client_secret" json:"-"`
 	ClientSecretEnv   string   `yaml:"client_secret_env" json:"client_secret_env"`
 	DeviceFlowEnabled bool     `yaml:"device_flow_enabled" json:"device_flow_enabled"`
-	AdminGroups       []string `yaml:"admin_groups" json:"admin_groups"`
-	AdminEmails       []string `yaml:"admin_emails" json:"admin_emails"`
+	AdminSubjects     []string `yaml:"admin_subjects" json:"admin_subjects"`
+	AdminGroups       []string `yaml:"admin_groups" json:"-"` // Legacy; rejected by Validate.
+	AdminEmails       []string `yaml:"admin_emails" json:"-"` // Legacy; rejected by Validate.
 	Scopes            []string `yaml:"scopes" json:"scopes"`
 }
 
@@ -124,9 +126,10 @@ func DefaultServerConfig(paths Paths) ServerConfig {
 			MasterKeyEnv: EnvMasterKey,
 		},
 		Auth: ServerAuthConfig{
-			LocalLoginEnabled:  true,
-			SessionTTLHours:    24,
-			ForbidSelfApproval: &forbidSelf,
+			LocalLoginEnabled:     true,
+			BootstrapAdminPassEnv: "AGENT_DBCTL_BOOTSTRAP_ADMIN_PASSWORD",
+			SessionTTLHours:       24,
+			ForbidSelfApproval:    &forbidSelf,
 			OIDC: ServerOIDCConfig{
 				ClientSecretEnv: EnvOIDCSecret,
 				Scopes:          []string{"openid", "profile", "email"},
@@ -244,6 +247,9 @@ func (c ServerConfig) Validate() error {
 	default:
 		return fmt.Errorf("unsupported storage.driver %q", c.Storage.Driver)
 	}
+	if c.Storage.PostgresSkipMigrations && !strings.EqualFold(c.Storage.Driver, "postgres") {
+		return fmt.Errorf("storage.postgres_skip_migrations requires storage.driver=postgres")
+	}
 	switch strings.ToLower(c.PubSub.Driver) {
 	case "memory", "postgres", "redis":
 	default:
@@ -274,9 +280,20 @@ func (c ServerConfig) Validate() error {
 	if !c.Auth.LocalLoginEnabled && !c.Auth.OIDC.Enabled {
 		return fmt.Errorf("at least one authentication method (local_login_enabled or auth.oidc.enabled) must be enabled")
 	}
+	if len(c.Auth.OIDC.AdminEmails) != 0 || len(c.Auth.OIDC.AdminGroups) != 0 {
+		return fmt.Errorf("auth.oidc.admin_emails and admin_groups are no longer supported; configure admin_subjects using verified OIDC subject IDs")
+	}
 	if c.Auth.OIDC.Enabled {
 		if strings.TrimSpace(c.Auth.OIDC.IssuerURL) == "" || strings.TrimSpace(c.Auth.OIDC.ClientID) == "" {
 			return fmt.Errorf("auth.oidc.enabled requires issuer_url and client_id")
+		}
+		for _, subject := range c.Auth.OIDC.AdminSubjects {
+			if subject == "" || strings.TrimSpace(subject) != subject || len(subject) > 255 {
+				return fmt.Errorf("auth.oidc.admin_subjects contains an invalid subject ID")
+			}
+		}
+		if !c.Auth.LocalLoginEnabled && len(c.Auth.OIDC.AdminSubjects) == 0 {
+			return fmt.Errorf("OIDC-only authentication requires at least one auth.oidc.admin_subjects entry for recovery")
 		}
 	}
 	return nil

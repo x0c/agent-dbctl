@@ -118,7 +118,7 @@ func registerWebAPIRoutes(mux *http.ServeMux, svc *Service) {
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Connection", "keep-alive")
 		sub := svc.subscribeSSE(rbac.PrincipalFromContext(r.Context()))
 		defer svc.unsubscribeSSE(sub)
@@ -744,11 +744,11 @@ func handleApprovalDecision(w http.ResponseWriter, r *http.Request, svc *Service
 
 // WebSecurityMiddleware protects the local Web Console against DNS rebinding, cross-site CSRF,
 // and unauthenticated loopback mutations:
-// - Every request must target a loopback Host header (127.0.0.1, localhost, or [::1]).
-// - Every mutating request must satisfy strict browser same-origin checks (Origin, Sec-Fetch-Site, or Referer;
-//   headerless loopback requests are rejected).
-// - Mutating /api/v1/* endpoints require a valid per-daemon HttpOnly session cookie + X-Agent-DBCTL-CSRF header
-//   (except approval decision endpoints, which also accept a valid one-time approval_token).
+//   - Every request must target a loopback Host header (127.0.0.1, localhost, or [::1]).
+//   - Every mutating request must satisfy strict browser same-origin checks (Origin, Sec-Fetch-Site, or Referer;
+//     headerless loopback requests are rejected).
+//   - Mutating /api/v1/* endpoints require a valid per-daemon HttpOnly session cookie + X-Agent-DBCTL-CSRF header
+//     (except approval decision endpoints, which also accept a valid one-time approval_token).
 func WebSecurityMiddleware(svc *Service, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !isLoopbackHostHeader(r.Host) {
